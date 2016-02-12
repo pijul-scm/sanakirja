@@ -12,6 +12,7 @@ pub enum Error {
 }
 
 pub struct Env {
+    page_size:off_t,
     length:off_t,
     map:*mut u8,
     fd:c_int
@@ -22,6 +23,7 @@ impl Env {
         unsafe {
             let page_size =sysconf(_SC_PAGESIZE) as off_t;
             Env {
+                page_size:page_size,
                 length:10*page_size,
                 map:std::ptr::null_mut(),
                 fd:0
@@ -57,7 +59,7 @@ impl Drop for Env {
     fn drop(&mut self){
         unsafe {
             if ! self.map.is_null() {
-                libc::msync(self.map as *mut c_void,self.length as size_t,MS_SYNC);
+                //libc::msync(self.map as *mut c_void,self.length as size_t,MS_SYNC);
                 libc::munmap(self.map as *mut c_void,self.length as size_t);
                 libc::close(self.fd);
             }
