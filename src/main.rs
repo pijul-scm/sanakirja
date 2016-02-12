@@ -5,7 +5,10 @@ use std::ptr::copy_nonoverlapping;
 
 
 // Encoding of a page:
-// - one byte indicating whether the page (0) starts a blank space, (1) is free or (2) is occupied
+// 1 - one byte indicating whether the page (0) starts a blank space, (1) is free.
+// 2 - offset (u64) of the next free page
+
+// TODO: compress 1 and 2, page sizes are always even.
 
 fn page_starts_blank(flag:u8)->bool {
     flag==0
@@ -21,12 +24,19 @@ pub enum Error {
     IO(std::io::Error)
 }
 
+// Here is the reasoning:
+// - first_free_page is the head of the list of pages that are free. We might or might not have used them during the transaction, before freeing them.
+// - first_clean_page is the head of "usable" pages, i.e. pages that we have never used during this transaction.
+//
+// The guarantee is that no concurrent read has access to any clean page, but they might be reading free pages.
+
 pub struct Env {
     page_size:off_t,
     length:off_t,
     map:*mut u8,
     fd:c_int,
-    first_free_page:u64
+    first_free_page:u64,
+    first_clean_page:u64
 }
 
 pub unsafe fn readbe_64(p0:*mut u8)->u64 {
@@ -81,31 +91,32 @@ impl Env {
                         length:length,
                         map:memory as *mut u8,
                         fd:fd,
-                        first_free_page:first_free_page
+                        first_free_page:first_free_page,
+                        first_clean_page:first_free_page
                     })
                 }
             }
         }
     }
 
-    fn alloc_page<'a>(&'a mut self)->Option<Page> {
+    fn alloc_page(&mut self)->Option<Page> {
         unsafe {
-            let ptr=self.map.offset(self.first_free_page as isize);
+            let ptr=self.map.offset(self.first_clean_page as isize);
             if page_starts_blank(*ptr) {
 
-                self.first_free_page += self.page_size as u64;
+                self.first_clean_page += self.page_size as u64;
 
                 writebe_64(ptr.offset(1), self.first_free_page);
                 Some(Page { page:ptr,page_size:self.page_size as usize })
             } else {
                 let offset_next_page = readbe_64(ptr.offset(1));
-                self.first_free_page = offset_next_page;
+                self.first_clean_page = offset_next_page;
                 Some(Page { page:ptr,page_size:self.page_size as usize })
             }
         }
     }
 
-    fn free_page<'a>(&'a mut self,p:Page) {
+    fn free_page(&mut self,p:Page) {
         unsafe {
             if page_starts_blank(*((p.page as *mut u8).offset(self.page_size as isize))) {
                 *p.page = 0;
@@ -115,6 +126,15 @@ impl Env {
                 writebe_64((p.page as *mut u8).offset(1), self.first_free_page);
                 self.first_free_page = (p.page as *mut u8 as u64) - (self.map as u64)
             }
+        }
+    }
+
+    fn sync(&self)->Result<(),Error>{
+        let ok= unsafe {libc::msync(self.map as *mut c_void,self.length as size_t,MS_SYNC) };
+        if ok==0 {
+            Ok(())
+        } else {
+            Err(Error::IO(std::io::Error::last_os_error()))
         }
     }
 }
@@ -139,7 +159,6 @@ impl Page {
 impl Drop for Env {
     fn drop(&mut self){
         unsafe {
-            //libc::msync(self.map as *mut c_void,self.length as size_t,MS_SYNC);
             libc::munmap(self.map as *mut c_void,self.length as size_t);
             libc::close(self.fd);
         }
