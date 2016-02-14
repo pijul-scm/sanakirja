@@ -2,8 +2,12 @@
 name = "dictionnaire"
 version = "0.1.0"
 authors = ["pe"]
+build = "build.rs"
 
 [dependencies]
 libc="*"
 log="*"
 env_logger="*"
+
+[build-dependencies]
+libc="*"

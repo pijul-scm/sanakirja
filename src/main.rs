@@ -4,11 +4,11 @@ extern crate env_logger;
 fn main(){
     env_logger::init().unwrap();
     //Env::test_concat_mmap("/tmp/test", &[(0,4096), (20480,4096)]);
-    let env=Env::new("/tmp/test").unwrap();
+    let env=Env::new("/tmp/test",100).unwrap();
     let env=std::sync::Arc::new(env);
     let thr={
         let env=env.clone();
-        env.debug();
+        println!("before spawn statistics: {:?}",env.statistics());
         std::thread::spawn(move | | {
             let mut txn=env.txn_mut_begin().unwrap();
             let mut page=txn.alloc_page().unwrap();
@@ -35,5 +35,5 @@ fn main(){
         })
     };
     thr.join().unwrap();
-    env.debug();
+    println!("final statistics: {:?}",env.statistics());
 }
