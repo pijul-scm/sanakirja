@@ -1,11 +1,29 @@
 // TODO:
-// - multiple consecutive pages
 // - get rid of initial length -- grow file as needed.
-// - PAGE_SIZE is now a constant, check modulos/divisions to make that constant too.
+// - process mutex for mutable transactions.
+//   see http://www.gnu.org/software/libc/manual/html_node/File-Locks.html
+// X multiple consecutive pages (done with glue_pages)
+// X PAGE_SIZE is now a constant, check modulos/divisions to make that constant too.
 // X merge last page : done for just the last page, but could probably be improved.
 // X count allocated pages (debug/test).
 // X test page size in build.rs
 // X documentation
+
+// Types guarantees:
+// - The only pages we write are the ones we allocate.
+
+
+// Problem 1:
+// - Start a reader, moving very slowly down the tree.
+// - Quickly start a mutable transaction, free some of the pages the reader is reading.
+// - Commit, start another one, overwrite some of the free pages.
+// - Go on reading the pages -> the reader reads garbage.
+
+// Solution: before commiting page 0, wait until all readers are done (try to take a lock on the lock file). How about suspended readers?
+
+// Other solution: before starting the second write transaction, make sure all readers are done. How?
+
+
 
 extern crate libc;
 use libc::*;
@@ -176,6 +194,8 @@ impl Page {
         std::slice::from_raw_parts_mut(self.data as *mut u8,self.len)
     }
 }
+pub struct Pages<'a> (&'a [Page]);
+
 
 impl <'env>MutTxn<'env> {
 
@@ -209,7 +229,7 @@ impl <'env>MutTxn<'env> {
     /// Allocate a single page.
     pub fn alloc_page(&mut self)->Option<Page> {
         debug!("alloc page");
-        let x = unsafe {
+        unsafe {
             // If we have allocated and freed a page in this transaction, use it first.
             if let Some(page)=self.free_clean_pages.pop() {
                 debug!("clean page reuse:{}",page);
@@ -237,9 +257,45 @@ impl <'env>MutTxn<'env> {
                     })
                 }
             }
-        };
-        x
+        }
     }
+
+    pub fn glue_pages<'a>(&self,pages:&'a[Page])->Result<Pages<'a>,Error> {
+        let mut memory=std::ptr::null_mut();
+        let mut p0=std::ptr::null_mut();
+        for p in pages {
+            if memory.is_null() {
+                memory=p.data;
+                p0=p.data
+            } else {
+                unsafe {
+                    memory=libc::mmap(memory.offset(PAGE_SIZE as isize) as *mut c_void,
+                                      PAGE_SIZE as size_t,
+                                      PROT_READ|PROT_WRITE,
+                                      MAP_SHARED | MAP_FIXED,
+                                      self.txn.env.fd,0) as *mut u8;
+                }
+                if memory as *mut c_void == libc::MAP_FAILED {
+                    let err=std::io::Error::last_os_error();
+                    unsafe {
+                        loop {
+                            memory=memory.offset(-(PAGE_SIZE as isize));
+                            if memory == p0 {
+                                break
+                            } else {
+                                munmap(memory as *mut c_void,PAGE_SIZE);
+                            }
+                        }
+                    }
+                    return Err(Error::IO(err));
+                }
+            }
+        }
+        Ok(Pages (pages))
+    }
+
+
+
     /// Free a single page (not necessarily allocated in the current transaction).
     pub fn free_page(&mut self,p:Page) {
         let offset=(p.data as usize as u64) - (self.txn.env.map as usize as u64);
