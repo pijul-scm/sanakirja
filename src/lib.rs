@@ -28,7 +28,7 @@ pub enum Error {
 
 pub struct Env {
     page_size:u64,
-    length:off_t,
+    length:u64,
     map:*mut u8,
     fd:c_int,
     mutable:std::sync::Arc<std::sync::Mutex<()>>,
@@ -113,7 +113,7 @@ impl Env {
                 } else {
                     Ok(Env {
                         page_size:page_size as u64,
-                        length:length,
+                        length:length as u64,
                         map:memory as *mut u8,
                         fd:fd,
                         mutable:std::sync::Arc::new(std::sync::Mutex::new(()))
@@ -126,13 +126,6 @@ impl Env {
         Txn { env:self }
     }
     pub fn txn_mut_begin<'env>(&'env self)->Result<MutTxn<'env>,Error> {
-
-        unsafe {
-            let len=readle_64(self.map.offset(12288 + 8));
-            debug!("txn begin: len of 2nd page: {}",len)
-        }
-
-
         let txn=self.txn_begin();
         let guard=self.mutable.lock().unwrap();
         unsafe {
@@ -229,6 +222,7 @@ impl <'env>MutTxn<'env> {
                 let pos=self.current_list_position;
                 // find the page at the top.
                 self.current_list_position -= 8;
+                debug!("free_pages_pop, new position:{}",self.current_list_position);
                 Some(readle_64(self.txn.env.map.offset((cur + 8 + pos) as isize)))
             }
         }
@@ -277,6 +271,7 @@ impl <'env>MutTxn<'env> {
         }
     }
     pub fn commit(mut self)->Result<(),Error>{
+        *(self.mutable); // avoid unused stuff.
         // Tasks:
         // - allocate new pages (copy-on-write) to write the new list of free pages, including edited "stack pages".
         //
@@ -305,9 +300,8 @@ impl <'env>MutTxn<'env> {
                                (new_page.data as usize as u64) - (self.txn.env.map as usize as u64));
                         copy_nonoverlapping(self.txn.env.map.offset(self.current_list_page as isize),
                                             new_page.data,
-                                            self.txn.env.page_size as usize);
-                        writele_64(self.txn.env.map.offset(8+self.current_list_page as isize),
-                                   self.current_list_length);
+                                            16 + self.current_list_length as usize);
+                        writele_64(new_page.data.offset(8), self.current_list_position);
                         self.free_pages.push(self.current_list_page);
                         let off=readle_64(new_page.data);
                         let len=readle_64(self.txn.env.map.offset(self.current_list_page as isize + 8));
@@ -337,10 +331,11 @@ impl <'env>MutTxn<'env> {
 
                         current_page = new_page.data
                     } else {
-                        debug!("commit: push 1");
                         // push
 
                         let p=self.free_pages.pop().unwrap_or_else(|| self.free_clean_pages.pop().unwrap());
+                        debug!("commit: push {}",p);
+
                         writele_64(current_page.offset(8),len+8); // increase length.
                         writele_64(current_page.offset(16+len as isize), p); // write pointer.
                     }
@@ -352,25 +347,21 @@ impl <'env>MutTxn<'env> {
                            current_page as usize as u64 - self.txn.env.map as usize as u64);
             }
         }
-        /*
-        let mut is_first=true;
-        while ! (self.free_clean_pages.is_empty() && self.free_pages.is_empty()) {
-
-            if page_full {
-                let page=self.alloc_page().unwrap();
-                if is_first && self.current_list_page!= 0 {
-                    // copy
-                    unsafe {
-                        let cur= self.txn.env.map.offset(self.current_list_page as isize);
-                        let len= 16 + self.current_list_length;
-                        copy_nonoverlapping(cur,page.data,len as usize);
-                    }
+        // Now commit in order.
+        {
+            let mut ok= unsafe {libc::msync(self.txn.env.map.offset(self.txn.env.page_size as isize) as *mut c_void,
+                                            (self.txn.env.length - self.txn.env.page_size) as size_t,MS_SYNC) };
+            if ok!=0 {
+                return Err(Error::IO(std::io::Error::last_os_error()))
+            } else {
+                ok= unsafe {libc::msync(self.txn.env.map as *mut c_void,self.txn.env.page_size as size_t,MS_SYNC) };
+                if ok!=0 {
+                    return Err(Error::IO(std::io::Error::last_os_error()))
+                } else {
+                    Ok(())
                 }
             }
-            // Now push as many {free,free_clean}_pages as possible to the page
-    }
-         */
-        Ok(())
+        }
     }
     pub fn abort(self){}
 }
@@ -383,40 +374,3 @@ impl Drop for Env {
         }
     }
 }
-
-
-
-// Ancien code de commit.
-        /*
-        // Sync, except the last page.
-        let mut ok= unsafe {libc::msync(self.txn.env.map.offset(self.txn.env.page_size as isize) as *mut c_void,
-                                        (self.txn.env.length - self.txn.env.page_size) as size_t,MS_SYNC) };
-        if ok!=0 {
-            return Err(Error::IO(std::io::Error::last_os_error()))
-        } else {
-            println!("first_free_page={}, first_clean_page={}",self.first_free_page,self.first_clean_page);
-            //
-            // Probleme: qu'est-ce qu'on fait de self.free_pages, les pages propres utilisées par self, puis libérées à nouveau?
-            //
-            // En fait, ce vecteur devrait etre dans la premiere page du mmap.
-            //
-            if self.first_free_page==0 {
-                unsafe { writele_64(self.txn.env.map,self.first_clean_page) };
-            } else {
-                // link last_free_page to first_clean_page
-                // link first_free_page to starting point
-                unsafe {
-                    println!("commit: {} {} {}",self.first_free_page,self.last_free_page,self.first_clean_page);
-                    writele_64(self.txn.env.map.offset(self.last_free_page as isize),
-                               self.first_clean_page);
-                    writele_64(self.txn.env.map,
-                               self.first_free_page);
-                }
-            }
-            ok= unsafe {libc::msync(self.txn.env.map as *mut c_void,self.txn.env.page_size as size_t,MS_SYNC) };
-            if ok!=0 {
-                return Err(Error::IO(std::io::Error::last_os_error()))
-            } else {
-                Ok(())
-            }
-    }*/
