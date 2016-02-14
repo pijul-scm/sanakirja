@@ -5,3 +5,5 @@ authors = ["pe"]
 
 [dependencies]
 libc="*"
+log="*"
+env_logger="*"
