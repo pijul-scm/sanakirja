@@ -34,6 +34,7 @@ use std::collections::HashSet;
 #[macro_use]
 extern crate log;
 use std::cmp::max;
+use std::marker::PhantomData;
 
 mod constants;
 use constants::*;
@@ -194,8 +195,29 @@ impl Page {
         std::slice::from_raw_parts_mut(self.data as *mut u8,self.len)
     }
 }
-pub struct Pages<'a> (&'a [Page]);
 
+// WARNING: do not allocate anything while a Pages is in scope, the mutable borrow should take care of this.
+pub struct Pages<'a,'txn> {
+    pages:&'a [Page],
+    txn:PhantomData<&'txn()>
+}
+
+impl<'a,'txn> Drop for Pages<'a,'txn> {
+    fn drop(&mut self) {
+        let mut memory=std::ptr::null_mut();
+        for page in self.pages {
+            if memory.is_null() {
+                memory=page.data;
+            } else {
+                unsafe {
+                    memory=memory.offset(PAGE_SIZE as isize);
+                    munmap(memory as *mut c_void,PAGE_SIZE);
+                }
+            }
+        }
+
+    }
+}
 
 impl <'env>MutTxn<'env> {
 
@@ -260,7 +282,7 @@ impl <'env>MutTxn<'env> {
         }
     }
 
-    pub fn glue_pages<'a>(&self,pages:&'a[Page])->Result<Pages<'a>,Error> {
+    pub fn glue_pages<'a,'txn>(&'txn self,pages:&'a[Page])->Result<Pages<'a,'txn>,Error> {
         let mut memory=std::ptr::null_mut();
         let mut p0=std::ptr::null_mut();
         for p in pages {
@@ -291,7 +313,7 @@ impl <'env>MutTxn<'env> {
                 }
             }
         }
-        Ok(Pages (pages))
+        Ok(Pages {pages:pages,txn:PhantomData})
     }
 
 
