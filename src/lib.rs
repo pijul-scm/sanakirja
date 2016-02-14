@@ -300,7 +300,7 @@ impl <'env>MutTxn<'env> {
                                (new_page.data as usize as u64) - (self.txn.env.map as usize as u64));
                         copy_nonoverlapping(self.txn.env.map.offset(self.current_list_page as isize),
                                             new_page.data,
-                                            16 + self.current_list_length as usize);
+                                            16 + self.current_list_position as usize);
                         writele_64(new_page.data.offset(8), self.current_list_position);
                         self.free_pages.push(self.current_list_page);
                         let off=readle_64(new_page.data);
