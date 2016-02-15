@@ -239,12 +239,12 @@ impl Env {
 pub struct Page {
     pub data:*const u8,
     pub len:usize,
-    offset:u64
+    pub offset:u64
 }
 pub struct MutPage {
     pub data:*mut u8,
     pub len:usize,
-    offset:u64
+    pub offset:u64
 }
 
 
