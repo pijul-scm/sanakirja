@@ -360,13 +360,23 @@ impl <'env>MutTxn<'env> {
         let mut l=0;
         for p in pages {
             unsafe {
-                memory=libc::mmap(memory.offset(PAGE_SIZE as isize) as *mut c_void,
-                                  PAGE_SIZE as size_t,
-                                  PROT_READ|PROT_WRITE,
-                                  MAP_SHARED | MAP_FIXED,
-                                  self.env.fd,
-                                  p.offset as off_t
-                                  ) as *mut u8;
+                if memory.is_null() {
+                    memory=libc::mmap(memory as *mut c_void,
+                                      PAGE_SIZE as size_t,
+                                      PROT_READ|PROT_WRITE,
+                                      MAP_SHARED,
+                                      self.env.fd,
+                                      p.offset as off_t
+                                      ) as *mut u8;
+                } else {
+                    memory=libc::mmap(memory.offset(PAGE_SIZE as isize) as *mut c_void,
+                                      PAGE_SIZE as size_t,
+                                      PROT_READ|PROT_WRITE,
+                                      MAP_SHARED | MAP_FIXED,
+                                      self.env.fd,
+                                      p.offset as off_t
+                                      ) as *mut u8;
+                }
                 if memory as *mut c_void == libc::MAP_FAILED {
                     let err=std::io::Error::last_os_error();
                     {
