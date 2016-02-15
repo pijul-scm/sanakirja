@@ -1,5 +1,5 @@
 // TODO:
-// - get rid of initial length -- grow file as needed.
+// - get rid of initial length, grow file as needed. See fallocate, ftruncate. Equivalents on windows?
 // X process and thread mutex for mutable transactions.
 // X multiple consecutive pages (done with glue_pages)
 // X PAGE_SIZE is now a constant, check modulos/divisions to make that constant too.
@@ -10,7 +10,6 @@
 
 // Types guarantees:
 // - The only pages we write are the ones we allocate.
-
 
 // LMDB takes care of zombie readers, at the cost of checking a file of size linear in the number of PIDs at the beginning of every transaction. Also, doesn't work on USB sticks. More details: mdb.c, line 2606: PID locks.
 
@@ -471,7 +470,8 @@ impl <'env>MutTxn<'env> {
                         Ok(())
                     }
                 };
-                self.env.lock_file.unlock().unwrap();
+                // The following is unnecessary: already unlocked by drop.
+                //self.env.lock_file.unlock().unwrap();
                 *self.mutable; // This is == ()
                 result
             }
@@ -480,7 +480,6 @@ impl <'env>MutTxn<'env> {
 
     /// Abort the transaction. This is actually a no-op, just as a machine crash aborts a transaction. Letting the transaction go out of scope would have the same effect.
     pub fn abort(self){
-
     }
 }
 
