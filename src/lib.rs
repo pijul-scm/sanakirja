@@ -81,7 +81,7 @@ pub struct MutTxn<'env> {
     mutable:MutexGuard<'env,()>,
     maps:Vec<*mut u8>,
     last_page:u64,
-    current_list_page:u64,
+    current_list_page:Page,
     current_list_length:u64,
     current_list_position:u64,
     occupied_clean_pages:HashSet<u64>,
@@ -97,6 +97,13 @@ impl<'env> Drop for Txn<'env>{
 }
 impl<'env> Drop for MutTxn<'env>{
     fn drop(&mut self){
+        for p in self.maps.iter().skip(1) {
+            unsafe {
+                if !(*p).is_null() {
+                    munmap(*p as *mut c_void,self.env.length);
+                }
+            }
+        }
         self.env.mutable_file.unlock().unwrap();
     }
 }
@@ -159,9 +166,12 @@ impl Env {
         unsafe {
             let last_page=readle_64(self.map);
             let current_list_page=readle_64(self.map.offset(8));
+
+            // This is already another page. UNSAFE!
+            let current_list_data=self.map.offset(current_list_page as isize);
+
             let current_list_length = if current_list_page == 0 { 0 } else {
-                // This is already another page. UNSAFE!
-                readle_64(self.map.offset(current_list_page as isize + 8))
+                readle_64(current_list_data.offset(8))
             };
             let current_list_position = current_list_length;
             let guard=self.mutable.lock().unwrap();
@@ -171,7 +181,7 @@ impl Env {
                 mutable:guard,
                 maps:vec!(self.map),
                 last_page:if last_page == 0 { PAGE_SIZE as u64 } else { last_page },
-                current_list_page:current_list_page,
+                current_list_page:Page { data:current_list_data,len:PAGE_SIZE, offset:current_list_page },
                 current_list_length:current_list_length,
                 current_list_position:current_list_position, // position of the word immediately after the top.
                 occupied_clean_pages:HashSet::new(),
@@ -274,9 +284,22 @@ impl <'env>MutTxn<'env> {
     fn offset(&mut self,off:u64)-> *mut u8 {
         // Allocate more space in the file if needed, adding a new mapping
         let index=(off>>self.env.log_length) as usize;
-        println!("offset index:{}",index);
+        while index>= self.maps.len() {
+            self.maps.push(std::ptr::null_mut())
+        }
         unsafe {
-            self.maps[index].offset((off & self.env.mask_length) as isize)
+            let map = self.maps.get_unchecked_mut(index);
+            if (*map).is_null(){
+                *map=mmap(std::ptr::null_mut(),
+                          self.env.length,
+                          PROT_READ|PROT_WRITE,
+                          MAP_SHARED,
+                          self.env.fd,off as off_t) as *mut u8;
+                if (*map as *mut c_void)==libc::MAP_FAILED{
+                    panic!(format!("mmap failed: {:?}", std::io::Error::last_os_error()))
+                }
+            }
+            (*map).offset((off & self.env.mask_length) as isize)
         }
     }
 
@@ -284,27 +307,27 @@ impl <'env>MutTxn<'env> {
     fn free_pages_pop(&mut self)->Option<u64> {
         unsafe {
             debug!("free_pages_pop, current_list_position:{}",self.current_list_position);
-            if self.current_list_page==0 { None } else {
+            if self.current_list_page.offset==0 { None } else {
                 if self.current_list_position==0 {
-                    let previous_page = { let off=self.current_list_page; readle_64(self.offset(off)) };
+                    let previous_page = readle_64(self.current_list_page.data);
                     debug!("free_pages_pop, previous page:{}",previous_page);
                     if previous_page == 0 {
                         None
                     } else {
                         // free page, move to previous one and call recursively.
-                        self.free_pages.push(self.current_list_page);
-                        self.current_list_length = {let off=self.current_list_page + 8;readle_64(self.offset(off))};
-                        self.current_list_page = previous_page;
+                        self.free_pages.push(self.current_list_page.offset);
+                        self.current_list_length = readle_64(self.current_list_page.data.offset(8));
+                        self.current_list_page = Page { data:self.offset(previous_page),
+                                                        len:PAGE_SIZE, offset:previous_page };
 
                         self.free_pages_pop()
                     }
                 } else {
-                    let cur=self.current_list_page;
                     let pos=self.current_list_position;
                     // find the page at the top.
                     self.current_list_position -= 8;
                     debug!("free_pages_pop, new position:{}",self.current_list_position);
-                    Some(readle_64(self.offset(cur + 8 + pos)))
+                    Some(readle_64(self.current_list_page.data.offset(8 + pos as isize)))
                 }
             }
         }
@@ -420,17 +443,17 @@ impl <'env>MutTxn<'env> {
                     debug!("commit: current is null");
                     // First page, copy-on-write
                     let new_page = self.alloc_page().unwrap();
-                    if self.current_list_page != 0 {
+                    if self.current_list_page.offset != 0 {
                         debug!("Copying from {} to {}",
-                               self.current_list_page,
+                               self.current_list_page.offset,
                                new_page.page.offset);
-                        copy_nonoverlapping({let off=self.current_list_page;self.offset(off)},
+                        copy_nonoverlapping(self.current_list_page.data,
                                             new_page.page.data,
                                             16 + self.current_list_position as usize);
                         writele_64(new_page.page.data.offset(8), self.current_list_position);
-                        self.free_pages.push(self.current_list_page);
+                        self.free_pages.push(self.current_list_page.offset);
                         let off=readle_64(new_page.page.data);
-                        let len={let off=self.current_list_page + 8;readle_64(self.offset(off))};
+                        let len=readle_64(self.current_list_page.data.offset(8));
                         debug!("off={}, len={}",off,len);
                     } else {
                         debug!("commit: allocate");
