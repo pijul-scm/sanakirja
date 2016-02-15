@@ -52,9 +52,9 @@ pub struct Env {
     length:usize,
     log_length:usize,
     mask_length:u64,
-    map:*mut u8,
     lock_file:File,
     mutable_file:File,
+    maps:RefCell<Vec<*mut u8>>,
     fd:c_int,
     lock:RwLock<()>, // Ensure all reads are done when sync starts.
     mutable:Mutex<()> // Ensure only one mutable transaction can be started.
@@ -72,7 +72,6 @@ pub unsafe fn writele_64(p:*mut u8,v:u64) {
 
 pub struct Txn<'env> {
     env:&'env Env,
-    maps:RefCell<Vec<*mut u8>>,
     guard:RwLockReadGuard<'env,()>,
 }
 
@@ -80,7 +79,6 @@ pub struct Txn<'env> {
 pub struct MutTxn<'env> {
     env:&'env Env,
     mutable:MutexGuard<'env,()>,
-    maps:RefCell<Vec<*mut u8>>,
     last_page:u64,
     current_list_page:Page,
     current_list_length:u64,
@@ -92,26 +90,12 @@ pub struct MutTxn<'env> {
 
 impl<'env> Drop for Txn<'env>{
     fn drop(&mut self){
-        for p in self.maps.borrow().iter().skip(1) {
-            unsafe {
-                if !(*p).is_null() {
-                    munmap(*p as *mut c_void,self.env.length);
-                }
-            }
-        }
         self.env.lock_file.unlock().unwrap();
         *self.guard;
     }
 }
 impl<'env> Drop for MutTxn<'env>{
     fn drop(&mut self){
-        for p in self.maps.borrow().iter().skip(1) {
-            unsafe {
-                if !(*p).is_null() {
-                    munmap(*p as *mut c_void,self.env.length);
-                }
-            }
-        }
         self.env.mutable_file.unlock().unwrap();
     }
 }
@@ -152,7 +136,7 @@ impl Env {
                         length:length,
                         log_length:log_length,
                         mask_length:(length-1) as u64,
-                        map:memory as *mut u8,
+                        maps:RefCell::new(vec!(memory as *mut u8)),
                         lock_file:lock_file,
                         mutable_file:mutable_file,
                         fd:fd,
@@ -168,19 +152,19 @@ impl Env {
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
         let read=self.lock.read().unwrap();
         self.lock_file.lock_shared().unwrap();
-        Txn { env:self,guard:read,maps:RefCell::new(vec!(self.map)) }
+        Txn { env:self,guard:read }
     }
 
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
     pub fn mut_txn_begin<'env>(&'env self)->MutTxn<'env> {
         unsafe {
-            let last_page=readle_64(self.map);
-            let current_list_page=readle_64(self.map.offset(8));
+            let map=self.maps.borrow();
+            let last_page=readle_64(map[0]);
+            let current_list_page=readle_64(map[0].offset(8));
 
             let guard=self.mutable.lock().unwrap();
             self.mutable_file.lock_exclusive().unwrap();
-            let maps=RefCell::new(vec!(self.map));
-            let current_list_page = Page { data:offset(self,maps.borrow_mut(),current_list_page),
+            let current_list_page = Page { data:offset(self,self.maps.borrow_mut(),current_list_page),
                                            len:PAGE_SIZE, offset:current_list_page };
             let current_list_length=if current_list_page.offset == 0 { 0 } else {
                 readle_64(current_list_page.data.offset(8))
@@ -188,7 +172,6 @@ impl Env {
             MutTxn {
                 env:self,
                 mutable:guard,
-                maps:maps,
                 last_page:if last_page == 0 { PAGE_SIZE as u64 } else { last_page },
                 current_list_page:current_list_page,
                 current_list_length:current_list_length,
@@ -204,13 +187,14 @@ impl Env {
     /// Compute statistics about pages. This is a potentially costlty operation, as we need to go through all bookkeeping pages.
     pub fn statistics(&self)->Statistics{
         unsafe {
-            let total_pages = readle_64(self.map.offset(0)) as usize;
+            let map=self.maps.borrow();
+            let total_pages = readle_64(map[0].offset(0)) as usize;
             let mut free_pages = HashSet::new();
             let mut bookkeeping_pages = Vec::new();
-            let mut cur=readle_64(self.map.offset(8));
+            let mut cur=readle_64(map[0].offset(8));
             while cur!=0 {
                 bookkeeping_pages.push(cur);
-                let p=self.map.offset(cur as isize);
+                let p=map[0].offset(cur as isize);
                 let prev=readle_64(p);
                 let len=readle_64(p.offset(8));
                 println!("- {:?}, {}", cur, len);
@@ -370,19 +354,19 @@ pub fn glue_pages<'a>(env:&Env,pages:&'a[Page])->Result<Pages<'a>,Error> {
 impl <'env>Txn<'env> {
     /// Find the appropriate map segment
     pub fn offset(&self,off:u64)->*mut u8 {
-        offset(self.env,self.maps.borrow_mut(), off)
+        offset(self.env,self.env.maps.borrow_mut(), off)
     }
     pub fn load_page(&self,off:u64)->Page {
-        load_page(self.env,self.maps.borrow_mut(),off)
+        load_page(self.env,self.env.maps.borrow_mut(),off)
     }
 }
 impl <'env>MutTxn<'env> {
     /// Find the appropriate map segment
     pub fn offset(&self,off:u64)->*mut u8 {
-        offset(self.env,self.maps.borrow_mut(), off)
+        offset(self.env,self.env.maps.borrow_mut(), off)
     }
     pub fn load_page(&self,off:u64)->Page {
-        load_page(self.env,self.maps.borrow_mut(),off)
+        load_page(self.env,self.env.maps.borrow_mut(),off)
     }
     pub fn glue_pages<'a>(&self,pages:&'a[Page])->Result<Pages<'a>,Error> {
         glue_pages(self.env,pages)
@@ -544,17 +528,18 @@ impl <'env>MutTxn<'env> {
                 }
                 writele_64(self.offset(8),current_page_offset);
                 // synchronize all maps
-                for map in self.maps.borrow_mut().iter().skip(1) {
+                let maps=self.env.maps.borrow();
+                for map in maps.iter().skip(1) {
                     let ok= libc::msync(*map as *mut c_void,self.env.length as size_t,MS_SYNC);
                     if ok!=0 {
                         return Err(Error::IO(std::io::Error::last_os_error()))
                     }
                 }
-                let ok=libc::msync(self.env.map.offset(PAGE_SIZE as isize) as *mut c_void,
-                               (self.env.length as u64 - PAGE_SIZE as u64) as size_t,MS_SYNC);
+                let ok=libc::msync(maps[0].offset(PAGE_SIZE as isize) as *mut c_void,
+                                   (self.env.length as u64 - PAGE_SIZE as u64) as size_t,MS_SYNC);
                 if ok!=0 { return Err(Error::IO(std::io::Error::last_os_error())) }
 
-                let ok= libc::msync(self.env.map as *mut c_void,PAGE_SIZE as size_t,MS_SYNC);
+                let ok= libc::msync(maps[0] as *mut c_void,PAGE_SIZE as size_t,MS_SYNC);
                 if ok!=0 { return Err(Error::IO(std::io::Error::last_os_error())) }
 
                 *self.mutable; // This is actually just unit (prevents dead code warnings)
@@ -571,7 +556,13 @@ impl <'env>MutTxn<'env> {
 impl Drop for Env {
     fn drop(&mut self){
         unsafe {
-            libc::munmap(self.map as *mut c_void,self.length as size_t);
+            for p in self.maps.borrow().iter() {
+                unsafe {
+                    if !(*p).is_null() {
+                        munmap(*p as *mut c_void,self.length);
+                    }
+                }
+            }
             libc::close(self.fd);
         }
     }
