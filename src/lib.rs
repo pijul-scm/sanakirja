@@ -1,8 +1,6 @@
 // TODO:
 // - get rid of initial length -- grow file as needed.
-// - process and thread mutex for mutable transactions.
-//   see http://www.gnu.org/software/libc/manual/html_node/File-Locks.html
-//
+// X process and thread mutex for mutable transactions.
 // X multiple consecutive pages (done with glue_pages)
 // X PAGE_SIZE is now a constant, check modulos/divisions to make that constant too.
 // X merge last page : done for just the last page, but could probably be improved.
@@ -14,25 +12,12 @@
 // - The only pages we write are the ones we allocate.
 
 
-// Problem 1:
-// - Start a reader, moving very slowly down the tree.
-// - Quickly start a mutable transaction, free some of the pages the reader is reading.
-// - Commit, start another one, overwrite some of the free pages.
-// - Go on reading the pages -> the reader reads garbage.
-
-// Solution: before commiting page 0, wait until all readers are done (try to take a lock on the lock file). How about suspended readers?
-
-// Other solution: before starting the second write transaction, make sure all readers are done. How?
-
-
-
-// mdb.c, line 2606: PID locks.
-// crate fs2: lock files.
+// LMDB takes care of zombie readers, at the cost of checking a file of size linear in the number of PIDs at the beginning of every transaction. Also, doesn't work on USB sticks. More details: mdb.c, line 2606: PID locks.
 
 extern crate libc;
 use libc::*;
 use std::ffi::CString;
-use std::sync::{Arc,RwLock,RwLockReadGuard,Mutex,MutexGuard};
+use std::sync::{RwLock,RwLockReadGuard,Mutex,MutexGuard};
 use std::ptr::copy_nonoverlapping;
 use std::collections::HashSet;
 #[macro_use]
@@ -40,14 +25,24 @@ extern crate log;
 use std::cmp::max;
 use std::marker::PhantomData;
 
+extern crate fs2;
+use fs2::FileExt;
+use std::fs::File;
+use std::path::Path;
+
 mod constants;
 use constants::*;
+
 
 #[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
     MutableTxn
 }
+impl From<std::io::Error> for Error {
+    fn from(e:std::io::Error)->Error { Error::IO(e) }
+}
+// Lock order: first take thread locks, then process locks.
 
 // Why are there two synchronization mechanisms?
 // Because we would need to upgrade the read lock into a write lock, and rust has no way to do this.
@@ -56,9 +51,11 @@ pub enum Error {
 pub struct Env {
     length:u64,
     map:*mut u8,
+    lock_file:File,
+    mutable_file:File,
     fd:c_int,
-    lock:Arc<RwLock<()>>, // Ensure all reads are done when sync starts.
-    mutable:Arc<Mutex<()>> // Ensure only one mutable transaction can be started.
+    lock:RwLock<()>, // Ensure all reads are done when sync starts.
+    mutable:Mutex<()> // Ensure only one mutable transaction can be started.
 }
 
 unsafe impl Send for Env {}
@@ -77,9 +74,9 @@ pub struct Txn<'env> {
     guard:RwLockReadGuard<'env,()>,
 }
 
+
 pub struct MutTxn<'env> {
     env:&'env Env,
-    lock:Arc<RwLock<()>>,
     mutable:MutexGuard<'env,()>,
     last_page:u64,
     current_list_page:u64,
@@ -89,6 +86,19 @@ pub struct MutTxn<'env> {
     free_clean_pages:Vec<u64>,
     free_pages:Vec<u64>,
 }
+
+impl<'env> Drop for Txn<'env>{
+    fn drop(&mut self){
+        self.env.lock_file.unlock().unwrap();
+        *self.guard;
+    }
+}
+impl<'env> Drop for MutTxn<'env>{
+    fn drop(&mut self){
+        self.env.mutable_file.unlock().unwrap();
+    }
+}
+
 
 #[derive(Debug)]
 pub struct Statistics {
@@ -117,12 +127,16 @@ impl Env {
                 if memory==libc::MAP_FAILED {
                     Err(Error::IO(std::io::Error::last_os_error()))
                 } else {
+                    let lock_file=try!(File::create(Path::new(file).with_extension(".lock")));
+                    let mutable_file=try!(File::create(Path::new(file).with_extension(".mut")));
                     Ok(Env {
                         length:length,
                         map:memory as *mut u8,
+                        lock_file:lock_file,
+                        mutable_file:mutable_file,
                         fd:fd,
-                        lock:Arc::new(RwLock::new(())),
-                        mutable:Arc::new(Mutex::new(()))
+                        lock:RwLock::new(()),
+                        mutable:Mutex::new(())
                     })
                 }
             }
@@ -132,6 +146,7 @@ impl Env {
     /// Start a read-only transaction.
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
         let read=self.lock.read().unwrap();
+        self.lock_file.lock_shared().unwrap();
         Txn { env:self,guard:read }
     }
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
@@ -144,9 +159,9 @@ impl Env {
             };
             let current_list_position = current_list_length;
             let guard=self.mutable.lock().unwrap();
+            self.mutable_file.lock_exclusive().unwrap();
             Ok(MutTxn {
                 env:self,
-                lock:self.lock.clone(),
                 mutable:guard,
                 last_page:if last_page == 0 { PAGE_SIZE as u64 } else { last_page },
                 current_list_page:current_list_page,
@@ -231,11 +246,11 @@ impl MutPage {
 }
 
 
-pub struct MutPages<'a> { pages:Pages<'a> }
+pub struct MutPages<'a> { pub pages:Pages<'a> }
 
 pub struct Pages<'a> {
-    map:*mut u8,
-    len:usize,
+    pub map:*mut u8,
+    pub len:usize,
     pages:PhantomData<&'a()>
 }
 
@@ -433,7 +448,8 @@ impl <'env>MutTxn<'env> {
             }
             // Take lock
             {
-                *self.lock.write().unwrap();
+                *self.env.lock.write().unwrap();
+                self.env.lock_file.lock_exclusive().unwrap();
                 if last_freed_page == self.last_page - PAGE_SIZE as u64 {
                     writele_64(self.env.map,last_freed_page);
                 } else {
@@ -443,21 +459,21 @@ impl <'env>MutTxn<'env> {
                     writele_64(self.env.map.offset(8),
                                current_page as usize as u64 - self.env.map as usize as u64);
                 }
-            }
-        }
-        // Now commit in order.
-        {
-            let mut ok= unsafe {libc::msync(self.env.map.offset(PAGE_SIZE as isize) as *mut c_void,
-                                            (self.env.length - PAGE_SIZE as u64) as size_t,MS_SYNC) };
-            if ok!=0 {
-                return Err(Error::IO(std::io::Error::last_os_error()))
-            } else {
-                ok= unsafe {libc::msync(self.env.map as *mut c_void,PAGE_SIZE as size_t,MS_SYNC) };
-                if ok!=0 {
-                    return Err(Error::IO(std::io::Error::last_os_error()))
+                let mut ok= libc::msync(self.env.map.offset(PAGE_SIZE as isize) as *mut c_void,
+                                        (self.env.length - PAGE_SIZE as u64) as size_t,MS_SYNC);
+                let result=if ok!=0 {
+                    Err(Error::IO(std::io::Error::last_os_error()))
                 } else {
-                    Ok(())
-                }
+                    ok= libc::msync(self.env.map as *mut c_void,PAGE_SIZE as size_t,MS_SYNC);
+                    if ok!=0 {
+                        Err(Error::IO(std::io::Error::last_os_error()))
+                    } else {
+                        Ok(())
+                    }
+                };
+                self.env.lock_file.unlock().unwrap();
+                *self.mutable; // This is == ()
+                result
             }
         }
     }

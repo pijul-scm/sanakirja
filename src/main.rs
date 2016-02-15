@@ -37,7 +37,7 @@ fn main(){
             }
             //page.free(&mut txn);
             let pages=[page0,page1];
-            txn.glue_mut_pages(&pages);
+            txn.glue_mut_pages(&pages).unwrap();
             println!("free done");
             txn.commit().unwrap();
         })
