@@ -32,7 +32,7 @@
 extern crate libc;
 use libc::*;
 use std::ffi::CString;
-use std::sync::{Arc,Mutex,MutexGuard};
+use std::sync::{Arc,RwLock,RwLockReadGuard};
 use std::ptr::copy_nonoverlapping;
 use std::collections::HashSet;
 #[macro_use]
@@ -53,7 +53,7 @@ pub struct Env {
     length:u64,
     map:*mut u8,
     fd:c_int,
-    mutable:std::sync::Arc<std::sync::Mutex<()>>,
+    lock:std::sync::Arc<RwLock<()>>,
 }
 
 unsafe impl Send for Env {}
@@ -69,11 +69,12 @@ pub unsafe fn writele_64(p:*mut u8,v:u64) {
 
 pub struct Txn<'env> {
     env:&'env Env,
+    guard:RwLockReadGuard<'env,()>,
 }
 
 pub struct MutTxn<'env> {
     txn:Txn<'env>,
-    mutable:MutexGuard<'env,()>,
+    lock:Arc<RwLock<()>>,
     last_page:u64,
     current_list_page:u64,
     current_list_length:u64,
@@ -114,7 +115,7 @@ impl Env {
                         length:length,
                         map:memory as *mut u8,
                         fd:fd,
-                        mutable:std::sync::Arc::new(std::sync::Mutex::new(()))
+                        lock:Arc::new(RwLock::new(()))
                     })
                 }
             }
@@ -123,12 +124,12 @@ impl Env {
 
     /// Start a read-only transaction.
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
-        Txn { env:self }
+        let read=self.lock.read().unwrap();
+        Txn { env:self,guard:read }
     }
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
     pub fn txn_mut_begin<'env>(&'env self)->Result<MutTxn<'env>,Error> {
         let txn=self.txn_begin();
-        let guard=self.mutable.lock().unwrap();
         unsafe {
             let last_page=readle_64(self.map);
             let current_list_page=readle_64(self.map.offset(8));
@@ -138,7 +139,7 @@ impl Env {
             let current_list_position = current_list_length;
             Ok(MutTxn {
                 txn:txn,
-                mutable:guard,
+                lock:self.lock.clone(),
                 last_page:if last_page == 0 { PAGE_SIZE as u64 } else { last_page },
                 current_list_page:current_list_page,
                 current_list_length:current_list_length,
@@ -350,7 +351,6 @@ impl <'env>MutTxn<'env> {
 
     /// Commit a transaction. This is guaranteed to be atomic: either the commit succeeds, and all the changes made during the transaction are written to disk. Or the commit doesn't succeed, and we're back to the state just before starting the transaction.
     pub fn commit(mut self)->Result<(),Error>{
-        *(self.mutable); // avoid "unused field" warning.
         // Tasks:
         // - allocate new pages (copy-on-write) to write the new list of free pages, including edited "stack pages".
         //
@@ -418,14 +418,19 @@ impl <'env>MutTxn<'env> {
                     }
                 }
             }
-            if last_freed_page == self.last_page - PAGE_SIZE as u64 {
-                writele_64(self.txn.env.map,last_freed_page);
-            } else {
-                writele_64(self.txn.env.map,self.last_page);
-            }
-            if !current_page.is_null() {
-                writele_64(self.txn.env.map.offset(8),
-                           current_page as usize as u64 - self.txn.env.map as usize as u64);
+            // Take lock
+            {
+                drop(self.txn.guard);
+                *self.lock.write().unwrap();
+                if last_freed_page == self.last_page - PAGE_SIZE as u64 {
+                    writele_64(self.txn.env.map,last_freed_page);
+                } else {
+                    writele_64(self.txn.env.map,self.last_page);
+                }
+                if !current_page.is_null() {
+                    writele_64(self.txn.env.map.offset(8),
+                               current_page as usize as u64 - self.txn.env.map as usize as u64);
+                }
             }
         }
         // Now commit in order.
@@ -447,7 +452,7 @@ impl <'env>MutTxn<'env> {
 
     /// Abort the transaction. This is actually a no-op, just as a machine crash aborts a transaction. Letting the transaction go out of scope would have the same effect.
     pub fn abort(self){
-        *(self.mutable); // No-op, just for a symbolic reason ;-)
+
     }
 }
 
