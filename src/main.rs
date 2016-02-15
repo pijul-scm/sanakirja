@@ -10,7 +10,7 @@ fn main(){
     f.lock_exclusive().unwrap();
     env_logger::init().unwrap();
     //Env::test_concat_mmap("/tmp/test", &[(0,4096), (20480,4096)]);
-    let env=Env::new("/tmp/test",100).unwrap();
+    let env=Env::new("/tmp/test",18).unwrap();
     let env=std::sync::Arc::new(env);
     let thr={
         let env=env.clone();
@@ -36,8 +36,8 @@ fn main(){
                 }
             }
             //page.free(&mut txn);
-            let pages=[page0,page1];
-            txn.glue_mut_pages(&pages).unwrap();
+            //let pages=[page0,page1];
+            //txn.glue_mut_pages(&pages).unwrap();
             println!("free done");
             txn.commit().unwrap();
         })

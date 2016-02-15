@@ -188,7 +188,7 @@ impl Env {
             let mut free_pages = HashSet::new();
             let mut bookkeeping_pages = Vec::new();
             let mut cur=readle_64(self.map.offset(8));
-            loop {
+            while cur!=0 {
                 bookkeeping_pages.push(cur);
                 let p=self.map.offset(cur as isize);
                 let prev=readle_64(p);
@@ -204,9 +204,7 @@ impl Env {
                         i+=8
                     }
                 }
-                if prev==0 { break } else {
-                    cur=prev
-                }
+                cur=prev
             }
             Statistics {
                 total_pages:(total_pages/PAGE_SIZE) as u64,
@@ -276,11 +274,7 @@ impl <'env>MutTxn<'env> {
     fn offset(&mut self,off:u64)-> *mut u8 {
         // Allocate more space in the file if needed, adding a new mapping
         let index=(off>>self.env.log_length) as usize;
-        /*
-        while index >= self.map.len() {
-            self.map.push(std::ptr::null_mut())
-        }
-         */
+        println!("offset index:{}",index);
         unsafe {
             self.maps[index].offset((off & self.env.mask_length) as isize)
         }
@@ -290,26 +284,28 @@ impl <'env>MutTxn<'env> {
     fn free_pages_pop(&mut self)->Option<u64> {
         unsafe {
             debug!("free_pages_pop, current_list_position:{}",self.current_list_position);
-            if self.current_list_position==0 {
-                let previous_page = { let off=self.current_list_page; readle_64(self.offset(off)) };
-                debug!("free_pages_pop, previous page:{}",previous_page);
-                if previous_page == 0 {
-                    None
-                } else {
-                    // free page, move to previous one and call recursively.
-                    self.free_pages.push(self.current_list_page);
-                    self.current_list_length = {let off=self.current_list_page + 8;readle_64(self.offset(off))};
-                    self.current_list_page = previous_page;
+            if self.current_list_page==0 { None } else {
+                if self.current_list_position==0 {
+                    let previous_page = { let off=self.current_list_page; readle_64(self.offset(off)) };
+                    debug!("free_pages_pop, previous page:{}",previous_page);
+                    if previous_page == 0 {
+                        None
+                    } else {
+                        // free page, move to previous one and call recursively.
+                        self.free_pages.push(self.current_list_page);
+                        self.current_list_length = {let off=self.current_list_page + 8;readle_64(self.offset(off))};
+                        self.current_list_page = previous_page;
 
-                    self.free_pages_pop()
+                        self.free_pages_pop()
+                    }
+                } else {
+                    let cur=self.current_list_page;
+                    let pos=self.current_list_position;
+                    // find the page at the top.
+                    self.current_list_position -= 8;
+                    debug!("free_pages_pop, new position:{}",self.current_list_position);
+                    Some(readle_64(self.offset(cur + 8 + pos)))
                 }
-            } else {
-                let cur=self.current_list_page;
-                let pos=self.current_list_position;
-                // find the page at the top.
-                self.current_list_position -= 8;
-                debug!("free_pages_pop, new position:{}",self.current_list_position);
-                Some(readle_64(self.offset(cur + 8 + pos)))
             }
         }
     }
@@ -477,9 +473,7 @@ impl <'env>MutTxn<'env> {
                 } else {
                     writele_64(self.offset(0),self.last_page);
                 }
-                if !current_page.is_null() {
-                    writele_64(self.offset(8),current_page_offset);
-                }
+                writele_64(self.offset(8),current_page_offset);
                 // synchronize all maps
                 for map in self.maps.iter().skip(1) {
                     let ok= libc::msync(*map as *mut c_void,self.env.length as size_t,MS_SYNC);
