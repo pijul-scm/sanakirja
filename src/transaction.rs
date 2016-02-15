@@ -36,7 +36,6 @@ use constants::*;
 #[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
-    MutableTxn
 }
 impl From<std::io::Error> for Error {
     fn from(e:std::io::Error)->Error { Error::IO(e) }
@@ -122,7 +121,8 @@ impl Env {
         unsafe {
             let length:usize=(1 as usize).shl(log_length);
             assert!(length>=PAGE_SIZE);
-            let name=CString::new(file).unwrap();
+            let path=Path::new(file).join("db");
+            let name=CString::new(path.to_str().unwrap()).unwrap();
             let fd=libc::open(name.as_ptr(),O_CREAT|O_RDWR,0o777);
             let ftrunc=libc::ftruncate(fd,length as off_t);
             if ftrunc<0 {
@@ -136,8 +136,8 @@ impl Env {
                 if memory==libc::MAP_FAILED {
                     Err(Error::IO(std::io::Error::last_os_error()))
                 } else {
-                    let lock_file=try!(File::create(Path::new(file).with_extension(".lock")));
-                    let mutable_file=try!(File::create(Path::new(file).with_extension(".mut")));
+                    let lock_file=try!(File::create(Path::new(file).join("db").with_extension(".lock")));
+                    let mutable_file=try!(File::create(Path::new(file).join("db").with_extension(".mut")));
                     let env=Env {
                         length:length,
                         log_length:log_length,

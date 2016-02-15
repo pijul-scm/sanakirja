@@ -4,7 +4,7 @@ extern crate fs2;
 use fs2::FileExt;
 use std::fs::File;
 
-use dictionnaire::transaction::*;
+use dictionnaire::*;
 
 fn main(){
     let f=File::create("/tmp/truc").unwrap();
