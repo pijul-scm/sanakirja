@@ -9,5 +9,7 @@ libc="*"
 log="*"
 env_logger="*"
 
+fs2="*"
+
 [build-dependencies]
 libc="*"
