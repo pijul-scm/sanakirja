@@ -29,7 +29,7 @@ fn main(){
                     p[i]=v[i]
                 }
             }
-            txn.free_page(page);
+            page.free(&mut txn);
             println!("free done");
             txn.commit().unwrap();
         })

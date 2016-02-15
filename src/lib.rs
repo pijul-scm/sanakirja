@@ -1,7 +1,8 @@
 // TODO:
 // - get rid of initial length -- grow file as needed.
-// - process mutex for mutable transactions.
+// - process and thread mutex for mutable transactions.
 //   see http://www.gnu.org/software/libc/manual/html_node/File-Locks.html
+//
 // X multiple consecutive pages (done with glue_pages)
 // X PAGE_SIZE is now a constant, check modulos/divisions to make that constant too.
 // X merge last page : done for just the last page, but could probably be improved.
@@ -24,6 +25,9 @@
 // Other solution: before starting the second write transaction, make sure all readers are done. How?
 
 
+
+// mdb.c, line 2606: PID locks.
+// crate fs2: lock files.
 
 extern crate libc;
 use libc::*;
@@ -116,6 +120,7 @@ impl Env {
             }
         }
     }
+
     /// Start a read-only transaction.
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
         Txn { env:self }
@@ -187,37 +192,57 @@ pub struct Page {
     pub len:usize
 }
 
+pub struct MutPage{page:Page}
+
 impl Page {
     pub unsafe fn as_slice<'a>(&'a self)->&'a[u8]{
         std::slice::from_raw_parts(self.data as *const u8,self.len as usize)
     }
-    pub unsafe fn as_mut_slice<'a>(&'a mut self)->&'a mut [u8]{
-        std::slice::from_raw_parts_mut(self.data as *mut u8,self.len)
+    pub fn free(&self,txn:&mut MutTxn) {
+        let offset=(self.data as usize as u64) - (txn.txn.env.map as usize as u64);
+        // If this page was allocated during this transaction
+        if txn.occupied_clean_pages.remove(&offset) {
+            txn.free_clean_pages.push(offset);
+        } else {
+            // Else, register it for freeing (we cannot reuse it in this transaction).
+            txn.free_pages.push(offset)
+        }
     }
 }
 
-// WARNING: do not allocate anything while a Pages is in scope, the mutable borrow should take care of this.
-pub struct Pages<'a,'txn> {
-    pages:&'a [Page],
-    txn:PhantomData<&'txn()>
+impl MutPage {
+    pub unsafe fn as_slice<'a>(&'a self)->&'a[u8] { self.page.as_slice() }
+    pub unsafe fn as_mut_slice<'a>(&'a mut self)->&'a mut [u8]{
+        std::slice::from_raw_parts_mut(self.page.data as *mut u8,self.page.len)
+    }
+    pub fn free(&self,txn:&mut MutTxn) {
+        self.page.free(txn)
+    }
 }
 
-impl<'a,'txn> Drop for Pages<'a,'txn> {
+
+
+
+pub struct Pages<'a> {
+    map:*mut u8,
+    len:usize,
+    pages:PhantomData<&'a()>
+}
+
+impl<'a> Drop for Pages<'a> {
     fn drop(&mut self) {
-        let mut memory=std::ptr::null_mut();
-        for page in self.pages {
-            if memory.is_null() {
-                memory=page.data;
-            } else {
-                unsafe {
-                    memory=memory.offset(PAGE_SIZE as isize);
-                    munmap(memory as *mut c_void,PAGE_SIZE);
-                }
+        let mut memory=self.map;
+        let mut l=0;
+        while l<self.len {
+            unsafe {
+                munmap(memory as *mut c_void,PAGE_SIZE);
+                l+=PAGE_SIZE;
+                memory=memory.offset(PAGE_SIZE as isize)
             }
         }
-
     }
 }
+
 
 impl <'env>MutTxn<'env> {
 
@@ -249,86 +274,80 @@ impl <'env>MutTxn<'env> {
         }
     }
     /// Allocate a single page.
-    pub fn alloc_page(&mut self)->Option<Page> {
+    pub fn alloc_page(&mut self)->Option<MutPage> {
         debug!("alloc page");
         unsafe {
             // If we have allocated and freed a page in this transaction, use it first.
             if let Some(page)=self.free_clean_pages.pop() {
                 debug!("clean page reuse:{}",page);
-                Some(Page {
+                Some(MutPage{page:Page {
                     data:self.txn.env.map.offset(page as isize),
                     len:PAGE_SIZE as usize,
-                })
+                }})
             } else {
                 // Else, if there are free pages, take one.
                 if let Some(page)=self.free_pages_pop() {
                     debug!("using an old free page: {}",page);
                     self.occupied_clean_pages.insert(page);
-                    Some(Page {
+                    Some(MutPage{page:Page {
                         data:self.txn.env.map.offset(page as isize),
                         len:PAGE_SIZE as usize,
-                    })
+                    }})
                 } else {
                     // Else, allocate in the free space.
                     let last=self.last_page;
                     debug!("eating the free space: {}",last);
                     self.last_page += PAGE_SIZE as u64;
-                    Some(Page {
+                    Some(MutPage{page:Page {
                         data:self.txn.env.map.offset(last as isize),
                         len:PAGE_SIZE as usize
-                    })
+                    }})
                 }
             }
         }
     }
 
-    pub fn glue_pages<'a,'txn>(&'txn self,pages:&'a[Page])->Result<Pages<'a,'txn>,Error> {
+    pub fn load_page(&self,off:u64)->Page {
+        unsafe {
+            Page { data:self.txn.env.map.offset(off as isize),
+                   len:PAGE_SIZE }
+        }
+    }
+
+    pub fn glue_pages<'a>(&self,pages:&'a[Page])->Result<Pages<'a>,Error> {
         let mut memory=std::ptr::null_mut();
         let mut p0=std::ptr::null_mut();
+        let mut l=0;
         for p in pages {
-            if memory.is_null() {
-                memory=p.data;
-                p0=p.data
-            } else {
-                unsafe {
-                    memory=libc::mmap(memory.offset(PAGE_SIZE as isize) as *mut c_void,
-                                      PAGE_SIZE as size_t,
-                                      PROT_READ|PROT_WRITE,
-                                      MAP_SHARED | MAP_FIXED,
-                                      self.txn.env.fd,0) as *mut u8;
-                }
+            unsafe {
+                memory=libc::mmap(memory.offset(PAGE_SIZE as isize) as *mut c_void,
+                                  PAGE_SIZE as size_t,
+                                  PROT_READ|PROT_WRITE,
+                                  MAP_SHARED | MAP_FIXED,
+                                  self.txn.env.fd,
+
+                                  (p.data as usize - self.txn.env.map as usize) as off_t
+
+                                  ) as *mut u8;
                 if memory as *mut c_void == libc::MAP_FAILED {
                     let err=std::io::Error::last_os_error();
-                    unsafe {
-                        loop {
-                            memory=memory.offset(-(PAGE_SIZE as isize));
-                            if memory == p0 {
-                                break
-                            } else {
-                                munmap(memory as *mut c_void,PAGE_SIZE);
-                            }
-                        }
+                    {
+                        // the Drop trait unmaps the memory.
+                        Pages {map:p0,len:l,pages:PhantomData };
                     }
                     return Err(Error::IO(err));
+                } else {
+                    if p0.is_null() {
+                        p0=memory
+                    }
+                    l += PAGE_SIZE
                 }
             }
         }
-        Ok(Pages {pages:pages,txn:PhantomData})
+        Ok(Pages {map:p0,len:l,pages:PhantomData})
     }
 
 
-
-    /// Free a single page (not necessarily allocated in the current transaction).
-    pub fn free_page(&mut self,p:Page) {
-        let offset=(p.data as usize as u64) - (self.txn.env.map as usize as u64);
-        // If this page was allocated during this transaction
-        if self.occupied_clean_pages.remove(&offset) {
-            self.free_clean_pages.push(offset);
-        } else {
-            // Else, register it for freeing (we cannot reuse it in this transaction).
-            self.free_pages.push(offset)
-        }
-    }
     /// Commit a transaction. This is guaranteed to be atomic: either the commit succeeds, and all the changes made during the transaction are written to disk. Or the commit doesn't succeed, and we're back to the state just before starting the transaction.
     pub fn commit(mut self)->Result<(),Error>{
         *(self.mutable); // avoid "unused field" warning.
@@ -340,10 +359,6 @@ impl <'env>MutTxn<'env> {
         //
         // everything can be sync'ed at any time, except that the first page needs to be sync'ed last.
         unsafe {
-            {
-                let len=readle_64(self.txn.env.map.offset(12288 + 8));
-                debug!("len of 2nd page: {}",len)
-            }
             // While we've not written everything.
             // Write free pages first.
             let mut current_page:*mut u8= std::ptr::null_mut();
@@ -361,25 +376,21 @@ impl <'env>MutTxn<'env> {
                     if self.current_list_page != 0 {
                         debug!("Copying from {} to {}",
                                self.current_list_page,
-                               (new_page.data as usize as u64) - (self.txn.env.map as usize as u64));
+                               (new_page.page.data as usize as u64) - (self.txn.env.map as usize as u64));
                         copy_nonoverlapping(self.txn.env.map.offset(self.current_list_page as isize),
-                                            new_page.data,
+                                            new_page.page.data,
                                             16 + self.current_list_position as usize);
-                        writele_64(new_page.data.offset(8), self.current_list_position);
+                        writele_64(new_page.page.data.offset(8), self.current_list_position);
                         self.free_pages.push(self.current_list_page);
-                        let off=readle_64(new_page.data);
+                        let off=readle_64(new_page.page.data);
                         let len=readle_64(self.txn.env.map.offset(self.current_list_page as isize + 8));
                         debug!("off={}, len={}",off,len);
                     } else {
                         debug!("commit: allocate");
-                        writele_64(new_page.data, 0); // previous page: none
-                        writele_64(new_page.data.offset(8), 0); // len: 0
-                        {
-                            let len=readle_64(self.txn.env.map.offset(12288 + 8));
-                            debug!("len of 2nd page: {}",len)
-                        }
+                        writele_64(new_page.page.data, 0); // previous page: none
+                        writele_64(new_page.page.data.offset(8), 0); // len: 0
                     }
-                    current_page = new_page.data
+                    current_page = new_page.page.data
                 } else {
                     debug!("commit: current is not null");
                     let len=readle_64(current_page.offset(8));
@@ -389,11 +400,11 @@ impl <'env>MutTxn<'env> {
                         let new_page = self.alloc_page().unwrap();
 
                         // Write a reference to the current page (which cannot be null).
-                        writele_64(new_page.data, current_page as usize as u64 - self.txn.env.map as usize as u64);
+                        writele_64(new_page.page.data, current_page as usize as u64 - self.txn.env.map as usize as u64);
                         // Write the length of the new page (0).
-                        writele_64(new_page.data.offset(8), 0);
+                        writele_64(new_page.page.data.offset(8), 0);
 
-                        current_page = new_page.data
+                        current_page = new_page.page.data
                     } else {
                         // push
 
