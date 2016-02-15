@@ -46,6 +46,8 @@ impl From<std::io::Error> for Error {
 // Because we would need to upgrade the read lock into a write lock, and rust has no way to do this.
 // So, we take a mutex to make sure no other mutable transaction can start,
 // and then at the time of writing, we also take the RwLock.
+
+/// Environment, required to start any transactions. Thread-safe, but opening the same database several times in the same process is not cross-platform.
 pub struct Env {
     length:usize,
     log_length:usize,
@@ -70,6 +72,7 @@ pub unsafe fn writele_64(p:*mut u8,v:u64) {
 
 pub struct Txn<'env> {
     env:&'env Env,
+    maps:Vec<*mut u8>,
     guard:RwLockReadGuard<'env,()>,
 }
 
@@ -89,6 +92,13 @@ pub struct MutTxn<'env> {
 
 impl<'env> Drop for Txn<'env>{
     fn drop(&mut self){
+        for p in self.maps.iter().skip(1) {
+            unsafe {
+                if !(*p).is_null() {
+                    munmap(*p as *mut c_void,self.env.length);
+                }
+            }
+        }
         self.env.lock_file.unlock().unwrap();
         *self.guard;
     }
@@ -158,8 +168,9 @@ impl Env {
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
         let read=self.lock.read().unwrap();
         self.lock_file.lock_shared().unwrap();
-        Txn { env:self,guard:read }
+        Txn { env:self,guard:read,maps:vec!(self.map) }
     }
+
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
     pub fn txn_mut_begin<'env>(&'env self)->Result<MutTxn<'env>,Error> {
         unsafe {
@@ -189,6 +200,7 @@ impl Env {
             })
         }
     }
+
 
     /// Compute statistics about pages. This is a potentially costlty operation, as we need to go through all bookkeeping pages.
     pub fn statistics(&self)->Statistics{
@@ -226,13 +238,16 @@ impl Env {
 
 /// This is a semi-owned page: just as we can mutate several indices of an array in the same scope, we must be able to get several pages from a single environment in the same scope. However, pages don't outlive their environment. Pages longer than one PAGE_SIZE might trigger calls to munmap when they go out of scope.
 pub struct Page {
+    pub data:*const u8,
+    pub len:usize,
+    offset:u64
+}
+pub struct MutPage {
     pub data:*mut u8,
     pub len:usize,
     offset:u64
 }
 
-// Any other definition for MutPage breaks transmutes.
-pub struct MutPage{page:Page}
 
 impl Page {
     pub unsafe fn as_slice<'a>(&'a self)->&'a[u8]{
@@ -250,12 +265,14 @@ impl Page {
 }
 
 impl MutPage {
-    pub unsafe fn as_slice<'a>(&'a self)->&'a[u8] { self.page.as_slice() }
+    pub unsafe fn as_slice<'a>(&'a self)->&'a[u8] {
+        std::slice::from_raw_parts(self.data as *const u8,self.len as usize)
+    }
     pub unsafe fn as_mut_slice<'a>(&'a mut self)->&'a mut [u8]{
-        std::slice::from_raw_parts_mut(self.page.data as *mut u8,self.page.len)
+        std::slice::from_raw_parts_mut(self.data as *mut u8,self.len)
     }
     pub fn free(&self,txn:&mut MutTxn) {
-        self.page.free(txn)
+        let p:&Page = unsafe { std::mem::transmute(self) }; p.free(txn)
     }
 }
 
@@ -277,29 +294,99 @@ impl<'a> Drop for Pages<'a> {
     }
 }
 
+fn offset(env:&Env, maps:&mut Vec<*mut u8>,off:u64)-> *mut u8 {
+    // Allocate more space in the file if needed, adding a new mapping
+    let index=(off>>env.log_length) as usize;
+    while index>= maps.len() {
+        maps.push(std::ptr::null_mut())
+    }
+    unsafe {
+        let map = maps.get_unchecked_mut(index);
+        if (*map).is_null(){
+            *map=mmap(std::ptr::null_mut(),
+                      env.length,
+                      PROT_READ|PROT_WRITE,
+                      MAP_SHARED,
+                      env.fd,off as off_t) as *mut u8;
+            if (*map as *mut c_void)==libc::MAP_FAILED{
+                panic!(format!("mmap failed: {:?}", std::io::Error::last_os_error()))
+            }
+        }
+        (*map).offset((off & env.mask_length) as isize)
+    }
+}
 
+pub fn load_page(env:&Env,maps:&mut Vec<*mut u8>,off:u64)->Page {
+    Page { data:offset(env,maps,off),
+           len:PAGE_SIZE,
+           offset:off }
+}
+pub fn glue_mut_pages<'a>(env:&Env,pages:&'a[MutPage])->Result<MutPages<'a>,Error> {
+    unsafe {
+        glue_pages(env,std::mem::transmute(pages)).and_then(|x| Ok(MutPages {pages:x}))
+    }
+}
+pub fn glue_pages<'a>(env:&Env,pages:&'a[Page])->Result<Pages<'a>,Error> {
+    let mut memory=std::ptr::null_mut();
+    let mut p0=std::ptr::null_mut();
+    let mut l=0;
+    for p in pages {
+        unsafe {
+            if memory.is_null() {
+                memory=libc::mmap(memory as *mut c_void,
+                                  PAGE_SIZE as size_t,
+                                  PROT_READ|PROT_WRITE,
+                                  MAP_SHARED,
+                                  env.fd,
+                                  p.offset as off_t
+                                  ) as *mut u8;
+            } else {
+                memory=libc::mmap(memory.offset(PAGE_SIZE as isize) as *mut c_void,
+                                  PAGE_SIZE as size_t,
+                                  PROT_READ|PROT_WRITE,
+                                  MAP_SHARED | MAP_FIXED,
+                                  env.fd,
+                                  p.offset as off_t
+                                  ) as *mut u8;
+            }
+            if memory as *mut c_void == libc::MAP_FAILED {
+                let err=std::io::Error::last_os_error();
+                {
+                    // the Drop trait unmaps the memory.
+                    Pages {map:p0,len:l,pages:PhantomData };
+                }
+                return Err(Error::IO(err));
+            } else {
+                if p0.is_null() {
+                    p0=memory
+                }
+                l += PAGE_SIZE
+            }
+        }
+    }
+    Ok(Pages {map:p0,len:l,pages:PhantomData})
+}
+
+
+impl <'env>Txn<'env> {
+    /// Find the appropriate map segment
+    pub fn offset(&mut self,off:u64)->*mut u8 {
+        offset(self.env,&mut self.maps, off)
+    }
+}
 impl <'env>MutTxn<'env> {
     /// Find the appropriate map segment
-    fn offset(&mut self,off:u64)-> *mut u8 {
-        // Allocate more space in the file if needed, adding a new mapping
-        let index=(off>>self.env.log_length) as usize;
-        while index>= self.maps.len() {
-            self.maps.push(std::ptr::null_mut())
-        }
-        unsafe {
-            let map = self.maps.get_unchecked_mut(index);
-            if (*map).is_null(){
-                *map=mmap(std::ptr::null_mut(),
-                          self.env.length,
-                          PROT_READ|PROT_WRITE,
-                          MAP_SHARED,
-                          self.env.fd,off as off_t) as *mut u8;
-                if (*map as *mut c_void)==libc::MAP_FAILED{
-                    panic!(format!("mmap failed: {:?}", std::io::Error::last_os_error()))
-                }
-            }
-            (*map).offset((off & self.env.mask_length) as isize)
-        }
+    pub fn offset(&mut self,off:u64)->*mut u8 {
+        offset(self.env,&mut self.maps, off)
+    }
+    pub fn load_page(&mut self,off:u64)->Page {
+        load_page(self.env,&mut self.maps,off)
+    }
+    pub fn glue_pages<'a>(&self,pages:&'a[Page])->Result<Pages<'a>,Error> {
+        glue_pages(self.env,pages)
+    }
+    pub fn glue_mut_pages<'a>(&self,pages:&'a[MutPage])->Result<MutPages<'a>,Error> {
+        glue_mut_pages(self.env,pages)
     }
 
     /// Pop a free page from the list of free pages.
@@ -337,86 +424,34 @@ impl <'env>MutTxn<'env> {
         // If we have allocated and freed a page in this transaction, use it first.
         if let Some(page)=self.free_clean_pages.pop() {
             debug!("clean page reuse:{}",page);
-            Some(MutPage{page:Page {
+            Some(MutPage {
                 data:self.offset(page),
                 len:PAGE_SIZE as usize,
                 offset:page
-            }})
+            })
         } else {
             // Else, if there are free pages, take one.
             if let Some(page)=self.free_pages_pop() {
                 debug!("using an old free page: {}",page);
                 self.occupied_clean_pages.insert(page);
-                Some(MutPage{page:Page {
+                Some(MutPage {
                     data:self.offset(page),
                     len:PAGE_SIZE as usize,
                     offset:page
-                }})
+                })
             } else {
                 // Else, allocate in the free space.
                 let last=self.last_page;
                 debug!("eating the free space: {}",last);
                 self.last_page += PAGE_SIZE as u64;
-                Some(MutPage{page:Page {
+                Some(MutPage {
                     data:self.offset(last),
                     len:PAGE_SIZE as usize,
                     offset:last
-                }})
+                })
             }
         }
     }
-
-    pub fn load_page(&mut self,off:u64)->Page {
-        Page { data:self.offset(off),
-               len:PAGE_SIZE,
-               offset:off }
-    }
-    pub fn glue_mut_pages<'a>(&self,pages:&'a[MutPage])->Result<MutPages<'a>,Error> {
-        unsafe {
-            self.glue_pages(std::mem::transmute(pages)).and_then(|x| Ok(MutPages {pages:x}))
-        }
-    }
-    pub fn glue_pages<'a>(&self,pages:&'a[Page])->Result<Pages<'a>,Error> {
-        let mut memory=std::ptr::null_mut();
-        let mut p0=std::ptr::null_mut();
-        let mut l=0;
-        for p in pages {
-            unsafe {
-                if memory.is_null() {
-                    memory=libc::mmap(memory as *mut c_void,
-                                      PAGE_SIZE as size_t,
-                                      PROT_READ|PROT_WRITE,
-                                      MAP_SHARED,
-                                      self.env.fd,
-                                      p.offset as off_t
-                                      ) as *mut u8;
-                } else {
-                    memory=libc::mmap(memory.offset(PAGE_SIZE as isize) as *mut c_void,
-                                      PAGE_SIZE as size_t,
-                                      PROT_READ|PROT_WRITE,
-                                      MAP_SHARED | MAP_FIXED,
-                                      self.env.fd,
-                                      p.offset as off_t
-                                      ) as *mut u8;
-                }
-                if memory as *mut c_void == libc::MAP_FAILED {
-                    let err=std::io::Error::last_os_error();
-                    {
-                        // the Drop trait unmaps the memory.
-                        Pages {map:p0,len:l,pages:PhantomData };
-                    }
-                    return Err(Error::IO(err));
-                } else {
-                    if p0.is_null() {
-                        p0=memory
-                    }
-                    l += PAGE_SIZE
-                }
-            }
-        }
-        Ok(Pages {map:p0,len:l,pages:PhantomData})
-    }
-
 
     /// Commit a transaction. This is guaranteed to be atomic: either the commit succeeds, and all the changes made during the transaction are written to disk. Or the commit doesn't succeed, and we're back to the state just before starting the transaction.
     pub fn commit(mut self)->Result<(),Error>{
@@ -445,22 +480,22 @@ impl <'env>MutTxn<'env> {
                     if self.current_list_page.offset != 0 {
                         debug!("Copying from {} to {}",
                                self.current_list_page.offset,
-                               new_page.page.offset);
+                               new_page.offset);
                         copy_nonoverlapping(self.current_list_page.data,
-                                            new_page.page.data,
+                                            new_page.data,
                                             16 + self.current_list_position as usize);
-                        writele_64(new_page.page.data.offset(8), self.current_list_position);
+                        writele_64(new_page.data.offset(8), self.current_list_position);
                         self.free_pages.push(self.current_list_page.offset);
-                        let off=readle_64(new_page.page.data);
+                        let off=readle_64(new_page.data);
                         let len=readle_64(self.current_list_page.data.offset(8));
                         debug!("off={}, len={}",off,len);
                     } else {
                         debug!("commit: allocate");
-                        writele_64(new_page.page.data, 0); // previous page: none
-                        writele_64(new_page.page.data.offset(8), 0); // len: 0
+                        writele_64(new_page.data, 0); // previous page: none
+                        writele_64(new_page.data.offset(8), 0); // len: 0
                     }
-                    current_page = new_page.page.data;
-                    current_page_offset = new_page.page.offset;
+                    current_page = new_page.data;
+                    current_page_offset = new_page.offset;
                 } else {
                     debug!("commit: current is not null");
                     let len=readle_64(current_page.offset(8));
@@ -470,12 +505,12 @@ impl <'env>MutTxn<'env> {
                         let new_page = self.alloc_page().unwrap();
 
                         // Write a reference to the current page (which cannot be null).
-                        writele_64(new_page.page.data, current_page_offset);
+                        writele_64(new_page.data, current_page_offset);
                         // Write the length of the new page (0).
-                        writele_64(new_page.page.data.offset(8), 0);
+                        writele_64(new_page.data.offset(8), 0);
 
-                        current_page = new_page.page.data;
-                        current_page_offset = new_page.page.offset
+                        current_page = new_page.data;
+                        current_page_offset = new_page.offset
                     } else {
                         // push
                         let p=self.free_pages.pop().unwrap_or_else(|| self.free_clean_pages.pop().unwrap());
