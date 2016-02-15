@@ -13,3 +13,8 @@ fs2="*"
 
 [build-dependencies]
 libc="*"
+
+
+[[bin]]
+name="dictionnaire"
+doc=false

@@ -1,9 +1,10 @@
 extern crate dictionnaire;
-use dictionnaire::*;
 extern crate env_logger;
 extern crate fs2;
 use fs2::FileExt;
 use std::fs::File;
+
+use dictionnaire::transaction::*;
 
 fn main(){
     let f=File::create("/tmp/truc").unwrap();
