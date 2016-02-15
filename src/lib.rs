@@ -1,5 +1,7 @@
 // TODO:
 // - get rid of initial length, grow file as needed. See fallocate, ftruncate. Equivalents on windows?
+// - 32 bits compatibility. mmap has 64 bits offsets. Equivalent on windows?
+
 // X process and thread mutex for mutable transactions.
 // X multiple consecutive pages (done with glue_pages)
 // X PAGE_SIZE is now a constant, check modulos/divisions to make that constant too.
@@ -8,8 +10,7 @@
 // X test page size in build.rs
 // X documentation
 
-// Types guarantees:
-// - The only pages we write are the ones we allocate.
+// Types guarantee: the only pages we write are the ones we allocate.
 
 // LMDB takes care of zombie readers, at the cost of checking a file of size linear in the number of PIDs at the beginning of every transaction. Also, doesn't work on USB sticks. More details: mdb.c, line 2606: PID locks.
 
@@ -18,12 +19,12 @@ use libc::*;
 use std::ffi::CString;
 use std::sync::{RwLock,RwLockReadGuard,Mutex,MutexGuard};
 use std::ptr::copy_nonoverlapping;
-use std::collections::HashSet;
+use std::collections::{HashSet,HashMap};
 #[macro_use]
 extern crate log;
 use std::cmp::max;
 use std::marker::PhantomData;
-
+use std::ops::Shl;
 extern crate fs2;
 use fs2::FileExt;
 use std::fs::File;
@@ -48,15 +49,16 @@ impl From<std::io::Error> for Error {
 // So, we take a mutex to make sure no other mutable transaction can start,
 // and then at the time of writing, we also take the RwLock.
 pub struct Env {
-    length:u64,
-    map:*mut u8,
+    length:usize,
+    log_length:usize,
+    mask_length:u64,
+    map:HashMap<usize,*mut u8>,
     lock_file:File,
     mutable_file:File,
     fd:c_int,
     lock:RwLock<()>, // Ensure all reads are done when sync starts.
     mutable:Mutex<()> // Ensure only one mutable transaction can be started.
 }
-
 unsafe impl Send for Env {}
 unsafe impl Sync for Env {}
 
@@ -108,10 +110,11 @@ pub struct Statistics {
 
 impl Env {
 
-    /// Initialize environment.
-    pub fn new(file:&str,n_pages:usize)->Result<Env,Error> {
+    /// Initialize environment. log_length must be at least log(PAGE_SIZE)
+    pub fn new(file:&str,log_length:usize)->Result<Env,Error> {
         unsafe {
-            let length=PAGE_SIZE as u64 * n_pages as u64;
+            let length:usize=(1 as usize).shl(log_length);
+            assert!(length>=PAGE_SIZE);
             let name=CString::new(file).unwrap();
             let fd=libc::open(name.as_ptr(),O_CREAT|O_RDWR,0o777);
             let ftrunc=libc::ftruncate(fd,length as off_t);
@@ -128,20 +131,30 @@ impl Env {
                 } else {
                     let lock_file=try!(File::create(Path::new(file).with_extension(".lock")));
                     let mutable_file=try!(File::create(Path::new(file).with_extension(".mut")));
-                    Ok(Env {
+                    let mut env=Env {
                         length:length,
-                        map:memory as *mut u8,
+                        log_length:log_length,
+                        mask_length:(length-1) as u64,
+                        map:HashMap::new(),
                         lock_file:lock_file,
                         mutable_file:mutable_file,
                         fd:fd,
                         lock:RwLock::new(()),
                         mutable:Mutex::new(())
-                    })
+                    };
+                    env.map.insert(0,memory as *mut u8);
+                    Ok(env)
                 }
             }
         }
     }
-
+    /// Find the appropriate map segment
+    unsafe fn offset(&self,off:u64)-> *mut u8 {
+        // Allocate more space in the file if needed, adding a new mapping
+        let index=off>>self.log_length;
+        let map=self.map.get(&(index as usize)).unwrap();
+        map.offset((off & self.mask_length) as isize)
+    }
     /// Start a read-only transaction.
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
         let read=self.lock.read().unwrap();
@@ -151,10 +164,10 @@ impl Env {
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
     pub fn txn_mut_begin<'env>(&'env self)->Result<MutTxn<'env>,Error> {
         unsafe {
-            let last_page=readle_64(self.map);
-            let current_list_page=readle_64(self.map.offset(8));
+            let last_page=readle_64(self.offset(0));
+            let current_list_page=readle_64(self.offset(8));
             let current_list_length = if current_list_page == 0 { 0 } else {
-                readle_64(self.map.offset(current_list_page as isize+8))
+                readle_64(self.offset(current_list_page+8))
             };
             let current_list_position = current_list_length;
             let guard=self.mutable.lock().unwrap();
@@ -176,13 +189,13 @@ impl Env {
     /// Compute statistics about pages. This is a potentially costlty operation, as we need to go through all bookkeeping pages.
     pub fn statistics(&self)->Statistics{
         unsafe {
-            let total_pages = readle_64(self.map) as usize;
+            let total_pages = readle_64(self.offset(0)) as usize;
             let mut free_pages = HashSet::new();
             let mut bookkeeping_pages = Vec::new();
-            let mut cur=readle_64(self.map.offset(8));
+            let mut cur=readle_64(self.offset(8));
             loop {
                 bookkeeping_pages.push(cur);
-                let p=self.map.offset(cur as isize);
+                let p=self.offset(cur);
                 let prev=readle_64(p);
                 let len=readle_64(p.offset(8));
                 println!("- {:?}, {}", cur, len);
@@ -212,7 +225,8 @@ impl Env {
 /// This is a semi-owned page: just as we can mutate several indices of an array in the same scope, we must be able to get several pages from a single environment in the same scope. However, pages don't outlive their environment. Pages longer than one PAGE_SIZE might trigger calls to munmap when they go out of scope.
 pub struct Page {
     pub data:*mut u8,
-    pub len:usize
+    pub len:usize,
+    offset:u64
 }
 
 // Any other definition for MutPage breaks transmutes.
@@ -223,13 +237,12 @@ impl Page {
         std::slice::from_raw_parts(self.data as *const u8,self.len as usize)
     }
     pub fn free(&self,txn:&mut MutTxn) {
-        let offset=(self.data as usize as u64) - (txn.env.map as usize as u64);
         // If this page was allocated during this transaction
-        if txn.occupied_clean_pages.remove(&offset) {
-            txn.free_clean_pages.push(offset);
+        if txn.occupied_clean_pages.remove(&self.offset) {
+            txn.free_clean_pages.push(self.offset);
         } else {
             // Else, register it for freeing (we cannot reuse it in this transaction).
-            txn.free_pages.push(offset)
+            txn.free_pages.push(self.offset)
         }
     }
 }
@@ -255,14 +268,9 @@ pub struct Pages<'a> {
 
 impl<'a> Drop for Pages<'a> {
     fn drop(&mut self) {
-        let mut memory=self.map;
-        let mut l=0;
-        while l<self.len {
-            unsafe {
-                munmap(memory as *mut c_void,PAGE_SIZE);
-                l+=PAGE_SIZE;
-                memory=memory.offset(PAGE_SIZE as isize)
-            }
+        let memory=self.map;
+        unsafe {
+            munmap(memory as *mut c_void,self.len);
         }
     }
 }
@@ -275,14 +283,14 @@ impl <'env>MutTxn<'env> {
         unsafe {
             debug!("free_pages_pop, current_list_position:{}",self.current_list_position);
             if self.current_list_position==0 {
-                let previous_page = readle_64(self.env.map.offset(self.current_list_page as isize));
+                let previous_page = readle_64(self.env.offset(self.current_list_page));
                 debug!("free_pages_pop, previous page:{}",previous_page);
                 if previous_page == 0 {
                     None
                 } else {
                     // free page, move to previous one and call recursively.
                     self.free_pages.push(self.current_list_page);
-                    self.current_list_length = readle_64(self.env.map.offset(self.current_list_page as isize + 8));
+                    self.current_list_length = readle_64(self.env.offset(self.current_list_page + 8));
                     self.current_list_page = previous_page;
 
                     self.free_pages_pop()
@@ -293,7 +301,7 @@ impl <'env>MutTxn<'env> {
                 // find the page at the top.
                 self.current_list_position -= 8;
                 debug!("free_pages_pop, new position:{}",self.current_list_position);
-                Some(readle_64(self.env.map.offset((cur + 8 + pos) as isize)))
+                Some(readle_64(self.env.offset(cur + 8 + pos)))
             }
         }
     }
@@ -305,8 +313,9 @@ impl <'env>MutTxn<'env> {
             if let Some(page)=self.free_clean_pages.pop() {
                 debug!("clean page reuse:{}",page);
                 Some(MutPage{page:Page {
-                    data:self.env.map.offset(page as isize),
+                    data:self.env.offset(page),
                     len:PAGE_SIZE as usize,
+                    offset:page
                 }})
             } else {
                 // Else, if there are free pages, take one.
@@ -314,8 +323,9 @@ impl <'env>MutTxn<'env> {
                     debug!("using an old free page: {}",page);
                     self.occupied_clean_pages.insert(page);
                     Some(MutPage{page:Page {
-                        data:self.env.map.offset(page as isize),
+                        data:self.env.offset(page),
                         len:PAGE_SIZE as usize,
+                        offset:page
                     }})
                 } else {
                     // Else, allocate in the free space.
@@ -323,8 +333,9 @@ impl <'env>MutTxn<'env> {
                     debug!("eating the free space: {}",last);
                     self.last_page += PAGE_SIZE as u64;
                     Some(MutPage{page:Page {
-                        data:self.env.map.offset(last as isize),
-                        len:PAGE_SIZE as usize
+                        data:self.env.offset(last),
+                        len:PAGE_SIZE as usize,
+                        offset:last
                     }})
                 }
             }
@@ -333,8 +344,9 @@ impl <'env>MutTxn<'env> {
 
     pub fn load_page(&self,off:u64)->Page {
         unsafe {
-            Page { data:self.env.map.offset(off as isize),
-                   len:PAGE_SIZE }
+            Page { data:self.env.offset(off),
+                   len:PAGE_SIZE,
+                   offset:off }
         }
     }
     pub fn glue_mut_pages<'a>(&self,pages:&'a[MutPage])->Result<MutPages<'a>,Error> {
@@ -353,9 +365,7 @@ impl <'env>MutTxn<'env> {
                                   PROT_READ|PROT_WRITE,
                                   MAP_SHARED | MAP_FIXED,
                                   self.env.fd,
-
-                                  (p.data as usize - self.env.map as usize) as off_t
-
+                                  p.offset as off_t
                                   ) as *mut u8;
                 if memory as *mut c_void == libc::MAP_FAILED {
                     let err=std::io::Error::last_os_error();
@@ -389,7 +399,7 @@ impl <'env>MutTxn<'env> {
             // While we've not written everything.
             // Write free pages first.
             let mut current_page:*mut u8= std::ptr::null_mut();
-
+            let mut current_page_offset=0;
             // Trick here: we want to merge the last free page with the blank space, but since the following while loop can allocate pages, there is a risk the blank space gets overwritten. Therefore, we'll change the value of last_free_page (in page 0) only if a page has been freed next to it, and none has been allocated in the blank space.
             let mut last_freed_page = 0;
 
@@ -403,21 +413,22 @@ impl <'env>MutTxn<'env> {
                     if self.current_list_page != 0 {
                         debug!("Copying from {} to {}",
                                self.current_list_page,
-                               (new_page.page.data as usize as u64) - (self.env.map as usize as u64));
-                        copy_nonoverlapping(self.env.map.offset(self.current_list_page as isize),
+                               new_page.page.offset);
+                        copy_nonoverlapping(self.env.offset(self.current_list_page),
                                             new_page.page.data,
                                             16 + self.current_list_position as usize);
                         writele_64(new_page.page.data.offset(8), self.current_list_position);
                         self.free_pages.push(self.current_list_page);
                         let off=readle_64(new_page.page.data);
-                        let len=readle_64(self.env.map.offset(self.current_list_page as isize + 8));
+                        let len=readle_64(self.env.offset(self.current_list_page + 8));
                         debug!("off={}, len={}",off,len);
                     } else {
                         debug!("commit: allocate");
                         writele_64(new_page.page.data, 0); // previous page: none
                         writele_64(new_page.page.data.offset(8), 0); // len: 0
                     }
-                    current_page = new_page.page.data
+                    current_page = new_page.page.data;
+                    current_page_offset = new_page.page.offset;
                 } else {
                     debug!("commit: current is not null");
                     let len=readle_64(current_page.offset(8));
@@ -427,14 +438,14 @@ impl <'env>MutTxn<'env> {
                         let new_page = self.alloc_page().unwrap();
 
                         // Write a reference to the current page (which cannot be null).
-                        writele_64(new_page.page.data, current_page as usize as u64 - self.env.map as usize as u64);
+                        writele_64(new_page.page.data, current_page_offset);
                         // Write the length of the new page (0).
                         writele_64(new_page.page.data.offset(8), 0);
 
-                        current_page = new_page.page.data
+                        current_page = new_page.page.data;
+                        current_page_offset = new_page.page.offset
                     } else {
                         // push
-
                         let p=self.free_pages.pop().unwrap_or_else(|| self.free_clean_pages.pop().unwrap());
                         debug!("commit: push {}",p);
                         // This is one of the pages freed by this transaction.
@@ -450,30 +461,42 @@ impl <'env>MutTxn<'env> {
                 *self.env.lock.write().unwrap();
                 self.env.lock_file.lock_exclusive().unwrap();
                 if last_freed_page == self.last_page - PAGE_SIZE as u64 {
-                    writele_64(self.env.map,last_freed_page);
+                    // If the last page was freed by the
+                    // transaction. Maybe other blocks just before it
+                    // were freed too, but they're not merged into the
+                    // blank space. Maybe they should, but since the
+                    // penultimate page might have been freed in a
+                    // previous transaction and not reused, this is
+                    // not very general either, so providing this
+                    // simple mechanism allows for shrinking.
+                    writele_64(self.env.offset(0),last_freed_page);
                 } else {
-                    writele_64(self.env.map,self.last_page);
+                    writele_64(self.env.offset(0),self.last_page);
                 }
                 if !current_page.is_null() {
-                    writele_64(self.env.map.offset(8),
-                               current_page as usize as u64 - self.env.map as usize as u64);
+                    writele_64(self.env.offset(8),current_page_offset);
                 }
-                let mut ok= libc::msync(self.env.map.offset(PAGE_SIZE as isize) as *mut c_void,
-                                        (self.env.length - PAGE_SIZE as u64) as size_t,MS_SYNC);
-                let result=if ok!=0 {
-                    Err(Error::IO(std::io::Error::last_os_error()))
-                } else {
-                    ok= libc::msync(self.env.map as *mut c_void,PAGE_SIZE as size_t,MS_SYNC);
-                    if ok!=0 {
-                        Err(Error::IO(std::io::Error::last_os_error()))
+                // synchronize all maps
+                let mut map0=std::ptr::null_mut();
+                for (i,map) in self.env.map.iter() {
+                    if *i>0 {
+                        let ok= libc::msync(*map as *mut c_void,self.env.length as size_t,MS_SYNC);
+                        if ok!=0 {
+                            return Err(Error::IO(std::io::Error::last_os_error()))
+                        }
                     } else {
-                        Ok(())
+                        map0= *map
                     }
-                };
-                // The following is unnecessary: already unlocked by drop.
-                //self.env.lock_file.unlock().unwrap();
-                *self.mutable; // This is == ()
-                result
+                }
+                let ok=libc::msync(map0.offset(PAGE_SIZE as isize) as *mut c_void,
+                               (self.env.length as u64 - PAGE_SIZE as u64) as size_t,MS_SYNC);
+                if ok!=0 { return Err(Error::IO(std::io::Error::last_os_error())) }
+
+                let ok= libc::msync(map0 as *mut c_void,PAGE_SIZE as size_t,MS_SYNC);
+                if ok!=0 { return Err(Error::IO(std::io::Error::last_os_error())) }
+
+                *self.mutable; // This is actually just unit (prevents dead code warnings)
+                Ok(())
             }
         }
     }
@@ -486,7 +509,9 @@ impl <'env>MutTxn<'env> {
 impl Drop for Env {
     fn drop(&mut self){
         unsafe {
-            libc::munmap(self.map as *mut c_void,self.length as size_t);
+            for (_,map) in self.map.iter() {
+                libc::munmap(*map as *mut c_void,self.length as size_t);
+            }
             libc::close(self.fd);
         }
     }
