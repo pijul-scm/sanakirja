@@ -1,22 +1,19 @@
 extern crate dictionnaire;
 extern crate env_logger;
-extern crate fs2;
-use fs2::FileExt;
-use std::fs::File;
 
 use dictionnaire::*;
 
 fn main(){
-    let f=File::create("/tmp/truc").unwrap();
-    f.lock_exclusive().unwrap();
     env_logger::init().unwrap();
     //Env::test_concat_mmap("/tmp/test", &[(0,4096), (20480,4096)]);
-    let env=Env::new("/tmp/test",18).unwrap();
+    let env=Env::new("/tmp/test").unwrap();
     let env=std::sync::Arc::new(env);
     let thr={
         let env=env.clone();
         println!("before spawn statistics: {:?}",env.statistics());
         std::thread::spawn(move | | {
+
+            /*
             let mut txn=env.txn_mut_begin().unwrap();
             let mut page0=txn.alloc_page().unwrap();
             println!("first alloc done");
@@ -41,6 +38,7 @@ fn main(){
             txn.glue_mut_pages(&pages).unwrap();
             println!("free done");
             txn.commit().unwrap();
+             */
         })
     };
     thr.join().unwrap();

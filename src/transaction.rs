@@ -22,7 +22,7 @@ use std::ffi::CString;
 use std::sync::{RwLock,RwLockReadGuard,Mutex,MutexGuard};
 use std::ptr::copy_nonoverlapping;
 use std::collections::{HashSet};
-
+use std::cell::{RefCell,RefMut};
 use std::cmp::max;
 use std::marker::PhantomData;
 use std::ops::Shl;
@@ -72,7 +72,7 @@ pub unsafe fn writele_64(p:*mut u8,v:u64) {
 
 pub struct Txn<'env> {
     env:&'env Env,
-    maps:Vec<*mut u8>,
+    maps:RefCell<Vec<*mut u8>>,
     guard:RwLockReadGuard<'env,()>,
 }
 
@@ -80,7 +80,7 @@ pub struct Txn<'env> {
 pub struct MutTxn<'env> {
     env:&'env Env,
     mutable:MutexGuard<'env,()>,
-    maps:Vec<*mut u8>,
+    maps:RefCell<Vec<*mut u8>>,
     last_page:u64,
     current_list_page:Page,
     current_list_length:u64,
@@ -92,7 +92,7 @@ pub struct MutTxn<'env> {
 
 impl<'env> Drop for Txn<'env>{
     fn drop(&mut self){
-        for p in self.maps.iter().skip(1) {
+        for p in self.maps.borrow().iter().skip(1) {
             unsafe {
                 if !(*p).is_null() {
                     munmap(*p as *mut c_void,self.env.length);
@@ -105,7 +105,7 @@ impl<'env> Drop for Txn<'env>{
 }
 impl<'env> Drop for MutTxn<'env>{
     fn drop(&mut self){
-        for p in self.maps.iter().skip(1) {
+        for p in self.maps.borrow().iter().skip(1) {
             unsafe {
                 if !(*p).is_null() {
                     munmap(*p as *mut c_void,self.env.length);
@@ -127,11 +127,11 @@ pub struct Statistics {
 impl Env {
 
     /// Initialize environment. log_length must be at least log(PAGE_SIZE)
-    pub fn new(file:&str,log_length:usize)->Result<Env,Error> {
+    pub fn new<P:AsRef<Path>>(file:P,log_length:usize)->Result<Env,Error> {
         unsafe {
             let length:usize=(1 as usize).shl(log_length);
             assert!(length>=PAGE_SIZE);
-            let path=Path::new(file).join("db");
+            let path=file.as_ref().join("db");
             let name=CString::new(path.to_str().unwrap()).unwrap();
             let fd=libc::open(name.as_ptr(),O_CREAT|O_RDWR,0o777);
             let ftrunc=libc::ftruncate(fd,length as off_t);
@@ -146,8 +146,8 @@ impl Env {
                 if memory==libc::MAP_FAILED {
                     Err(Error::IO(std::io::Error::last_os_error()))
                 } else {
-                    let lock_file=try!(File::create(Path::new(file).join("db").with_extension(".lock")));
-                    let mutable_file=try!(File::create(Path::new(file).join("db").with_extension(".mut")));
+                    let lock_file=try!(File::create(file.as_ref().join("db").with_extension(".lock")));
+                    let mutable_file=try!(File::create(file.as_ref().join("db").with_extension(".mut")));
                     let env=Env {
                         length:length,
                         log_length:log_length,
@@ -168,36 +168,35 @@ impl Env {
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
         let read=self.lock.read().unwrap();
         self.lock_file.lock_shared().unwrap();
-        Txn { env:self,guard:read,maps:vec!(self.map) }
+        Txn { env:self,guard:read,maps:RefCell::new(vec!(self.map)) }
     }
 
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
-    pub fn txn_mut_begin<'env>(&'env self)->Result<MutTxn<'env>,Error> {
+    pub fn mut_txn_begin<'env>(&'env self)->MutTxn<'env> {
         unsafe {
             let last_page=readle_64(self.map);
             let current_list_page=readle_64(self.map.offset(8));
 
-            // This is already another page. UNSAFE!
-            let current_list_data=self.map.offset(current_list_page as isize);
-
-            let current_list_length = if current_list_page == 0 { 0 } else {
-                readle_64(current_list_data.offset(8))
-            };
-            let current_list_position = current_list_length;
             let guard=self.mutable.lock().unwrap();
             self.mutable_file.lock_exclusive().unwrap();
-            Ok(MutTxn {
+            let maps=RefCell::new(vec!(self.map));
+            let current_list_page = Page { data:offset(self,maps.borrow_mut(),current_list_page),
+                                           len:PAGE_SIZE, offset:current_list_page };
+            let current_list_length=if current_list_page.offset == 0 { 0 } else {
+                readle_64(current_list_page.data.offset(8))
+            };
+            MutTxn {
                 env:self,
                 mutable:guard,
-                maps:vec!(self.map),
+                maps:maps,
                 last_page:if last_page == 0 { PAGE_SIZE as u64 } else { last_page },
-                current_list_page:Page { data:current_list_data,len:PAGE_SIZE, offset:current_list_page },
+                current_list_page:current_list_page,
                 current_list_length:current_list_length,
-                current_list_position:current_list_position, // position of the word immediately after the top.
+                current_list_position:current_list_length, // position of the word immediately after the top.
                 occupied_clean_pages:HashSet::new(),
                 free_clean_pages:Vec::new(),
                 free_pages:Vec::new()
-            })
+            }
         }
     }
 
@@ -294,7 +293,7 @@ impl<'a> Drop for Pages<'a> {
     }
 }
 
-fn offset(env:&Env, maps:&mut Vec<*mut u8>,off:u64)-> *mut u8 {
+fn offset(env:&Env, mut maps:std::cell::RefMut<Vec<*mut u8>>,off:u64)-> *mut u8 {
     // Allocate more space in the file if needed, adding a new mapping
     let index=(off>>env.log_length) as usize;
     while index>= maps.len() {
@@ -316,7 +315,7 @@ fn offset(env:&Env, maps:&mut Vec<*mut u8>,off:u64)-> *mut u8 {
     }
 }
 
-pub fn load_page(env:&Env,maps:&mut Vec<*mut u8>,off:u64)->Page {
+pub fn load_page(env:&Env,maps:RefMut<Vec<*mut u8>>,off:u64)->Page {
     Page { data:offset(env,maps,off),
            len:PAGE_SIZE,
            offset:off }
@@ -370,17 +369,20 @@ pub fn glue_pages<'a>(env:&Env,pages:&'a[Page])->Result<Pages<'a>,Error> {
 
 impl <'env>Txn<'env> {
     /// Find the appropriate map segment
-    pub fn offset(&mut self,off:u64)->*mut u8 {
-        offset(self.env,&mut self.maps, off)
+    pub fn offset(&self,off:u64)->*mut u8 {
+        offset(self.env,self.maps.borrow_mut(), off)
+    }
+    pub fn load_page(&self,off:u64)->Page {
+        load_page(self.env,self.maps.borrow_mut(),off)
     }
 }
 impl <'env>MutTxn<'env> {
     /// Find the appropriate map segment
-    pub fn offset(&mut self,off:u64)->*mut u8 {
-        offset(self.env,&mut self.maps, off)
+    pub fn offset(&self,off:u64)->*mut u8 {
+        offset(self.env,self.maps.borrow_mut(), off)
     }
-    pub fn load_page(&mut self,off:u64)->Page {
-        load_page(self.env,&mut self.maps,off)
+    pub fn load_page(&self,off:u64)->Page {
+        load_page(self.env,self.maps.borrow_mut(),off)
     }
     pub fn glue_pages<'a>(&self,pages:&'a[Page])->Result<Pages<'a>,Error> {
         glue_pages(self.env,pages)
@@ -542,7 +544,7 @@ impl <'env>MutTxn<'env> {
                 }
                 writele_64(self.offset(8),current_page_offset);
                 // synchronize all maps
-                for map in self.maps.iter().skip(1) {
+                for map in self.maps.borrow_mut().iter().skip(1) {
                     let ok= libc::msync(*map as *mut c_void,self.env.length as size_t,MS_SYNC);
                     if ok!=0 {
                         return Err(Error::IO(std::io::Error::last_os_error()))
