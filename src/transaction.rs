@@ -1,5 +1,8 @@
 // TODO:
 // - get rid of initial length, grow file as needed. See fallocate, ftruncate. Equivalents on windows?
+// - Windows
+// - 32 bits mmap64
+// - SPARC (8kB pages)
 
 // X 32 bits compatibility. mmap has 64 bits offsets.
 // X process and thread mutex for mutable transactions.
@@ -83,9 +86,9 @@ pub struct MutTxn<'env> {
     current_list_page:Page,
     current_list_length:u64,
     current_list_position:u64,
-    occupied_clean_pages:HashSet<u64>,
-    free_clean_pages:Vec<u64>,
-    free_pages:Vec<u64>,
+    occupied_clean_pages:HashSet<u64>, // Offsets of pages that were allocated by this transaction.
+    free_clean_pages:Vec<u64>, // Offsets of pages that were allocated by this transaction, and then freed.
+    free_pages:Vec<u64>, // Offsets of old pages freed by this transaction. These were *not* allocated by this transaction.
 }
 
 impl<'env> Drop for Txn<'env>{
@@ -304,6 +307,8 @@ pub fn load_page(env:&Env,maps:RefMut<Vec<*mut u8>>,off:u64)->Page {
            len:PAGE_SIZE,
            offset:off }
 }
+
+/*
 pub fn glue_mut_pages<'a>(env:&Env,pages:&'a[MutPage])->Result<MutPages<'a>,Error> {
     unsafe {
         glue_pages(env,std::mem::transmute(pages)).and_then(|x| Ok(MutPages {pages:x}))
@@ -349,7 +354,7 @@ pub fn glue_pages<'a>(env:&Env,pages:&'a[Page])->Result<Pages<'a>,Error> {
     }
     Ok(Pages {map:p0,len:l,pages:PhantomData})
 }
-
+*/
 
 impl <'env>Txn<'env> {
     /// Find the appropriate map segment
@@ -368,13 +373,24 @@ impl <'env>MutTxn<'env> {
     pub fn load_page(&self,off:u64)->Page {
         load_page(self.env,self.env.maps.borrow_mut(),off)
     }
+    pub fn load_mut_page(&mut self,off:u64)->MutPage {
+        let page=load_page(self.env,self.env.maps.borrow_mut(),off);
+        if off !=0 && self.occupied_clean_pages.contains(&off) {
+            unsafe { std::mem::transmute(page) }
+        } else {
+            let result=self.alloc_page().unwrap();
+            unsafe { copy_nonoverlapping(page.data,result.data,PAGE_SIZE) }
+            result
+        }
+    }
+    /*
     pub fn glue_pages<'a>(&self,pages:&'a[Page])->Result<Pages<'a>,Error> {
         glue_pages(self.env,pages)
     }
     pub fn glue_mut_pages<'a>(&self,pages:&'a[MutPage])->Result<MutPages<'a>,Error> {
         glue_mut_pages(self.env,pages)
     }
-
+    */
     /// Pop a free page from the list of free pages.
     fn free_pages_pop(&mut self)->Option<u64> {
         unsafe {
