@@ -146,23 +146,17 @@ impl<'a> Value<'a> for &'a [u8] {
 }
 
 impl<'a> Value<'a> for u64 {
+    // The issue here is, we're not guaranteed that p is 64-bits aligned, and yet we need to read a 64-bits value.
     fn read(p:&'a u32)->(&'a[u8],u64) {
-        // Layout of these nodes: |key| (32-bits aligned), key, padding, value (64 bits aligned).
+        // Layout of these nodes: |key| (32-bits aligned), 32 lowest bits of value, 32 highest bits of value, key.
         unsafe {
             let p:*const u32=p as *const u32;
             let key_len=u32::from_le(*p);
-            let key_ptr=p.offset(1);
+            let low_bits=(u32::from_le(*(p.offset(1)))) as u64;
+            let high_bits=(u32::from_le(*(p.offset(2)))) as u64;
+            let key_ptr=p.offset(3);
             let key=std::slice::from_raw_parts(key_ptr as *const u8, key_len as usize);
-            let value_ptr=(key_ptr as *const u8).offset(key_len as isize);
-            let n= value_ptr as usize;
-            let value_ptr=
-                if n&7 == 0 {
-                    // already 64-bits/8 bytes aligned.
-                    n as *const u64
-                } else {
-                    (n+(8-n&7)) as *const u64
-                };
-            (key,*value_ptr)
+            (key,(high_bits<<32)|low_bits)
         }
     }
     fn write(ptr:*mut u32,key:&[u8],value:u64) {
