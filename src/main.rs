@@ -1,20 +1,26 @@
-extern crate dictionnaire;
+//extern crate dictionnaire;
+#[macro_use]
+extern crate log;
+extern crate libc;
+extern crate fs2;
 extern crate env_logger;
 
-use dictionnaire::*;
+//use dictionnaire::*;
+
+mod transaction;
+use transaction::*;
 
 fn main(){
     env_logger::init().unwrap();
     //Env::test_concat_mmap("/tmp/test", &[(0,4096), (20480,4096)]);
-    let env=Env::new("/tmp/test").unwrap();
+    let env=Env::new("/tmp/test",16).unwrap();
     let env=std::sync::Arc::new(env);
     let thr={
         let env=env.clone();
         println!("before spawn statistics: {:?}",env.statistics());
         std::thread::spawn(move | | {
 
-            /*
-            let mut txn=env.txn_mut_begin().unwrap();
+            let mut txn=env.mut_txn_begin();
             let mut page0=txn.alloc_page().unwrap();
             println!("first alloc done");
             {
@@ -34,11 +40,11 @@ fn main(){
                 }
             }
             page0.free(&mut txn);
-            let pages=[page0,page1];
-            txn.glue_mut_pages(&pages).unwrap();
+            //let pages=[page0,page1];
+            //txn.glue_mut_pages(&pages).unwrap();
             println!("free done");
             txn.commit().unwrap();
-             */
+
         })
     };
     thr.join().unwrap();
