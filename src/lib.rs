@@ -6,13 +6,14 @@ extern crate fs2;
 use std::path::Path;
 use std::ptr::copy_nonoverlapping;
 use std::cmp::Ordering;
+use std::marker::PhantomData;
 
 mod constants;
 mod transaction;
 
 pub use transaction::{Statistics};
-use transaction::{MutPage,Page,readle_64,writele_64};
-use constants::PAGE_SIZE;
+use transaction::{PAGE_SIZE,PAGE_SIZE_64};
+
 
 pub struct MutTxn<'env> {
     txn:transaction::MutTxn<'env>
@@ -43,60 +44,176 @@ impl Env {
 }
 
 
-
-/// A return value of 0 means "not found".
-fn rec_get_page(root:*const u8,cur:*const u8,key:&[u8])->u64 {
-    unsafe {
-        let left_child= readle_64(cur);
-        let is_leaf = left_child & 1 == 0;
-        let left_child = left_child >> 1;
-        let right_child = readle_64(cur.offset(8));
-        let length = readle_64(cur.offset(16));
-        let value=std::slice::from_raw_parts(cur.offset(24),length as usize);
-        if is_leaf {
-            if key<value { left_child } else { right_child }
-        } else {
-            rec_get_page(root,root.offset(if key<value { left_child } else { right_child} as isize), key)
-        }
-    }
-}
-fn get_page(p:&Page, key:&[u8])->u64 {
-    unsafe {
-        let p_data=if p.offset==0 { p.data.offset(24) } else { p.data };
-
-        let extra_page=readle_64(p_data);
-        assert!(extra_page==0); // we just read the blocker
-
-        let rc=p_data.offset(8); // reference counter
-        assert!((*rc)&1 == 0); // assume fixed-length for now.
-
-        let root=p_data.offset(16);
-        rec_get_page(p_data,p_data,key)
-    }
-}
-
-pub unsafe fn readle_16(p0:*const u8)->u16 {
-    (*(p0 as *const u16)).to_le()
-}
-
-pub unsafe fn writele_16(p:*mut u8,v:u16) {
-    *(p as *mut u16) = v.to_le()
-}
-pub unsafe fn readle_32(p0:*const u8)->u32 {
-    (*(p0 as *const u32)).to_le()
-}
-
-pub unsafe fn writele_32(p:*mut u8,v:u32) {
-    *(p as *mut u32) = v.to_le()
-}
-
-
 const LEAF_CONTENTS_OFFSET:isize=8; // in bytes.
 const PAGE:u64 = PAGE_SIZE as u64;
-// The difference between fixed and non-fixed size is just the need for compaction.
-// Fixed sizes maintain a list of free zones.
+
+struct Page {
+    page:transaction::Page,
+}
+
+impl Page {
+    // Page layout: Starts with a header of ((n>=1)*8 bytes + 16 bytes).
+    // - 64 bits: glueing number (0 for now), + flags on the 13 least significant bits
+    // - 32 bits: RC
+    // - 32 bits: offset of the first free spot, from the beginning of the page
+    // - 32 bits: offset of the root of the tree, from the beginning of the page
+    // - 32 bits: how much space is occupied in this page? (controls compaction)
+    // - beginning of coding space (different encodings in B-nodes and B-leaves)
+
+    // returns a pointer to the last glue number.
+    fn skip_glues(&self)->*const u64 {
+        unsafe {
+            let mut p=self.page.data as *const u64;
+            while u64::from_le(*p) >= PAGE_SIZE_64 {
+                unimplemented!() // glue pages together.
+                    //p=p.offset(1)
+                    // len-=8
+            }
+            p
+        }
+    }
+
+    fn flags(&self)->u16 {
+        unsafe {
+            let p=self.skip_glues();
+            ((u64::from_le(*p)) & (PAGE_SIZE_64-1)) as u16
+        }
+    }
+
+    fn rc(&self)->u32 {
+        unsafe {
+            let p=self.skip_glues().offset(1) as *const u32;
+            u32::from_le(*p)
+        }
+    }
+    // First free spot in this page (head of the linked list, number of |u32| from the start of the coding zone)
+    fn first_free(&self)->u32 {
+        unsafe {
+            let p=(self.skip_glues() as *const u32).offset(3);
+            u32::from_le(*p)
+        }
+    }
+    // Root of the binary tree (number of |u32| from the start of the coding zone)
+    fn root(&self)->Tree<()> {
+        unsafe {
+            let p=(self.skip_glues() as *mut u32).offset(4);
+            let off=u32::from_le(*p);
+            Tree { p:p, node:off as isize,phantom:PhantomData }
+        }
+    }
+    // Amount of space occupied in the page
+    fn occupied_space(&self)->u32 {
+        unsafe {
+            let p=(self.skip_glues() as *const u32).offset(5);
+            u32::from_le(*p)
+        }
+    }
+    /*
+    fn allocate_tree<T:Value>(&mut self,key:&[u8],value:T)->Tree<T> {
+        unimplemented!()
+    }
+     */
+}
+
+trait Value<'a> {
+    // ptr is guaranteed to be 32-bit aligned
+    fn read(ptr:&'a u32)->(&'a[u8],Self);
+    fn write(ptr:*mut u32,key:&[u8],value:Self);
+}
+
+struct Tree<T> {
+    p:*mut u32, // pointer to the last glue number.
+    node:isize, // offset (in u32) from p. Address of the current node: self.p.offset(self.node). 0 is invalid.
+    phantom:PhantomData<T>
+}
+
+impl<'a> Value<'a> for &'a [u8] {
+    fn read(p:&'a u32)->(&'a[u8],&'a[u8]) {
+        // Layout of these nodes: |key| (32-bits aligned), |value| (32-bits aligned), key, value
+        unsafe {
+            let p:*const u32=p as *const u32;
+            let key_len=u32::from_le(*p);
+            let val_len=u32::from_le(*(p.offset(1)));
+            let key_ptr=p.offset(2);
+            let val_ptr=(p.offset(2) as *const u8).offset(key_len as isize);
+            (std::slice::from_raw_parts(key_ptr as *const u8, key_len as usize),
+             std::slice::from_raw_parts(val_ptr as *const u8, val_len as usize))
+        }
+    }
+    fn write(ptr:*mut u32,key:&[u8],value:&[u8]) {
+        unimplemented!()
+    }
+}
+
+impl<'a> Value<'a> for u64 {
+    fn read(p:&'a u32)->(&'a[u8],u64) {
+        // Layout of these nodes: |key| (32-bits aligned), key, padding, value (64 bits aligned).
+        unsafe {
+            let p:*const u32=p as *const u32;
+            let key_len=u32::from_le(*p);
+            let key_ptr=p.offset(1);
+            let key=std::slice::from_raw_parts(key_ptr as *const u8, key_len as usize);
+            let value_ptr=(key_ptr as *const u8).offset(key_len as isize);
+            let n= value_ptr as usize;
+            let value_ptr=
+                if n&7 == 0 {
+                    // already 64-bits/8 bytes aligned.
+                    n as *const u64
+                } else {
+                    (n+(8-n&7)) as *const u64
+                };
+            (key,*value_ptr)
+        }
+    }
+    fn write(ptr:*mut u32,key:&[u8],value:u64) {
+        unimplemented!()
+    }
+}
+
+const NODE_FLAG:u16=1;
+impl <'a,T:Value<'a>>Tree<T> {
+    fn left(&self)->Option<Tree<T>> {
+        unsafe {
+            let left=u32::from_le(*self.p.offset(self.node));
+            if left==0 { None } else { Some(Tree { p:self.p, node: left as isize,phantom:PhantomData }) }
+        }
+    }
+    fn set_left(&mut self,left:Option<Tree<T>>) {
+        unsafe {
+            (*self.p.offset(self.node)) = match left { Some(left)=>(left.node as u32).to_le(), None=>0 };
+        }
+    }
+    fn right(&self)->Option<Tree<T>> {
+        unsafe {
+            let right=u32::from_le(*(self.p.offset(self.node + 1)));
+            if right==0 { None } else { Some(Tree { p:self.p, node: right as isize,phantom:PhantomData }) }
+        }
+    }
+    fn set_right(&mut self,right:Option<Tree<T>>) {
+        unsafe {
+            (*self.p.offset(self.node+1)) = match right { Some(right)=>(right.node as u32).to_le(), None=>0 };
+        }
+    }
+    fn balance(&self)->i32 {
+        unsafe { i32::from_le(*(self.p.offset(self.node+2) as *const i32)) }
+    }
+    fn set_balance(&mut self,balance:i32) {
+        unsafe { *(self.p.offset(self.node+2) as *mut i32) = balance.to_le() }
+    }
+    fn read(&'a self)->(&'a[u8],T) {
+        unsafe { T::read(&*self.p.offset(self.node+3)) }
+    }
+}
+
+
+
+
 impl<'env> MutTxn<'env> {
 
+
+
+
+    /*
     fn insert_leaf_page<'txn>(&'txn mut self,page_off:u64,key:&[u8],value:&[u8]) {
         unsafe {
             let mutpage=self.txn.load_mut_page(page_off);
@@ -310,4 +427,5 @@ impl<'env> MutTxn<'env> {
         }
          */
     }
+*/
 }

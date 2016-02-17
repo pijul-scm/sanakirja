@@ -36,7 +36,7 @@ use std::path::Path;
 // We need a fixed page size for compatibility reasons. Most systems will have half of this, but some (SPARC) don't...
 pub const PAGE_SIZE:usize=8192;
 pub const PAGE_SIZE_64:u64=8192;
-
+pub const LOG_PAGE_SIZE:usize=13;
 
 #[derive(Debug)]
 pub enum Error {
