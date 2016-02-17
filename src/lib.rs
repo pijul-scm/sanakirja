@@ -50,6 +50,7 @@ const PAGE:u64 = PAGE_SIZE as u64;
 struct Page {
     page:transaction::Page,
 }
+const B_NODE_FLAG:u64 = 1;
 
 impl Page {
     // Page layout: Starts with a header of ((n>=1)*8 bytes + 16 bytes).
@@ -94,11 +95,17 @@ impl Page {
         }
     }
     // Root of the binary tree (number of |u32| from the start of the coding zone)
-    fn root(&self)->Tree<()> {
+    fn root<'a>(&'a self)->B<'a> {
         unsafe {
-            let p=(self.skip_glues() as *mut u32).offset(4);
-            let off=u32::from_le(*p);
-            Tree { p:p, node:off as isize,phantom:PhantomData }
+            let p=self.skip_glues() as *mut u64;
+            let flags=(*p)&(PAGE_SIZE_64-1);
+            let p_root=(p as *mut u32).offset(4);
+            let off=u32::from_le(*p_root);
+            if flags&B_NODE_FLAG == 0 {
+                B::Leaf(Tree { p:p_root, node:off as isize,phantom:PhantomData })
+            } else {
+                B::Node(Tree { p:p_root, node:off as isize,phantom:PhantomData })
+            }
         }
     }
     // Amount of space occupied in the page
@@ -113,6 +120,11 @@ impl Page {
         unimplemented!()
     }
      */
+}
+
+enum B<'a> {
+    Node(Tree<u64>),
+    Leaf(Tree<&'a[u8]>)
 }
 
 trait Value<'a> {
