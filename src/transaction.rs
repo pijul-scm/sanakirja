@@ -38,6 +38,8 @@ pub const PAGE_SIZE:usize=8192;
 pub const PAGE_SIZE_64:u64=8192;
 pub const LOG_PAGE_SIZE:usize=13;
 
+pub const ZERO_HEADER:isize=16; // size of the header on page 0, in bytes.
+
 #[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
@@ -193,6 +195,11 @@ impl Env {
         }
     }
 
+    pub fn extra(&self)->*mut u8 {
+        unsafe {
+            self.map.offset(ZERO_HEADER)
+        }
+    }
 
     /// Compute statistics about pages. This is a potentially costlty operation, as we need to go through all bookkeeping pages.
     pub fn statistics(&self)->Statistics{
@@ -384,7 +391,7 @@ impl <'env>MutTxn<'env> {
     }
 
     /// Commit a transaction. This is guaranteed to be atomic: either the commit succeeds, and all the changes made during the transaction are written to disk. Or the commit doesn't succeed, and we're back to the state just before starting the transaction.
-    pub fn commit(mut self)->Result<(),Error>{
+    pub fn commit(mut self,extra:&[u8])->Result<(),Error>{
         // Tasks:
         // - allocate new pages (copy-on-write) to write the new list of free pages, including edited "stack pages".
         //
@@ -471,6 +478,10 @@ impl <'env>MutTxn<'env> {
                     *(self.env.map as *mut u64) = self.last_page.to_le();
                 }
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
+                println!("commit: {:?}",extra);
+                copy_nonoverlapping(extra.as_ptr(),
+                                    self.env.map.offset(16),
+                                    extra.len());
                 // synchronize all maps
                 let ok=libc::msync(self.env.map.offset(PAGE_SIZE as isize) as *mut c_void,
                                    (self.env.length as u64 - PAGE_SIZE as u64) as size_t,MS_SYNC);

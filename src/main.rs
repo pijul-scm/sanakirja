@@ -1,20 +1,38 @@
-//extern crate dictionnaire;
+extern crate dictionnaire;
 #[macro_use]
 extern crate log;
 extern crate libc;
 extern crate fs2;
 extern crate env_logger;
 
-//use dictionnaire::*;
+use dictionnaire::*;
 
-mod transaction;
-use transaction::*;
+//mod transaction;
+//use transaction::*;
 
 fn main(){
     env_logger::init().unwrap();
     //Env::test_concat_mmap("/tmp/test", &[(0,4096), (20480,4096)]);
-    let env=Env::new("/tmp/test",16).unwrap();
-    let env=std::sync::Arc::new(env);
+    let env=Env::new("/tmp/test").unwrap();
+    let mut txn=env.mut_txn_begin();
+
+    println!("root:{:?}",txn.btree_root);
+    let mut root=txn.load_root().unwrap_or_else(|| {
+        println!("needs alloc");
+        let btree=txn.alloc_b_leaf(1);
+        let off=btree.offset();
+        txn.btree_root = off;
+        btree
+    });
+    root.insert(b"blabla",b"blibli");
+    println!("{:?}",txn.btree_root);
+    txn.commit().unwrap();
+
+    let mut txn=env.mut_txn_begin();
+    println!("root:{:?}",txn.btree_root);
+
+    //let env=std::sync::Arc::new(env);
+    /*
     let thr={
         let env=env.clone();
         println!("before spawn statistics: {:?}",env.statistics());
@@ -48,5 +66,6 @@ fn main(){
         })
     };
     thr.join().unwrap();
-    println!("final statistics: {:?}",env.statistics());
+*/
+    //println!("final statistics: {:?}",env.statistics());
 }

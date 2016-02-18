@@ -16,7 +16,8 @@ use transaction::{PAGE_SIZE,PAGE_SIZE_64};
 
 
 pub struct MutTxn<'env> {
-    txn:transaction::MutTxn<'env>
+    txn:transaction::MutTxn<'env>,
+    pub btree_root:u64
 }
 pub struct Txn<'env> {
     txn:transaction::Txn<'env>
@@ -39,7 +40,14 @@ impl Env {
         Txn { txn:self.env.txn_begin() }
     }
     pub fn mut_txn_begin<'env>(&'env self)->MutTxn<'env> {
-        MutTxn { txn:self.env.mut_txn_begin() }
+        let btree_root= unsafe {
+            let p_extra=self.env.extra() as *const u64;
+            u64::from_le(*p_extra)
+        };
+        MutTxn {
+            txn:self.env.mut_txn_begin(),
+            btree_root:btree_root
+        }
     }
 }
 
@@ -47,8 +55,8 @@ impl Env {
 const LEAF_CONTENTS_OFFSET:isize=8; // in bytes.
 const PAGE:u64 = PAGE_SIZE as u64;
 
-struct Page {
-    page:transaction::Page,
+pub struct Page {
+    page:transaction::MutPage,
 }
 const B_NODE_FLAG:u64 = 1;
 
@@ -62,9 +70,9 @@ impl Page {
     // - beginning of coding space (different encodings in B-nodes and B-leaves)
 
     // returns a pointer to the last glue number.
-    fn skip_glues(&self)->*const u64 {
+    fn skip_glues(&self)->*mut u64 {
         unsafe {
-            let mut p=self.page.data as *const u64;
+            let mut p=self.page.data as *mut u64;
             while u64::from_le(*p) >= PAGE_SIZE_64 {
                 unimplemented!() // glue pages together.
                     //p=p.offset(1)
@@ -87,25 +95,44 @@ impl Page {
             u32::from_le(*p)
         }
     }
-    // First free spot in this page (head of the linked list, number of |u32| from the start of the coding zone)
+    // First free spot in this page (head of the linked list, number of |u32| from the last glue.
     fn first_free(&self)->u32 {
         unsafe {
             let p=(self.skip_glues() as *const u32).offset(3);
-            u32::from_le(*p)
+            let f=u32::from_le(*p);
+            if f==0 { 1 } else { f }
         }
     }
-    // Root of the binary tree (number of |u32| from the start of the coding zone)
-    fn root<'a>(&'a self)->B<'a> {
+    /*
+    // load the binary tree.
+    fn root<'a,'b>(&'a self)->B<'a,'b> {
         unsafe {
             let p=self.skip_glues() as *mut u64;
             let flags=(*p)&(PAGE_SIZE_64-1);
             let p_root=(p as *mut u32).offset(4);
             let off=u32::from_le(*p_root);
+            assert!(off>0);
             if flags&B_NODE_FLAG == 0 {
                 B::Leaf(Tree { p:p_root, node:off as isize,phantom:PhantomData })
             } else {
                 B::Node(Tree { p:p_root, node:off as isize,phantom:PhantomData })
             }
+        }
+    }
+     */
+
+    fn root(&self)->u32 {
+        unsafe {
+            let p=self.skip_glues() as *mut u64;
+            let p_root=(p as *mut u32).offset(4);
+            *p_root
+        }
+    }
+    fn set_root(&self,root:u32) {
+        unsafe {
+            let p=self.skip_glues() as *mut u64;
+            let p_root=(p as *mut u32).offset(4);
+            *p_root = root
         }
     }
     // Amount of space occupied in the page
@@ -115,28 +142,179 @@ impl Page {
             u32::from_le(*p)
         }
     }
-    /*
-    fn allocate_tree<T:Value>(&mut self,key:&[u8],value:T)->Tree<T> {
-        unimplemented!()
+
+    fn offset(&self,off:u32)->*mut u32 {
+        unsafe {
+            let p=self.skip_glues() as *mut u32;
+            p.offset(5+off as isize)
+        }
     }
-     */
+
+    /// Takes a size in bytes, returns an offset from the word before
+    /// the beginning of the contents (0 is invalid, 1 is the first
+    /// offset).
+    fn alloc(&mut self,size:usize)->Option<u32> {
+        unsafe {
+            assert!(size&3== 0); // 32 bits aligned.
+            let p=self.skip_glues() as *mut u32;
+            let first_free={
+                // Offset from the word before contents.
+                let f=u32::from_le(*(p.offset(3)));
+                if f>0 { f } else { 1 }
+            };
+
+            let zero=p.offset(5);
+
+            let next_page = self.page.data.offset(PAGE_SIZE as isize) as *mut u32;
+
+            let current=zero.offset(first_free as isize);
+            // Always allocate at the end (for now).
+            // The head is always the beginning of the free zone at the end
+            // The first 32-bits word there is a tail.
+            // If the tail == 0, the list is empty.
+            println!("alloc: {:?} {:?}, {:?}",current,size,next_page);
+            if current.offset(size as isize) > next_page {
+                return None
+            } else {
+                *(p.offset(3)) = first_free + ((size as u32) >> 2);
+                Some(first_free)
+                    //Some(Tree::new(p,first_free as isize,key,value))
+            }
+        }
+    }
+
+    fn insert(&mut self,key:&[u8],value:&[u8]) {
+        unsafe {
+            // size in bytes
+            let size=24
+                + 4 //balance
+                + key.len() + value.len();
+            let size = size + (4-(size&3))&3;
+
+            let off_ptr = self.alloc(size).unwrap();
+            // off is the beginning of a free zone. Write the node there.
+            //////////////////////////////////////////////////
+            let ptr=self.offset(off_ptr);
+            println!("ptr: {} {:?}",off_ptr,ptr);
+            {
+                let ptr=ptr as *mut u64;
+                *ptr = 0; // left
+                *(ptr.offset(1)) = 0; //right
+            }
+
+            {
+                let ptr=ptr as *mut u32;
+                *(ptr.offset(2)) = (key.len() as u32).to_le();
+                *(ptr.offset(3)) = (value.len() as u32).to_le();
+            }
+            let ptr=ptr as *mut u8;
+            *(ptr.offset(24)) = 0; // balance number
+            copy_nonoverlapping(key.as_ptr(), ptr.offset(NODE_HEADER_BYTES) as *mut u8, key.len());
+            copy_nonoverlapping(value.as_ptr(), ptr.offset(NODE_HEADER_BYTES + key.len() as isize), value.len());
+
+            // Maintenant, on doit l'accrocher à l'arbre.
+            let root=self.root();
+            //
+            println!("insert root:{:?} {:?}",root,off_ptr);
+            if root==0 {
+                self.set_root(off_ptr)
+            } else {
+                // compare
+                let mut current=root;
+                loop {
+                    let ptr=self.offset(current);
+                    let (key0,value0)=read_key_value(&*(ptr as *const u8));
+                    println!("{:?},{:?}",key,value);
+                    break
+                }
+            }
+        }
+    }
+
+}
+const NODE_HEADER_BYTES:isize=25;
+fn read_key_value<'a>(p:&'a u8)->(&'a [u8],&'a[u8]) {
+    unsafe {
+        let p32=p as *const u8 as *const u32;
+        let key_len=*(p32.offset(4));
+        let val_len=*(p32.offset(5));
+        (std::slice::from_raw_parts((p as *const u8).offset(NODE_HEADER_BYTES), key_len as usize),
+         std::slice::from_raw_parts((p as *const u8).offset(NODE_HEADER_BYTES + key_len as isize), val_len as usize))
+    }
 }
 
-enum B<'a> {
-    Node(Tree<u64>),
-    Leaf(Tree<&'a[u8]>)
+
+pub enum BTree {
+    Leaf { page:Page },
+    Node { page:Page }
+}
+impl BTree {
+    pub fn offset(&self)->u64 {
+        match self {
+            &BTree::Leaf { ref page }=>page.page.offset,
+            &BTree::Node { ref page }=>page.page.offset,
+        }
+    }
+    pub fn insert(&mut self,key:&[u8],value:&[u8]) {
+        match self {
+            &mut BTree::Leaf { ref mut page } => page.insert(key,value),
+            &mut BTree::Node { ref mut page } => unimplemented!()
+        }
+    }
 }
 
-trait Value<'a> {
+impl<'env> MutTxn<'env> {
+
+    pub fn commit(self)->Result<(),transaction::Error> {
+        unsafe {
+            let extra=self.btree_root.to_le();
+            let x64:&[u8]=std::slice::from_raw_parts( std::mem::transmute(&extra), 8);
+            self.txn.commit(std::mem::transmute(x64))
+        }
+    }
+    pub fn load_root(&mut self)->Option<BTree> {
+        if self.btree_root == 0 {
+            None
+        } else {
+            // Here, go to page and load it.
+            unsafe {
+                let page=self.txn.load_mut_page(self.btree_root);
+                let p=page.data as *mut u64;
+                let glues= *p;
+                assert!(glues < PAGE_SIZE_64);
+                Some(if glues & 1 == 0 {
+                    BTree::Leaf { page:Page { page:page } }
+                } else {
+                    BTree::Node { page:Page { page:page } }
+                })
+            }
+        }
+    }
+    pub fn alloc_b_leaf<'a>(&mut self,n_pages:usize)->BTree {
+        unsafe {
+            assert!(n_pages==1);
+            let page=self.txn.alloc_page().unwrap();
+            let p=page.data as *mut u64;
+            println!("p:{:?}", p);
+            *p = 0; // glue number + "leaf" tag
+            let p=page.data as *mut u32;
+            *(p.offset(2)) = 1; // reference counter.
+            *(p.offset(3)) = 0; // offset of the first free spot.
+            *(p.offset(4)) = 0; // offset of the root.
+            *(p.offset(5)) = 0; // occupied space.
+            BTree::Leaf { page:Page{page:page} }
+        }
+    }
+
+}
+
+
+
+pub trait Value<'a> {
     // ptr is guaranteed to be 32-bit aligned
     fn read(ptr:&'a u32)->(&'a[u8],Self);
     fn write(ptr:*mut u32,key:&[u8],value:Self);
-}
-
-struct Tree<T> {
-    p:*mut u32, // pointer to the last glue number.
-    node:isize, // offset (in u32) from p. Address of the current node: self.p.offset(self.node). 0 is invalid.
-    phantom:PhantomData<T>
+    fn node_size(key:&[u8],Self)->usize; // size in bytes of a this node. Must be a multiple of 4
 }
 
 impl<'a> Value<'a> for &'a [u8] {
@@ -153,38 +331,62 @@ impl<'a> Value<'a> for &'a [u8] {
         }
     }
     fn write(ptr:*mut u32,key:&[u8],value:&[u8]) {
-        unimplemented!()
-    }
-}
-
-impl<'a> Value<'a> for u64 {
-    // The issue here is, we're not guaranteed that p is 64-bits aligned, and yet we need to read a 64-bits value.
-    fn read(p:&'a u32)->(&'a[u8],u64) {
-        // Layout of these nodes: |key| (32-bits aligned), 32 lowest bits of value, 32 highest bits of value, key.
         unsafe {
-            let p:*const u32=p as *const u32;
-            let key_len=u32::from_le(*p);
-            let low_bits=(u32::from_le(*(p.offset(1)))) as u64;
-            let high_bits=(u32::from_le(*(p.offset(2)))) as u64;
-            let key_ptr=p.offset(3);
-            let key=std::slice::from_raw_parts(key_ptr as *const u8, key_len as usize);
-            (key,(high_bits<<32)|low_bits)
+            *ptr = key.len() as u32;
+            *(ptr.offset(1)) = value.len() as u32;
+            copy_nonoverlapping(key.as_ptr(), ptr.offset(2) as *mut u8, key.len());
+            copy_nonoverlapping(value.as_ptr(), (ptr.offset(2) as *mut u8).offset(key.len() as isize), value.len());
         }
     }
-    fn write(ptr:*mut u32,key:&[u8],value:u64) {
-        unimplemented!()
+    fn node_size(key:&[u8],value:&[u8])->usize {
+        let s=12 // header common to all nodes
+            + 8 // size of lengths
+            + key.len()
+            + value.len();
+        // round to 32 bits alignment
+        if s & 3 == 0 { s } else { 4 + (s&(!3)) }
     }
 }
 
+
+
+
+
+/*
+enum B<'b,'a> {
+    Node(Tree<'b,u64>),
+    Leaf(Tree<'b,&'a[u8]>)
+}
+
+*/
+
+/*
 const NODE_FLAG:u16=1;
-impl <'a,T:Value<'a>>Tree<T> {
+impl <'b,'a,T:Value<'a>>Tree<'b,T> {
+    // Layout of a tree:
+    // - 32 bits Left, offset from the 32-bits word before the coding zone.
+    // - 32 bits Right, offset from the 32-bits word before the coding zone.
+    // - 32 bits balance number
+    // - (encoding of key and T, must start with a 32-bits word)
+
+    // Writes a tree at the given pointer.
+    fn new(p:*mut u32,node:isize,key:&[u8],value:T)->Tree<T> {
+        unsafe {
+            let pp=p.offset(node);
+            *pp=0;
+            *(pp.offset(1))=0;
+            *(pp.offset(2))=0;
+            Value::write(pp.offset(3),key,value);
+            Tree { p:p,node:node,phantom:PhantomData }
+        }
+    }
     fn left(&self)->Option<Tree<T>> {
         unsafe {
             let left=u32::from_le(*self.p.offset(self.node));
             if left==0 { None } else { Some(Tree { p:self.p, node: left as isize,phantom:PhantomData }) }
         }
     }
-    fn set_left(&mut self,left:Option<Tree<T>>) {
+    fn write_left(&mut self,left:Option<Tree<T>>) {
         unsafe {
             (*self.p.offset(self.node)) = match left { Some(left)=>(left.node as u32).to_le(), None=>0 };
         }
@@ -195,7 +397,7 @@ impl <'a,T:Value<'a>>Tree<T> {
             if right==0 { None } else { Some(Tree { p:self.p, node: right as isize,phantom:PhantomData }) }
         }
     }
-    fn set_right(&mut self,right:Option<Tree<T>>) {
+    fn write_right(&mut self,right:Option<Tree<T>>) {
         unsafe {
             (*self.p.offset(self.node+1)) = match right { Some(right)=>(right.node as u32).to_le(), None=>0 };
         }
@@ -203,7 +405,7 @@ impl <'a,T:Value<'a>>Tree<T> {
     fn balance(&self)->i32 {
         unsafe { i32::from_le(*(self.p.offset(self.node+2) as *const i32)) }
     }
-    fn set_balance(&mut self,balance:i32) {
+    fn write_balance(&mut self,balance:i32) {
         unsafe { *(self.p.offset(self.node+2) as *mut i32) = balance.to_le() }
     }
     fn read(&'a self)->(&'a[u8],T) {
@@ -211,10 +413,9 @@ impl <'a,T:Value<'a>>Tree<T> {
     }
 }
 
+*/
 
 
-
-impl<'env> MutTxn<'env> {
 
 
 
@@ -434,4 +635,3 @@ impl<'env> MutTxn<'env> {
          */
     }
 */
-}
