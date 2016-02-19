@@ -18,14 +18,13 @@
 // LMDB takes care of zombie readers, at the cost of checking a file of size linear in the number of PIDs at the beginning of every transaction. Also, doesn't work on USB sticks. More details: mdb.c, line 2606: PID locks.
 
 use libc;
-use libc::{c_void,size_t,MS_SYNC,off_t,PROT_WRITE,PROT_READ,MAP_SHARED,MAP_FIXED,munmap,c_int,O_CREAT,O_RDWR};
+use libc::{c_void,size_t,MS_SYNC,off_t,PROT_WRITE,PROT_READ,MAP_SHARED,munmap,c_int,O_CREAT,O_RDWR};
 use std;
 
 use std::ffi::CString;
 use std::sync::{RwLock,RwLockReadGuard,Mutex,MutexGuard};
 use std::ptr::copy_nonoverlapping;
 use std::collections::{HashSet};
-use std::cell::{RefCell,RefMut};
 use std::cmp::max;
 use std::marker::PhantomData;
 use std::ops::Shl;
@@ -36,7 +35,6 @@ use std::path::Path;
 // We need a fixed page size for compatibility reasons. Most systems will have half of this, but some (SPARC) don't...
 pub const PAGE_SIZE:usize=8192;
 pub const PAGE_SIZE_64:u64=8192;
-pub const LOG_PAGE_SIZE:usize=13;
 
 pub const ZERO_HEADER:isize=16; // size of the header on page 0, in bytes.
 
@@ -57,8 +55,6 @@ impl From<std::io::Error> for Error {
 /// Environment, required to start any transactions. Thread-safe, but opening the same database several times in the same process is not cross-platform.
 pub struct Env {
     length:u64,
-    log_length:usize,
-    mask_length:u64,
     lock_file:File,
     mutable_file:File,
     map:*mut u8,
@@ -142,8 +138,6 @@ impl Env {
                     let mutable_file=try!(File::create(file.as_ref().join("db").with_extension(".mut")));
                     let env=Env {
                         length:length,
-                        log_length:log_length,
-                        mask_length:(length-1) as u64,
                         map:memory as *mut u8,
                         lock_file:lock_file,
                         mutable_file:mutable_file,
@@ -238,11 +232,13 @@ impl Env {
 }
 
 /// This is a semi-owned page: just as we can mutate several indices of an array in the same scope, we must be able to get several pages from a single environment in the same scope. However, pages don't outlive their environment. Pages longer than one PAGE_SIZE might trigger calls to munmap when they go out of scope.
+#[allow(raw_pointer_derive)]
 #[derive(Debug)]
 pub struct Page {
     pub data:*const u8,
     pub offset:u64
 }
+#[allow(raw_pointer_derive)]
 #[derive(Debug)]
 pub struct MutPage {
     pub data:*mut u8,
@@ -487,7 +483,7 @@ impl <'env>MutTxn<'env> {
                     *(self.env.map as *mut u64) = self.last_page.to_le();
                 }
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
-                println!("commit: {:?}",extra);
+                debug!("commit: {:?}",extra);
                 copy_nonoverlapping(extra.as_ptr(),
                                     self.env.map.offset(ZERO_HEADER),
                                     extra.len());

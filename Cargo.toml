@@ -11,6 +11,8 @@ env_logger="*"
 
 fs2="*"
 
+rand="*"
+
 [build-dependencies]
 libc="*"
 
