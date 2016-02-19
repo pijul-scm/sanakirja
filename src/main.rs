@@ -16,20 +16,15 @@ fn main(){
     let env=Env::new("/tmp/test").unwrap();
     let mut txn=env.mut_txn_begin();
 
-    println!("root:{:?}",txn.btree_root);
-    let mut root=txn.load_root().unwrap_or_else(|| {
-        println!("needs alloc");
-        let btree=txn.alloc_b_leaf(1);
-        let off=btree.offset();
-        txn.btree_root = off;
-        btree
-    });
-    root.insert(b"blabla",b"blibli");
-    println!("{:?}",txn.btree_root);
+    for i in 0..50 {
+        let x=format!("{:4}",i);
+        let y=format!("{:4}",(i*i)%17);
+        txn.put(x.as_bytes(),y.as_bytes())
+        //txn.put(b"blublu",b"blibli");
+    }
+    txn.debug("/tmp/debug");
     txn.commit().unwrap();
-
-    let mut txn=env.mut_txn_begin();
-    println!("root:{:?}",txn.btree_root);
+    println!("final statistics: {:?}",env.statistics());
 
     //let env=std::sync::Arc::new(env);
     /*
@@ -67,5 +62,4 @@ fn main(){
     };
     thr.join().unwrap();
 */
-    //println!("final statistics: {:?}",env.statistics());
 }

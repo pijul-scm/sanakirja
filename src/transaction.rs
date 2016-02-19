@@ -82,7 +82,7 @@ pub struct MutTxn<'env> {
     current_list_page:Page, // current page storing the list of free pages.
     current_list_length:u64, // length of the current page of free pages.
     current_list_position:u64, // position in the current page of free pages.
-    occupied_clean_pages:HashSet<u64>, // Offsets of pages that were allocated by this transaction.
+    occupied_clean_pages:HashSet<u64>, // Offsets of pages that were allocated by this transaction, and have not been freed since.
     free_clean_pages:Vec<u64>, // Offsets of pages that were allocated by this transaction, and then freed.
     free_pages:Vec<u64>, // Offsets of old pages freed by this transaction. These were *not* allocated by this transaction.
 }
@@ -238,10 +238,12 @@ impl Env {
 }
 
 /// This is a semi-owned page: just as we can mutate several indices of an array in the same scope, we must be able to get several pages from a single environment in the same scope. However, pages don't outlive their environment. Pages longer than one PAGE_SIZE might trigger calls to munmap when they go out of scope.
+#[derive(Debug)]
 pub struct Page {
     pub data:*const u8,
     pub offset:u64
 }
+#[derive(Debug)]
 pub struct MutPage {
     pub data:*mut u8,
     pub offset:u64
@@ -304,6 +306,13 @@ impl <'env>Txn<'env> {
         }
     }
 }
+
+#[derive(Debug)]
+pub enum Cow {
+    Page(Page),
+    MutPage(MutPage)
+}
+
 impl <'env>MutTxn<'env> {
 
     pub fn load_page(&self,off:u64)->Page {
@@ -312,17 +321,15 @@ impl <'env>MutTxn<'env> {
                    offset:off }
         }
     }
-    pub fn load_mut_page(&mut self,off:u64)->MutPage {
+    pub fn load_mut_page(&mut self,off:u64)->Cow {
+        debug!("transaction::load_mut_page: {:?} {:?}", off, self.occupied_clean_pages);
         if off !=0 && self.occupied_clean_pages.contains(&off) {
-            unsafe { MutPage { data:self.env.map.offset(off as isize),
-                               offset:off }
-            }
+            unsafe { Cow::MutPage(MutPage { data:self.env.map.offset(off as isize),
+                                            offset:off }) }
         } else {
             unsafe {
                 let d=self.env.map.offset(off as isize);
-                let result=self.alloc_page().unwrap();
-                copy_nonoverlapping(d,result.data,PAGE_SIZE);
-                result
+                Cow::Page(Page { data:d,offset:off })
             }
         }
     }
@@ -362,6 +369,7 @@ impl <'env>MutTxn<'env> {
         // If we have allocated and freed a page in this transaction, use it first.
         if let Some(page)=self.free_clean_pages.pop() {
             debug!("clean page reuse:{}",page);
+            self.occupied_clean_pages.insert(page);
             Some(MutPage {
                 data:unsafe { self.env.map.offset(page as isize) },
                 offset:page
@@ -381,6 +389,7 @@ impl <'env>MutTxn<'env> {
                 debug!("eating the free space: {}",last);
                 if self.last_page+PAGE_SIZE_64 < self.env.length {
                     self.last_page += PAGE_SIZE_64;
+                    self.occupied_clean_pages.insert(last);
                     Some(MutPage {
                         data:unsafe { self.env.map.offset(last as isize) },
                         offset:last
@@ -480,7 +489,7 @@ impl <'env>MutTxn<'env> {
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
                 println!("commit: {:?}",extra);
                 copy_nonoverlapping(extra.as_ptr(),
-                                    self.env.map.offset(16),
+                                    self.env.map.offset(ZERO_HEADER),
                                     extra.len());
                 // synchronize all maps
                 let ok=libc::msync(self.env.map.offset(PAGE_SIZE as isize) as *mut c_void,
