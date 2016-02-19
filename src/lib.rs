@@ -31,7 +31,8 @@ pub struct MutTxn<'env> {
     pub btree_root:u64
 }
 pub struct Txn<'env> {
-    txn:transaction::Txn<'env>
+    txn:transaction::Txn<'env>,
+    pub btree_root:u64
 }
 
 pub struct Env {
@@ -48,7 +49,12 @@ impl Env {
         self.env.statistics()
     }
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
-        Txn { txn:self.env.txn_begin() }
+        let btree_root= unsafe {
+            let p_extra=self.env.extra() as *const u64;
+            u64::from_le(*p_extra)
+        };
+        Txn { txn:self.env.txn_begin(),
+              btree_root:btree_root }
     }
     pub fn mut_txn_begin<'env>(&'env self)->MutTxn<'env> {
         let btree_root= unsafe {
@@ -312,7 +318,35 @@ impl Cow {
     }
 }
 
+trait LoadPage {
+    fn load_page(&self,off:u64)->Page;
+    fn btree_root(&self)->u64;
+    fn load_root(&self)->Option<Page> {
+        if self.btree_root() == 0 {
+            None
+        } else {
+            // Here, go to page and load it.
+            Some(self.load_page(self.btree_root()))
+        }
+    }
+}
 
+impl<'env> LoadPage for MutTxn<'env>{
+    fn load_page(&self,off:u64)->Page {
+        Page { page:self.txn.load_page(off) }
+    }
+    fn btree_root(&self)->u64 {
+        self.btree_root
+    }
+}
+impl<'env> LoadPage for Txn<'env>{
+    fn load_page(&self,off:u64)->Page {
+        Page { page:self.txn.load_page(off) }
+    }
+    fn btree_root(&self)->u64 {
+        self.btree_root
+    }
+}
 
 impl<'env> MutTxn<'env> {
 
@@ -339,14 +373,6 @@ impl<'env> MutTxn<'env> {
                 assert!(glues < PAGE_SIZE_64);
                 Some(page)
             }
-        }
-    }
-    fn load_root(&self)->Option<Page> {
-        if self.btree_root == 0 {
-            None
-        } else {
-            // Here, go to page and load it.
-            Some(Page { page:self.txn.load_page(self.btree_root) })
         }
     }
 
@@ -446,9 +472,7 @@ impl<'env> MutTxn<'env> {
             self.insert(&mut btree,key0,value0,l,r);
         }
     }
-    fn load_page(&self,off:u64)->Page {
-        Page { page:self.txn.load_page(off) }
-    }
+
     fn load_mut_page(&mut self,off:u64)->MutPage {
         Cow(self.txn.load_mut_page(off)).into_mut_page(self)
     }
@@ -705,87 +729,98 @@ impl<'env> MutTxn<'env> {
             }
         }
     }
-
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         if let Some(root_page) = self.load_root() {
             let root=root_page.root();
-            self.binary_tree_get(&root_page,key,value,root)
+            binary_tree_get(self,&root_page,key,value,root)
         } else {
             None
         }
     }
+}
 
-    fn binary_tree_get<'a>(&self, page:&Page, key:&[u8], value:Option<&[u8]>, current:u32)->Option<&'a[u8]> {
-        unsafe {
-            debug!("binary_tree_get:{:?}",page);
-            let ptr=page.offset(current) as *mut u32;
+impl<'env> Txn<'env> {
+    pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
+        if let Some(root_page) = self.load_root() {
+            let root=root_page.root();
+            binary_tree_get(self,&root_page,key,value,root)
+        } else {
+            None
+        }
+    }
+}
 
-            let value_=value.unwrap_or(b"");
-            let (key0,value0)=read_key_value(&*(ptr as *const u8));
-            let cmp= if let Some(value_)=value {
-                (key,value_).cmp(&(key0,value0))
-            } else {
-                key.cmp(&key0)
-            };
-            debug!("({:?},{:?}), {:?}, ({:?},{:?})",
-                   std::str::from_utf8_unchecked(key),
-                   std::str::from_utf8_unchecked(value_),
-                   cmp,
-                   std::str::from_utf8_unchecked(key0),
-                   std::str::from_utf8_unchecked(value0));
-            match cmp {
-                Ordering::Equal | Ordering::Less=>{
-                    let result={
-                        let left0 = u32::from_le(*(ptr as *const u32));
-                        if left0 == 1 {
-                            let next=u32::from_le(*(ptr.offset(1)));
-                            if next==0 {
-                                None
-                            } else {
-                                self.binary_tree_get(page,key,value,next)
-                            }
-                        } else {
-                            // Global offset
-                            let left = u64::from_le(*(ptr as *const u64));
-                            if left==0 {
-                                None
-                            } else {
-                                // left child is another page.
-                                let page_=self.load_page(left);
-                                let root_=page_.root();
-                                self.binary_tree_get(&page_,key,value,root_)
-                            }
-                        }
-                    };
-                    if cmp==Ordering::Equal { Some(result.unwrap_or(value0)) } else { result }
-                },
-                Ordering::Greater =>{
-                    let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
-                    debug!("right0={:?}",right0);
-                    if right0 == 1 {
-                        let next=u32::from_le(*(ptr.offset(3)));
+fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&[u8]>, current:u32)->Option<&'a[u8]> {
+    unsafe {
+        debug!("binary_tree_get:{:?}",page);
+        let ptr=page.offset(current) as *mut u32;
+
+        let value_=value.unwrap_or(b"");
+        let (key0,value0)=read_key_value(&*(ptr as *const u8));
+        let cmp= if let Some(value_)=value {
+            (key,value_).cmp(&(key0,value0))
+        } else {
+            key.cmp(&key0)
+        };
+        debug!("({:?},{:?}), {:?}, ({:?},{:?})",
+               std::str::from_utf8_unchecked(key),
+               std::str::from_utf8_unchecked(value_),
+               cmp,
+               std::str::from_utf8_unchecked(key0),
+               std::str::from_utf8_unchecked(value0));
+        match cmp {
+            Ordering::Equal | Ordering::Less=>{
+                let result={
+                    let left0 = u32::from_le(*(ptr as *const u32));
+                    if left0 == 1 {
+                        let next=u32::from_le(*(ptr.offset(1)));
                         if next==0 {
                             None
                         } else {
-                            self.binary_tree_get(page,key,value,next)
+                           binary_tree_get(t,page,key,value,next)
                         }
                     } else {
-                        // global offset, follow
-                        let right = u64::from_le(*((ptr as *const u64).offset(1)));
-                        if right==0 {
+                        // Global offset
+                        let left = u64::from_le(*(ptr as *const u64));
+                        if left==0 {
                             None
                         } else {
-                            // right child is another page
-                            let mut page_=self.load_page(right);
+                            // left child is another page.
+                            let page_=t.load_page(left);
                             let root_=page_.root();
-                            self.binary_tree_get(&page_,key,value,root_)
+                            binary_tree_get(t,&page_,key,value,root_)
                         }
+                    }
+                };
+                if cmp==Ordering::Equal { Some(result.unwrap_or(value0)) } else { result }
+            },
+            Ordering::Greater =>{
+                let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
+                debug!("right0={:?}",right0);
+                if right0 == 1 {
+                    let next=u32::from_le(*(ptr.offset(3)));
+                    if next==0 {
+                        None
+                    } else {
+                        binary_tree_get(t,page,key,value,next)
+                    }
+                } else {
+                    // global offset, follow
+                    let right = u64::from_le(*((ptr as *const u64).offset(1)));
+                    if right==0 {
+                        None
+                    } else {
+                        // right child is another page
+                        let mut page_=t.load_page(right);
+                        let root_=page_.root();
+                        binary_tree_get(t,&page_,key,value,root_)
                     }
                 }
             }
+        }
     }
 }
-}
+
 
 unsafe fn incr(p:*mut u32) {
     *p = (u32::from_le(*p) + 1).to_le()
