@@ -12,6 +12,7 @@ env_logger="*"
 fs2="*"
 
 rand="*"
+tempdir="0.3"
 
 [build-dependencies]
 libc="*"

@@ -6,34 +6,69 @@ extern crate fs2;
 extern crate env_logger;
 
 extern crate rand;
-use rand::{thread_rng,sample};
+use rand::{Rng,thread_rng,sample};
 
 use dictionnaire::*;
 
 //mod transaction;
 //use transaction::*;
+extern crate tempdir;
 
 fn main(){
     env_logger::init().unwrap();
-    //Env::test_concat_mmap("/tmp/test", &[(0,4096), (20480,4096)]);
+    //let dir = self::tempdir::TempDir::new("dictionnaire").unwrap();
+    //let env=Env::new(dir.path()).unwrap();
     let env=Env::new("/tmp/test").unwrap();
-    let mut txn=env.mut_txn_begin();
-    let mut bindings=Vec::new();
-    for i in 0..100 {
-        let x=format!("{}",i);
-        let y=format!("{}",(i*i)%17);
-        txn.put(x.as_bytes(),y.as_bytes());
-        bindings.push((x,y));
-        //txn.put(b"blublu",b"blibli");
+
+    let n=248;
+    let m=n/10;
+
+    let mut bindings=Vec::with_capacity(n);
+    /*
+    {
+        let mut txn=env.mut_txn_begin();
+        for i in 0..100 {
+            let x=format!("{}",i);
+            let y=format!("{}",(i*i)%17);
+            txn.put(x.as_bytes(),y.as_bytes());
+            bindings.push((x,y,false));
+        }
+        // txn not commited = cancelled
     }
+     */
     let mut rng=thread_rng();
-    for &(ref u,ref v) in sample(&mut rng, bindings.iter(), 10) {
-        let x= unsafe { txn.get(u.as_bytes(),None).map(|x| std::str::from_utf8_unchecked(x)) };
-        println!("{},{},{:?}",u,v,x)
+    {
+        let mut txn=env.mut_txn_begin();
+        for i in 0..n {
+            //let x=rng.gen::<i32>();
+            //let y=rng.gen::<i32>();
+            let sx=format!("{}",i);
+            let sy=format!("{}",(i*i)%17);
+            println!("\n\n{}: {},{}\n",i,sx,sy);
+            txn.put(sx.as_bytes(),sy.as_bytes());
+            //txn.debug("/tmp/debug.tmp");
+            std::fs::rename("/tmp/debug.tmp","/tmp/debug");
+            bindings.push((sx,sy,true));
+        }
+        println!("debug");
+        txn.debug("/tmp/debug.tmp");
+        std::fs::rename("/tmp/debug.tmp","/tmp/debug");
+        println!("commit");
+        txn.commit().unwrap();
     }
-    txn.debug("/tmp/debug");
-    txn.commit().unwrap();
-    println!("final statistics: {:?}",env.statistics());
+
+    let txn=env.txn_begin();
+    for &(ref sx,ref sy,ref b) in bindings.iter() {//sample(&mut rng, bindings.iter(), m) {
+        //println!("getting {:?}",sx);
+        if let Some(y)=txn.get(sx.as_bytes(),None) {
+            assert!(*b && y==sy.as_bytes())
+        } else {
+            assert!(! *b)
+        }
+    }
+
+    //txn.debug("/tmp/debug");
+    //println!("final statistics: {:?}",env.statistics());
 
     //let env=std::sync::Arc::new(env);
     /*

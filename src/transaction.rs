@@ -54,7 +54,7 @@ impl From<std::io::Error> for Error {
 
 /// Environment, required to start any transactions. Thread-safe, but opening the same database several times in the same process is not cross-platform.
 pub struct Env {
-    length:u64,
+    pub length:u64,
     lock_file:File,
     mutable_file:File,
     map:*mut u8,
@@ -66,13 +66,13 @@ unsafe impl Send for Env {}
 unsafe impl Sync for Env {}
 
 pub struct Txn<'env> {
-    env:&'env Env,
+    pub env:&'env Env,
     guard:RwLockReadGuard<'env,()>,
 }
 
 
 pub struct MutTxn<'env> {
-    env:&'env Env,
+    pub env:&'env Env,
     mutable:MutexGuard<'env,()>,
     last_page:u64,
     current_list_page:Page, // current page storing the list of free pages.
@@ -269,7 +269,13 @@ impl MutPage {
         std::slice::from_raw_parts_mut(self.data as *mut u8,PAGE_SIZE)
     }
     pub fn free(&self,txn:&mut MutTxn) {
-        let p:&Page = unsafe { std::mem::transmute(self) }; p.free(txn)
+        let p:&Page = self.as_page(); p.free(txn)
+    }
+    pub fn as_page<'a>(&'a self)->&'a Page {
+        unsafe { std::mem::transmute(self) }
+    }
+    pub fn into_page(self)->Page {
+        unsafe { std::mem::transmute(self) }
     }
 }
 
@@ -396,7 +402,7 @@ impl <'env>MutTxn<'env> {
     }
 
     /// Commit a transaction. This is guaranteed to be atomic: either the commit succeeds, and all the changes made during the transaction are written to disk. Or the commit doesn't succeed, and we're back to the state just before starting the transaction.
-    pub fn commit(mut self,extra:&[u8])->Result<(),Error>{
+    pub fn commit<T>(mut self,extra:&[T])->Result<(),Error>{
         // Tasks:
         // - allocate new pages (copy-on-write) to write the new list of free pages, including edited "stack pages".
         //
@@ -483,9 +489,9 @@ impl <'env>MutTxn<'env> {
                     *(self.env.map as *mut u64) = self.last_page.to_le();
                 }
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
-                debug!("commit: {:?}",extra);
+                //debug!("commit: {:?}",extra);
                 copy_nonoverlapping(extra.as_ptr(),
-                                    self.env.map.offset(ZERO_HEADER),
+                                    self.env.map.offset(ZERO_HEADER) as *mut T,
                                     extra.len());
                 // synchronize all maps
                 let ok=libc::msync(self.env.map.offset(PAGE_SIZE as isize) as *mut c_void,
