@@ -26,7 +26,7 @@ use std::sync::{RwLock,RwLockReadGuard,Mutex,MutexGuard};
 use std::ptr::copy_nonoverlapping;
 use std::collections::{HashSet};
 use std::cmp::max;
-use std::marker::PhantomData;
+//use std::marker::PhantomData;
 use std::ops::Shl;
 use fs2::FileExt;
 use std::fs::File;
@@ -255,9 +255,11 @@ pub unsafe fn free(txn:&mut MutTxn,offset:u64) {
 }
 
 impl Page {
+    /*
     pub unsafe fn as_slice<'a>(&'a self)->&'a[u8]{
         std::slice::from_raw_parts(self.data as *const u8,PAGE_SIZE)
     }
+     */
     pub fn free(&self,txn:&mut MutTxn) {
         // If this page was allocated during this transaction
         unsafe { free(txn,self.offset) }
@@ -265,13 +267,15 @@ impl Page {
 }
 
 impl MutPage {
+    /*
     pub unsafe fn as_slice<'a>(&'a self)->&'a[u8] {
         std::slice::from_raw_parts(self.data as *const u8,PAGE_SIZE)
     }
     pub unsafe fn as_mut_slice<'a>(&'a mut self)->&'a mut [u8]{
         std::slice::from_raw_parts_mut(self.data as *mut u8,PAGE_SIZE)
     }
-    pub fn free(&self,txn:&mut MutTxn) {
+     */
+    /*pub fn free(&self,txn:&mut MutTxn) {
         unsafe { free(txn,self.offset) }
     }
     pub fn as_page<'a>(&'a self)->&'a Page {
@@ -279,10 +283,10 @@ impl MutPage {
     }
     pub fn into_page(self)->Page {
         unsafe { std::mem::transmute(self) }
-    }
+    }*/
 }
 
-
+/*
 pub struct MutPages<'a> { pub pages:Pages<'a> }
 
 pub struct Pages<'a> {
@@ -299,11 +303,9 @@ impl<'a> Drop for Pages<'a> {
         }
     }
 }
+*/
 impl <'env>Txn<'env> {
     /// Find the appropriate map segment
-    pub fn offset(&self,off:u64)->*mut u8 {
-        unsafe { self.env.map.offset(off as isize) }
-    }
     pub fn load_page(&self,off:u64)->Page {
         unsafe {
             Page { data:self.env.map.offset(off as isize),
@@ -509,10 +511,10 @@ impl <'env>MutTxn<'env> {
             }
         }
     }
-
+    /*
     /// Abort the transaction. This is actually a no-op, just as a machine crash aborts a transaction. Letting the transaction go out of scope would have the same effect.
     pub fn abort(self){
-    }
+    }*/
 }
 
 impl Drop for Env {

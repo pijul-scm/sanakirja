@@ -302,6 +302,7 @@ impl Cow {
             }
         }
     }
+    /*
     fn into_page(self)->Page {
         let Cow(s)=self;
         match s {
@@ -309,6 +310,7 @@ impl Cow {
             transaction::Cow::MutPage(p)=> Page { page:p.into_page() }
         }
     }
+     */
 }
 
 pub trait LoadPage {
@@ -381,11 +383,11 @@ impl<'env> MutTxn<'env> {
         };
 
         if let Some((key0,value0,l,r,fr))=put_result {
-            unsafe {
+            /*unsafe {
                 let key0=std::str::from_utf8_unchecked(&key0[..]);
                 let value0=std::str::from_utf8_unchecked(&value0[..]);
                 //println!("split root on {:?}",(key0,value0,l,r));
-            }
+            }*/
             // the root page has split, we need to allocate a new one.
             let mut btree = self.alloc_page(1);
             debug!("new root page:{:?}",btree);
@@ -583,7 +585,7 @@ impl<'env> MutTxn<'env> {
                 }
             }
             if fr!=0 {
-                unsafe { transaction::free(&mut self.txn, fr) }
+                transaction::free(&mut self.txn, fr)
             }
             Insert::Split { key:key,value:value,left:left_page.page.offset,right:right_page.page.offset,
                             free_page:page.page.offset }
@@ -596,7 +598,7 @@ impl<'env> MutTxn<'env> {
             debug!("binary_tree_insert {:?} {:?}",page,current);
             let ptr=page.offset(current) as *mut u32;
 
-            let count = u32::from_le(*(ptr.offset(6)));
+            //let count = u32::from_le(*(ptr.offset(6)));
 
             let (key0,value0)=read_key_value(&*(ptr as *const u8));
             //println!("{:?} {} comparing ({:?},{:?})", page.page.offset, count, std::str::from_utf8_unchecked(key0), std::str::from_utf8_unchecked(value0));
@@ -661,7 +663,7 @@ impl<'env> MutTxn<'env> {
                                     *(ptr as *mut u32) = (1 as u32).to_le();
                                     *((ptr as *mut u32).offset(1)) = off_ptr.to_le();
                                     incr(ptr.offset(6));
-                                    unsafe { transaction::free(&mut self.txn, fr0) }
+                                    transaction::free(&mut self.txn, fr0);
                                     Some(Insert::Ok(rebalance(page,current)))
                                 } else {
                                     debug!("Could not find space for child pages {} {}",l0,r0);
@@ -735,7 +737,7 @@ impl<'env> MutTxn<'env> {
                                     *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
                                     *((ptr as *mut u32).offset(3)) = off_ptr.to_le();
                                     incr(ptr.offset(6));
-                                    unsafe { transaction::free(&mut self.txn, fr0) }
+                                    transaction::free(&mut self.txn, fr0);
                                     Some(Insert::Ok(rebalance(page,current)))
                                 } else {
                                     debug!("Could not find space for child pages {} {}",l0,r0);
@@ -1040,11 +1042,6 @@ fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&
 unsafe fn incr(p:*mut u32) {
     *p = (u32::from_le(*p) + 1).to_le()
 }
-unsafe fn decr(p:*mut u32) {
-    *p = (u32::from_le(*p) - 1).to_le()
-}
-
-
 
 
 fn tree_rotate_clockwise(page:&mut MutPage, v:u32)->u32 {
