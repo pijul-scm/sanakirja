@@ -65,7 +65,6 @@ use std::ptr::copy_nonoverlapping;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufWriter,Write};
-mod constants;
 mod transaction;
 
 pub use transaction::{Statistics};
