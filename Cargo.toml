@@ -1,5 +1,6 @@
 [package]
 name = "sanakirja"
+description = "A key-value dictionary, using copy-on-write and B-trees."
 version = "0.1.0"
 authors = ["Pierre-Étienne Meunier"]
 build = "build.rs"
@@ -8,10 +9,10 @@ documentation = "http://pijul.org/sanakirja/doc/sanakirja"
 repository = "http://pijul.org/sanakirja"
 
 [dependencies]
-libc="*"
-log="*"
-env_logger="*"
-fs2="*"
+libc="0.2"
+log="0.3"
+env_logger="0.3"
+fs2="0.2"
 
 [build-dependencies]
-libc="*"
+libc="0.2"
