@@ -1,7 +1,15 @@
-//! Fast and reliable key-value store. Implements ACID semantics, in a
-//! lock-free way: mutable transactions exclude each other, do not
-//! exclude immutable transactions except during the call to
-//! ```commit()```.
+//! Fast and reliable key-value store.
+//!
+//! # Features
+//!
+//! - ACID semantics, using a separable transactions module, reusable for other structure.
+//!
+//! - B-trees with copy-on-write.
+//!
+//! - Support for referential transparency (interface still missing).
+//!
+//! - No locks, writers exclude each other, and only exclude readers during calls to ```commit()``` (readers still read the database as it was before the start of the writers/mutable transaction).
+//!
 //!
 //! This version is only capable of inserting and retrieving keys in
 //! the database, allowing several bindings for the same key (get will
@@ -10,9 +18,7 @@
 //! Implementation details, in particular the file format, are
 //! documented in the file.
 //!
-//! Here is a TODO list:
-//!
-//! - <s>get</s>
+//! Here is a todo-list:
 //!
 //! - iterate (easy)
 //!
