@@ -1,14 +1,49 @@
-/* TODO
+//! Fast and reliable key-value store. Implements ACID semantics, in a
+//! lock-free way: mutable transactions exclude each other, do not
+//! exclude immutable transactions except during the call to
+//! ```commit()```.
+//!
+//! This version is only capable of inserting and retrieving keys in
+//! the database, allowing several bindings for the same key (get will
+//! retrieve the first one).
+//!
+//! Implementation details, in particular the file format, are
+//! documented in the file.
+//!
+//! Here is a TODO list:
+//!
+//! - <s>get</s>
+//!
+//! - iterate (easy)
+//!
+//! - check that all dereferences are converted to/from little-endian. (easy)
+//!
+//! - delete (half-easy)
+//!
+//! - glues (not easy)
+//!
+//! - several databases (hard)
+//!
+//! - reference counting (half-easy)
+//!
+//! - dynamic loading of pages not in the map (in file 'transaction.rs', half-easy)
+//!
+//! - error handling (easy)
+//!
+//! # Example
+//!
+//! ```
+//! use sanakirja::Env;
+//! let env=Env::new("/tmp/test").unwrap();
+//! let mut txn=env.mut_txn_begin();
+//! txn.put(b"test key", b"test value");
+//! txn.commit().unwrap();
+//!
+//! let txn=env.txn_begin();
+//! assert!(txn.get(b"test key",None) == Some(b"test value"))
+//! ```
+//!
 
-- del
-- iterate
-- several databases
-- reference counting
-- check that all dereferences are converted to/from little-endian.
-
-X get
-
-*/
 
 extern crate libc;
 #[macro_use]
@@ -27,16 +62,19 @@ pub use transaction::{Statistics};
 use transaction::{PAGE_SIZE,PAGE_SIZE_64};
 use std::collections::HashSet;
 
+/// Mutable transaction
 pub struct MutTxn<'env> {
     txn:transaction::MutTxn<'env>,
-    pub btree_root:u64
+    btree_root:u64
 }
 
+/// Immutable transaction
 pub struct Txn<'env> {
     txn:transaction::Txn<'env>,
-    pub btree_root:u64
+    btree_root:u64
 }
 
+/// Environment, containing in particular a pointer to the memory-mapped file.
 pub struct Env {
     env:transaction::Env
 }
@@ -44,12 +82,18 @@ pub struct Env {
 pub type Error=transaction::Error;
 
 impl Env {
+
+    /// Creates an environment.
     pub fn new<P:AsRef<Path>>(file:P) -> Result<Env,Error> {
         transaction::Env::new(file,13 + 10).and_then(|env| Ok(Env {env:env}))
     }
+
+    /// Returns statistics about pages.
     pub fn statistics(&self)->Statistics {
         self.env.statistics()
     }
+
+    /// Start an immutable transaction.
     pub fn txn_begin<'env>(&'env self)->Txn<'env> {
         let btree_root= unsafe {
             let p_extra=self.env.extra() as *const u64;
@@ -58,6 +102,8 @@ impl Env {
         Txn { txn:self.env.txn_begin(),
               btree_root:btree_root }
     }
+
+    /// Start a mutable transaction.
     pub fn mut_txn_begin<'env>(&'env self)->MutTxn<'env> {
         let btree_root= unsafe {
             let p_extra=self.env.extra() as *const u64;
@@ -74,11 +120,11 @@ impl Env {
 
 
 #[derive(Debug)]
-pub struct MutPage {
+struct MutPage {
     page:transaction::MutPage,
 }
 #[derive(Debug)]
-pub struct Page {
+struct Page {
     page:transaction::Page,
 }
 
@@ -227,7 +273,7 @@ impl MutPage {
     // - 64 bits: right, little endian. if the first 32 bits == 1, local offset, else global in bytes.
     // - 32 bits: key length
     // - 32 bits: value length
-    // - 32 bits: cardinal (number of nodes)
+    // - 32 bits: cardinal, = 1+sum of children in the same page
     // - contents, |key|+|value|
     // - padding for 32 bits/4 bytes alignment.
 
@@ -313,7 +359,7 @@ impl Cow {
      */
 }
 
-pub trait LoadPage {
+trait LoadPage {
     fn length(&self)->u64;
     fn load_page(&self,off:u64)->Page;
     fn btree_root(&self)->u64;
@@ -758,6 +804,8 @@ impl<'env> MutTxn<'env> {
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         tree_get(self,key,value)
     }
+
+    #[doc(hidden)]
     pub fn debug<P:AsRef<Path>>(&self,p:P,off:u64) {
         debug(self,p,off)
     }
@@ -767,6 +815,7 @@ impl<'env> Txn<'env> {
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         tree_get(self,key,value)
     }
+    #[doc(hidden)]
     pub fn debug<P:AsRef<Path>>(&self,p:P,off:u64) {
         debug(self,p,off)
     }
@@ -1044,6 +1093,7 @@ unsafe fn incr(p:*mut u32) {
 }
 
 
+/// Converts v(u(a,b),c) into u(a,v(b,c))
 fn tree_rotate_clockwise(page:&mut MutPage, v:u32)->u32 {
     unsafe {
         let ptr=page.offset(v) as *mut u32;
@@ -1092,6 +1142,8 @@ fn tree_rotate_clockwise(page:&mut MutPage, v:u32)->u32 {
         }
     }
 }
+
+/// Converts u(a,v(b,c)) into v(u(a,b),c)
 fn tree_rotate_anticlockwise(page:&mut MutPage, u:u32)->u32 {
     unsafe {
         let ptr=page.offset(u) as *mut u32;
@@ -1139,6 +1191,8 @@ fn tree_rotate_anticlockwise(page:&mut MutPage, u:u32)->u32 {
         }
     }
 }
+
+/// Rebalances a binary tree.
 fn rebalance(page:&mut MutPage,node:u32)->u32 {
     debug!("rebalance");
     let x=unsafe {

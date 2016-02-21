@@ -1,23 +1,14 @@
 [package]
-name = "dictionnaire"
+name = "sanakirja"
 version = "0.1.0"
-authors = ["pe"]
+authors = ["Pierre-Étienne Meunier"]
 build = "build.rs"
 
 [dependencies]
 libc="*"
 log="*"
 env_logger="*"
-
 fs2="*"
-
-rand="*"
-tempdir="0.3"
 
 [build-dependencies]
 libc="*"
-
-
-[[bin]]
-name="dictionnaire"
-doc=false
