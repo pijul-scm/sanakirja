@@ -3,6 +3,7 @@ name = "sanakirja"
 version = "0.1.0"
 authors = ["Pierre-Étienne Meunier"]
 build = "build.rs"
+license = "MPL-2.0"
 
 [dependencies]
 libc="*"
