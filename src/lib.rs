@@ -813,6 +813,12 @@ impl<'env> MutTxn<'env> {
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         tree_get(self,key,value)
     }
+    fn iterate<'a,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(&'a self, key:&[u8], value:Option<&[u8]>, f:F) {
+        if let Some(root_page)=self.load_root() {
+            let root=root_page.root();
+            tree_iterate(self,&root_page,key,value,f,root,false);
+        }
+    }
 
     #[doc(hidden)]
     pub fn debug<P:AsRef<Path>>(&self,p:P,off:u64) {
@@ -823,6 +829,12 @@ impl<'env> MutTxn<'env> {
 impl<'env> Txn<'env> {
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         tree_get(self,key,value)
+    }
+    fn iterate<'a,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(&'a self, key:&[u8], value:Option<&[u8]>, f:F) {
+        if let Some(root_page)=self.load_root() {
+            let root=root_page.root();
+            tree_iterate(self,&root_page,key,value,f,root,false);
+        }
     }
     #[doc(hidden)]
     pub fn debug<P:AsRef<Path>>(&self,p:P,off:u64) {
@@ -1095,6 +1107,102 @@ fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&
         }
     }
 }
+
+
+
+
+
+
+fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&Page, key:&[u8], value:Option<&[u8]>, f:F, current:u32, started:bool)->Option<bool> {
+    unsafe {
+        debug!("binary_tree_get:{:?}",page);
+        let ptr=page.offset(current) as *mut u32;
+
+        let value_=value.unwrap_or(b"");
+        let (key0,value0)=read_key_value(&*(ptr as *const u8));
+        let cmp= if let Some(value_)=value {
+            (key,value_).cmp(&(key0,value0))
+        } else {
+            key.cmp(&key0)
+        };
+        debug!("({:?},{:?}), {:?}, ({:?},{:?})",
+               std::str::from_utf8_unchecked(key),
+               std::str::from_utf8_unchecked(value_),
+               cmp,
+               std::str::from_utf8_unchecked(key0),
+               std::str::from_utf8_unchecked(value0));
+
+        // If we've already started iterating, or else if the key can be found on our left.
+        let result_left = if started || (!started && (cmp==Ordering::Equal || cmp==Ordering::Less)) {
+            let result={
+                let left0 = u32::from_le(*(ptr as *const u32));
+                if left0 == 1 {
+                    let next=u32::from_le(*(ptr.offset(1)));
+                    if next==0 {
+                        None
+                    } else {
+                        tree_iterate(t,page,key,value,f,next,started)
+                    }
+                } else {
+                    // Global offset
+                    let left = u64::from_le(*(ptr as *const u64));
+                    if left==0 {
+                        None
+                    } else {
+                        // left child is another page.
+                        let page_=t.load_page(left);
+                        let root_=page_.root();
+                        tree_iterate(t,&page_,key,value,f,root_,started)
+                    }
+                }
+            };
+            match result {
+                Some(true)=>Some(f(key0,value0)),
+                None if cmp==Ordering::Equal => Some(f(key0,value0)),
+                _=>result // we've stopped already
+            }
+        } else { None };
+
+
+        if result_left==Some(false) {
+            Some(false)
+        } else {
+            if (result_left.is_none() && cmp==Ordering::Greater) || result_left.is_some() {
+                let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
+                if right0 == 1 {
+                    let next=u32::from_le(*(ptr.offset(3)));
+                    if next==0 {
+                        None
+                    } else {
+                        tree_iterate(t,page,key,value,f,next,started || result_left.is_some())
+                    }
+                } else {
+                    // global offset, follow
+                    let right = u64::from_le(*((ptr as *const u64).offset(1)));
+                    if right==0 {
+                        None
+                    } else {
+                        // right child is another page
+                        let page_=t.load_page(right);
+                        let root_=page_.root();
+                        tree_iterate(t,&page_,key,value,f,root_, started || result_left.is_some())
+                    }
+                }
+            } else {
+                result_left
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
 
 
 unsafe fn incr(p:*mut u32) {
