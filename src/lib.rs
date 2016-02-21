@@ -380,7 +380,7 @@ impl<'env> MutTxn<'env> {
             self.insert(&mut btree,key,value,0,0)
         };
 
-        if let Some((key0,value0,l,r))=put_result {
+        if let Some((key0,value0,l,r,fr))=put_result {
             unsafe {
                 let key0=std::str::from_utf8_unchecked(&key0[..]);
                 let value0=std::str::from_utf8_unchecked(&value0[..]);
@@ -393,6 +393,7 @@ impl<'env> MutTxn<'env> {
             let off=btree.page.offset;
             self.btree_root = off;
             let off=btree.alloc_key_value(&key0,&value0,l,r).unwrap();
+            unsafe { transaction::free(&mut self.txn, fr) }
             btree.set_root(off);
         }
     }
@@ -408,7 +409,7 @@ impl<'env> MutTxn<'env> {
     }
 
     // Finds binary tree root and calls binary_tree_insert on it.
-    fn insert<'a>(&mut self,page:&mut MutPage, key:&[u8],value:&[u8],l:u64,r:u64)->Option<(Vec<u8>,Vec<u8>, u64, u64)> {
+    fn insert<'a>(&mut self,page:&mut MutPage, key:&[u8],value:&[u8],l:u64,r:u64)->Option<(&'a[u8],&'a[u8], u64, u64, u64)> {
         let root = page.root();
         debug!("insert: root={:?}, {:?},{:?}",root,key,value);
         if root==0 {
@@ -421,8 +422,8 @@ impl<'env> MutTxn<'env> {
             let result=self.binary_tree_insert(page,key,value,l,r,root);
             debug!("result {:?}",result);
             match result {
-                Some(Insert::Split { key,value,left,right })=>{
-                    Some((key,value,left,right))
+                Some(Insert::Split { key,value,left,right,free_page })=>{
+                    Some((key,value,left,right,free_page))
                 },
                 Some(Insert::Ok(root))=>{
                     debug!("setting root");
@@ -439,7 +440,7 @@ impl<'env> MutTxn<'env> {
         }
     }
 
-    fn split_and_insert<'a>(&mut self, page:&mut MutPage, k:&[u8], v:&[u8], l:u64, r:u64)->Insert {
+    fn split_and_insert<'a>(&mut self, page:&mut MutPage, k:&[u8], v:&[u8], l:u64, r:u64, fr:u64)->Insert<'a> {
         //page.page.free(&mut self.txn);
         //self.debug("/tmp/before_split");
         //println!("split {:?}",page);
@@ -581,14 +582,16 @@ impl<'env> MutTxn<'env> {
                     }
                 }
             }
-            page.page.free(&mut self.txn);
-            //println!("done splitting");
-            Insert::Split { key:key.to_vec(),value:value.to_vec(),left:left_page.page.offset,right:right_page.page.offset }
+            if fr!=0 {
+                unsafe { transaction::free(&mut self.txn, fr) }
+            }
+            Insert::Split { key:key,value:value,left:left_page.page.offset,right:right_page.page.offset,
+                            free_page:page.page.offset }
         }
     }
 
     // Returns None if the changes have been done in one of the children of "page", Some(Insert::Ok(..)) if "page" is a B-leaf and we inserted something in it, and Some(Insert::Split(...)) if page was split.
-    fn binary_tree_insert<'a>(&mut self, page:&mut MutPage, key:&[u8], value:&[u8], l:u64,r:u64,current:u32)->Option<Insert> {
+    fn binary_tree_insert<'a>(&mut self, page:&mut MutPage, key:&[u8], value:&[u8], l:u64,r:u64,current:u32)->Option<Insert<'a>> {
         unsafe {
             debug!("binary_tree_insert {:?} {:?}",page,current);
             let ptr=page.offset(current) as *mut u32;
@@ -615,7 +618,7 @@ impl<'env> MutTxn<'env> {
                                 Some(Insert::Ok(rebalance(page,current)))
                             } else {
                                 debug!("needs to split this page");
-                                Some(self.split_and_insert(page,key,value,l,r))
+                                Some(self.split_and_insert(page,key,value,l,r,0))
                             }
                         } else {
                             debug!("calling insert from binary");
@@ -643,13 +646,13 @@ impl<'env> MutTxn<'env> {
                             } else {
                                 // Or not: split
                                 debug!("left split 0");
-                                Some(self.split_and_insert(page,key,value,l,r))
+                                Some(self.split_and_insert(page,key,value,l,r,0))
                             }
                         } else {
                             // left child is another page.
                             debug!("left, page_: {}",left);
                             let mut page_=self.load_mut_page(left);
-                            if let Some((k0,v0,l0,r0)) = self.insert(&mut page_,key,value,l,r) {
+                            if let Some((k0,v0,l0,r0,fr0)) = self.insert(&mut page_,key,value,l,r) {
                                 // page_ was split. this means a new key in page.
                                 //println!("Child page {:?} split into {} and {}, need to allocate",page_,l0,r0);
                                 //println!("child split: {:?},{:?}", std::str::from_utf8_unchecked(k0), std::str::from_utf8_unchecked(v0));
@@ -658,13 +661,14 @@ impl<'env> MutTxn<'env> {
                                     *(ptr as *mut u32) = (1 as u32).to_le();
                                     *((ptr as *mut u32).offset(1)) = off_ptr.to_le();
                                     incr(ptr.offset(6));
+                                    unsafe { transaction::free(&mut self.txn, fr0) }
                                     Some(Insert::Ok(rebalance(page,current)))
                                 } else {
                                     debug!("Could not find space for child pages {} {}",l0,r0);
                                     // page_ was split and there is no space here to keep track of its replacement.
                                     // We need to erase the reference to it.
                                     *(ptr as *mut u64) = 0;
-                                    Some(self.split_and_insert(page,&k0,&v0,l0,r0))
+                                    Some(self.split_and_insert(page,&k0,&v0,l0,r0,fr0))
                                 }
                             } else {
                                 // we successfully inserted (key,value) into page_ (or its children).
@@ -688,7 +692,7 @@ impl<'env> MutTxn<'env> {
                                 Some(Insert::Ok(rebalance(page,current)))
                             } else {
                                 debug!("needs to split this page");
-                                Some(self.split_and_insert(page,key,value,l,r))
+                                Some(self.split_and_insert(page,key,value,l,r,0))
                             }
                         } else {
                             debug!("calling insert from binary");
@@ -717,12 +721,12 @@ impl<'env> MutTxn<'env> {
                                 Some(Insert::Ok(rebalance(page,current)))
                             } else {
                                 debug!("split, above instances take care of reinsertion");
-                                Some(self.split_and_insert(page,key,value,l,r))
+                                Some(self.split_and_insert(page,key,value,l,r,0))
                             }
                         } else {
                             debug!("right, page_: {}",right);
                             let mut page_=self.load_mut_page(right);
-                            if let Some((k0,v0,l0,r0)) = self.insert(&mut page_,key,value,l,r) {
+                            if let Some((k0,v0,l0,r0,fr0)) = self.insert(&mut page_,key,value,l,r) {
                                 // page_ split, we need to insert the keys here.
                                 //println!("Child page {:?} split into {} and {}, need to allocate",page_,l0,r0);
                                 //println!("child split: {:?},{:?}",std::str::from_utf8_unchecked(k0),std::str::from_utf8_unchecked(v0));
@@ -731,13 +735,14 @@ impl<'env> MutTxn<'env> {
                                     *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
                                     *((ptr as *mut u32).offset(3)) = off_ptr.to_le();
                                     incr(ptr.offset(6));
+                                    unsafe { transaction::free(&mut self.txn, fr0) }
                                     Some(Insert::Ok(rebalance(page,current)))
                                 } else {
                                     debug!("Could not find space for child pages {} {}",l0,r0);
                                     // page_ was split and there is no space here to keep track of its replacement.
                                     // We need to erase the reference to it.
                                     *((ptr as *mut u64).offset(1)) = 0;
-                                    Some(self.split_and_insert(page,&k0,&v0,l0,r0))
+                                    Some(self.split_and_insert(page,&k0,&v0,l0,r0,fr0))
                                 }
                             } else {
                                 None
@@ -1174,11 +1179,10 @@ fn rebalance(page:&mut MutPage,node:u32)->u32 {
 }
 
 
-// Since Rust's type system is unfortunately 
 #[derive(Debug)]
-enum Insert {
+enum Insert<'a> {
     Ok(u32),
-    Split{key:Vec<u8>,value:Vec<u8>,left:u64,right:u64}
+    Split{key:&'a[u8],value:&'a[u8],left:u64,right:u64,free_page:u64}
 }
 
 /*
