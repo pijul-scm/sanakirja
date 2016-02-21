@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-//! Fast and reliable key-value store.
+//! Fast and reliable key-value store, under the Mozilla Public License (link as you like, share modifications).
 //!
 //! # Features
 //!
