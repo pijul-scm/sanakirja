@@ -22,7 +22,7 @@
 //! Implementation details, in particular the file format, are
 //! documented in the file.
 //!
-//! Here is a todo-list:
+//! # Todo-list
 //!
 //! - iterate (easy)
 //!
