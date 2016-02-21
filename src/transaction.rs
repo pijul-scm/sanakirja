@@ -245,6 +245,14 @@ pub struct MutPage {
     pub offset:u64
 }
 
+pub unsafe fn free(txn:&mut MutTxn,offset:u64) {
+    if txn.occupied_clean_pages.remove(&offset) {
+        txn.free_clean_pages.push(offset);
+    } else {
+        // Else, register it for freeing (we cannot reuse it in this transaction).
+        txn.free_pages.push(offset)
+    }
+}
 
 impl Page {
     pub unsafe fn as_slice<'a>(&'a self)->&'a[u8]{
@@ -252,12 +260,7 @@ impl Page {
     }
     pub fn free(&self,txn:&mut MutTxn) {
         // If this page was allocated during this transaction
-        if txn.occupied_clean_pages.remove(&self.offset) {
-            txn.free_clean_pages.push(self.offset);
-        } else {
-            // Else, register it for freeing (we cannot reuse it in this transaction).
-            txn.free_pages.push(self.offset)
-        }
+        unsafe { free(txn,self.offset) }
     }
 }
 
@@ -269,7 +272,7 @@ impl MutPage {
         std::slice::from_raw_parts_mut(self.data as *mut u8,PAGE_SIZE)
     }
     pub fn free(&self,txn:&mut MutTxn) {
-        let p:&Page = self.as_page(); p.free(txn)
+        unsafe { free(txn,self.offset) }
     }
     pub fn as_page<'a>(&'a self)->&'a Page {
         unsafe { std::mem::transmute(self) }

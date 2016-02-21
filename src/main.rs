@@ -14,13 +14,15 @@ use dictionnaire::*;
 //use transaction::*;
 extern crate tempdir;
 
+//mod lmdb;
+
 fn main(){
     env_logger::init().unwrap();
     //let dir = self::tempdir::TempDir::new("dictionnaire").unwrap();
     //let env=Env::new(dir.path()).unwrap();
     let env=Env::new("/tmp/test").unwrap();
 
-    let n=248;
+    let n=100000;
     let m=n/10;
 
     let mut bindings=Vec::with_capacity(n);
@@ -44,14 +46,15 @@ fn main(){
             //let y=rng.gen::<i32>();
             let sx=format!("{}",i);
             let sy=format!("{}",(i*i)%17);
-            println!("\n\n{}: {},{}\n",i,sx,sy);
+            println!("{}: {},{}\n",i,sx,sy);
             txn.put(sx.as_bytes(),sy.as_bytes());
             //txn.debug("/tmp/debug.tmp");
-            std::fs::rename("/tmp/debug.tmp","/tmp/debug");
+            //std::fs::rename("/tmp/debug.tmp","/tmp/debug");
             bindings.push((sx,sy,true));
         }
         println!("debug");
-        txn.debug("/tmp/debug.tmp");
+        txn.debug("/tmp/debug.tmp",0);
+        //txn.debug("/tmp/debug.tmp",2752512);
         std::fs::rename("/tmp/debug.tmp","/tmp/debug");
         println!("commit");
         txn.commit().unwrap();
@@ -59,10 +62,10 @@ fn main(){
 
     let txn=env.txn_begin();
     for &(ref sx,ref sy,ref b) in bindings.iter() {//sample(&mut rng, bindings.iter(), m) {
-        //println!("getting {:?}",sx);
         if let Some(y)=txn.get(sx.as_bytes(),None) {
             assert!(*b && y==sy.as_bytes())
         } else {
+            println!("getting {:?}",sx);
             assert!(! *b)
         }
     }
