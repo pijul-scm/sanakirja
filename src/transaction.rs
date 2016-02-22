@@ -343,7 +343,7 @@ impl <'env>MutTxn<'env> {
                    offset:off }
         }
     }
-    pub fn load_mut_page(&mut self,off:u64)->Cow {
+    pub fn load_cow_page(&mut self,off:u64)->Cow {
         assert!(off < self.env.length);
         debug!("transaction::load_mut_page: {:?} {:?}", off, self.occupied_clean_pages);
         if off !=0 && self.occupied_clean_pages.contains(&off) {
