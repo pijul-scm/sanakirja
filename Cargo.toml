@@ -8,11 +8,13 @@ license = "MPL-2.0"
 documentation = "http://pijul.org/sanakirja/doc/sanakirja"
 repository = "http://pijul.org/sanakirja"
 
+
 [dependencies]
 libc="0.2"
 log="0.3"
 env_logger="0.3"
 fs2="0.2"
+time="*"
 
 [build-dependencies]
 libc="0.2"

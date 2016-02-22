@@ -7,8 +7,8 @@
 // - get rid of initial length, grow file as needed. See fallocate, ftruncate. Equivalents on windows?
 // - Windows
 // - 32 bits mmap64
-// - SPARC (8kB pages) -> Allocate two consecutive pages instead of one. The BTree won't see the difference anyway.
 
+// X SPARC (8kB pages) -> Allocate two consecutive pages instead of one. The BTree won't see the difference anyway.
 // X 32 bits compatibility. mmap has 64 bits offsets.
 // X process and thread mutex for mutable transactions.
 // X multiple consecutive pages (done with glue_pages)
@@ -291,16 +291,24 @@ impl MutPage {
     }*/
 }
 
-/*
-pub struct MutPages<'a> { pub pages:Pages<'a> }
-
-pub struct Pages<'a> {
+#[allow(raw_pointer_derive)]
+#[derive(Debug)]
+pub struct MutPages {
     pub map:*mut u8,
+    pub offset:u64,
     len:usize,
-    pages:PhantomData<&'a()>
 }
 
-impl<'a> Drop for Pages<'a> {
+
+#[allow(raw_pointer_derive)]
+#[derive(Debug)]
+pub struct Pages {
+    pub map:*mut u8,
+    pub offset:u64,
+    len:usize,
+}
+
+impl Drop for Pages {
     fn drop(&mut self) {
         let memory=self.map;
         unsafe {
@@ -308,10 +316,11 @@ impl<'a> Drop for Pages<'a> {
         }
     }
 }
-*/
+
 impl <'env>Txn<'env> {
     /// Find the appropriate map segment
     pub fn load_page(&self,off:u64)->Page {
+        assert!(off < self.env.length);
         unsafe {
             Page { data:self.env.map.offset(off as isize),
                    offset:off }
@@ -328,12 +337,14 @@ pub enum Cow {
 impl <'env>MutTxn<'env> {
 
     pub fn load_page(&self,off:u64)->Page {
+        assert!(off < self.env.length);
         unsafe {
             Page { data:self.env.map.offset(off as isize),
                    offset:off }
         }
     }
     pub fn load_mut_page(&mut self,off:u64)->Cow {
+        assert!(off < self.env.length);
         debug!("transaction::load_mut_page: {:?} {:?}", off, self.occupied_clean_pages);
         if off !=0 && self.occupied_clean_pages.contains(&off) {
             unsafe { Cow::MutPage(MutPage { data:self.env.map.offset(off as isize),

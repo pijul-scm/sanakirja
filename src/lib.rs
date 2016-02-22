@@ -24,21 +24,19 @@
 //!
 //! # Todo-list
 //!
-//! - iterate (easy)
-//!
 //! - check that all dereferences are converted to/from little-endian. (easy)
 //!
+//! - error handling (easy)
+//!
 //! - delete (half-easy)
+//!
+//! - dynamic loading of pages not in the map (in file 'transaction.rs', half-easy)
 //!
 //! - glues (not easy)
 //!
 //! - several databases (hard)
 //!
 //! - reference counting (half-easy)
-//!
-//! - dynamic loading of pages not in the map (in file 'transaction.rs', half-easy)
-//!
-//! - error handling (easy)
 //!
 //! # Example
 //!
@@ -125,7 +123,7 @@ impl Env {
     }
 }
 
-
+// Difference between mutpage and mutpages: mutpages might also contain just one page, but it is unmapped whenever it goes out of scope, whereas P belongs to the main map. Useful for 32-bits platforms.
 
 
 #[derive(Debug)]
