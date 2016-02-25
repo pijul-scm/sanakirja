@@ -344,8 +344,8 @@ impl <'env>MutTxn<'env> {
         }
     }
     pub fn load_cow_page(&mut self,off:u64)->Cow {
-        assert!(off < self.env.length);
         debug!("transaction::load_mut_page: {:?} {:?}", off, self.occupied_clean_pages);
+        assert!(off < self.env.length);
         if off !=0 && self.occupied_clean_pages.contains(&off) {
             unsafe { Cow::MutPage(MutPage { data:self.env.map.offset(off as isize),
                                             offset:off }) }
