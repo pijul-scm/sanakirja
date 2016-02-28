@@ -402,6 +402,35 @@ impl Cow {
      */
 }
 
+pub enum Loaded<'a> {
+    Map{map:*mut u8,len:u64,contents:&'a[u8]},
+    S(&'a[u8])
+}
+
+impl<'a> Loaded<'a> {
+    fn contents(&self)->&'a[u8] {
+        match self {
+            &Loaded::S(s)=>s,
+            &Loaded::Map{contents,..}=>contents
+        }
+    }
+    fn len(&self)->usize {
+        match self {
+            &Loaded::S(s)=>s.len(),
+            &Loaded::Map{contents,..}=>contents.len()
+        }
+    }
+}
+
+impl<'a> Drop for Loaded<'a> {
+    fn drop(&mut self) {
+        match self {
+            &mut Loaded::Map{map,len,..} => unsafe { memmap::munmap(map,len) },
+            _=>{}
+        }
+    }
+}
+
 trait LoadPage {
     fn fd(&self)->c_int;
     fn length(&self)->u64;
@@ -414,9 +443,9 @@ trait LoadPage {
             Some(self.load_page(self.btree_root()))
         }
     }
-    fn load_value<'a>(&'a self,value:&Value<'a>)->&'a[u8] {
+    fn load_value<'a>(&self,value:&Value<'a>)->Loaded<'a> {
         match *value {
-            Value::S(s)=>s,
+            Value::S(s)=>Loaded::S(s),
             Value::O{offset,len,..}=>{
                 unsafe {
                     debug!("load_value {:?}",value);
@@ -432,7 +461,8 @@ trait LoadPage {
                         total+=PAGE_SIZE as isize;
                         cur = cur.offset(1)
                     }
-                    std::slice::from_raw_parts(cur.offset(1) as *const u8,len as usize)
+                    Loaded::Map { map:page,len:total as u64,
+                                  contents:std::slice::from_raw_parts(cur.offset(1) as *const u8,len as usize) }
                 }
             }
         }
@@ -469,7 +499,7 @@ impl<'env> LoadPage for Txn<'env>{
 }
 
 #[derive(Debug,Clone,Copy)]
-enum Value<'a> {
+pub enum Value<'a> {
     S(&'a[u8]),
     O{offset:u64,len:u32}
 }
@@ -501,7 +531,9 @@ impl<'env> MutTxn<'env> {
             Some(page)
         }
     }
-
+    pub fn load<'a>(&self,value:&Value<'a>)->Loaded<'a> {
+        self.load_value(value)
+    }
     pub fn put(&mut self,key:&[u8],value:&[u8]) {
         assert!(key.len() < MAX_KEY_SIZE);
         let put_result = if let Some(root) = self.load_cow_root() {
@@ -764,7 +796,9 @@ impl<'env> MutTxn<'env> {
                 let cmp=key.cmp(&key0);
                 if cmp==Ordering::Equal {
                     let value = self.load_value(&value);
+                    let value=value.contents();
                     let value0 = self.load_value(&value0);
+                    let value0=value0.contents();
                     value.cmp(value0)
                 } else {
                     cmp
@@ -915,7 +949,9 @@ impl<'env> MutTxn<'env> {
             let cmp = match cmp {
                 Ordering::Less | Ordering::Greater => cmp,
                 Ordering::Equal => {
-                    (self.load_value(&v)).cmp(&self.load_value(&value))
+                    let v=self.load_value(&v);
+                    let value=self.load_value(&value);
+                    v.contents().cmp(&value.contents())
                 }
             };
             match cmp {
@@ -952,7 +988,7 @@ impl<'env> MutTxn<'env> {
         }
     }
 
-    pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
+    pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<Value<'a>> {
         tree_get(self,key,value)
     }
 
@@ -970,7 +1006,7 @@ impl<'env> MutTxn<'env> {
 }
 
 impl<'env> Txn<'env> {
-    pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
+    pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<Value<'a>> {
         tree_get(self,key,value)
     }
 
@@ -1035,7 +1071,7 @@ fn debug<P:AsRef<Path>,T:LoadPage>(t:&T,p:P,off:u64) {
             let key=std::str::from_utf8_unchecked(key);
             let value=txn.load_value(&value);
             let mut value_=Vec::new();
-            let value = if value.len()>20 { value_.extend(&value[0..20]);value_.extend(b"...");&value_[..] } else { value };
+            let value = if value.len()>20 { value_.extend(&(value.contents())[0..20]);value_.extend(b"...");&value_[..] } else { value.contents() };
             let value=std::str::from_utf8_unchecked(value);
             //println!("key,value={:?},{:?}",key,value);
             writeln!(buf,"n_{}_{}[label=\"{}, '{}'->'{}'\"];",p.page.offset,off,count,key,value).unwrap();
@@ -1176,7 +1212,7 @@ unsafe fn tree_get<'a,T:LoadPage>(t:&'a T, key:&[u8], value:Option<&[u8]>)->Opti
 }
 */
 
-fn tree_get<'a,T:LoadPage>(t:&'a T,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]>{
+fn tree_get<'a,T:LoadPage>(t:&'a T,key:&[u8],value:Option<&[u8]>)->Option<Value<'a>>{
     if let Some(root_page) = t.load_root() {
         binary_tree_get(t,&root_page,key,value,root_page.root() as u32)
     } else {
@@ -1185,7 +1221,7 @@ fn tree_get<'a,T:LoadPage>(t:&'a T,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8
 }
 
 // non tail-rec version
-fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&[u8]>, current:u32)->Option<&'a[u8]> {
+fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&[u8]>, current:u32)->Option<Value<'a>> {
     unsafe {
         debug!("binary_tree_get:{:?}",page);
         let ptr=page.offset(current as isize) as *mut u32;
@@ -1194,7 +1230,8 @@ fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&
         let cmp= if let Some(value_)=value {
             let cmp=key.cmp(&key0);
             if cmp==Ordering::Equal {
-                value_.cmp(t.load_value(&value0))
+                let value0=t.load_value(&value0);
+                value_.cmp(value0.contents())
             } else {
                 cmp
             }
@@ -1233,7 +1270,9 @@ fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&
                         }
                     }
                 };
-                if cmp==Ordering::Equal { Some(t.load_value(&value0)) } else { result }
+                if cmp==Ordering::Equal {
+                    Some(value0)
+                } else { result }
             },
             Ordering::Greater =>{
                 let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
@@ -1279,7 +1318,8 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
             if cmp==Ordering::Equal {
                 if let Some(value)=value {
                     value0_loaded = Some(t.load_value(&value0));
-                    value.cmp(&value0_loaded.unwrap())
+                    let cont=value0_loaded.as_ref().unwrap();
+                    value.cmp(cont.contents())
                 } else {
                     cmp
                 }
@@ -1292,7 +1332,7 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
                std::str::from_utf8_unchecked(value_),
                cmp,
                std::str::from_utf8_unchecked(key0),
-               std::str::from_utf8_unchecked(t.load_value(&value0)));
+               std::str::from_utf8_unchecked(t.load_value(&value0).contents()));
 
         // If we've already started iterating, or else if the key can be found on our left.
         let result_left = if started || (!started && (cmp==Ordering::Equal || cmp==Ordering::Less)) {
@@ -1326,7 +1366,7 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
                         value0_loaded=Some(t.load_value(&value0));
                         value0_loaded.unwrap()
                     };
-                    Some(f(key0,value0))
+                    Some(f(key0,value0.contents()))
                 },
                 None if cmp==Ordering::Equal =>{
                     let value0 = if let Some(value0)=value0_loaded {
@@ -1335,7 +1375,7 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
                         value0_loaded=Some(t.load_value(&value0));
                         value0_loaded.unwrap()
                     };
-                    Some(f(key0,value0))
+                    Some(f(key0,value0.contents()))
                 },
                 _=>result // we've stopped already
             }

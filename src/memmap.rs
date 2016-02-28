@@ -14,3 +14,7 @@ pub unsafe fn mmap(fd:c_int,addr:Option<*mut u8>,offset:u64,length:u64)->*mut u8
         e as *mut u8
     }
 }
+
+pub unsafe fn munmap(addr:*mut u8,length:u64) {
+    libc::munmap(addr as *mut c_void,length as size_t);
+}
