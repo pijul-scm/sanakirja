@@ -955,14 +955,14 @@ impl<'env> MutTxn<'env> {
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         tree_get(self,key,value)
     }
-    /*
-    fn iterate<'a,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(&'a self, key:&[u8], value:Option<&[u8]>, f:F) {
+
+    pub fn iterate<'a,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(&'a self, key:&[u8], value:Option<&[u8]>, f:F) {
         if let Some(root_page)=self.load_root() {
             let root=root_page.root();
             tree_iterate(self,&root_page,key,value,f,root as u32,false);
         }
     }
-     */
+
     #[doc(hidden)]
     pub fn debug<P:AsRef<Path>>(&self,p:P,off:u64) {
         debug(self,p,off)
@@ -973,14 +973,14 @@ impl<'env> Txn<'env> {
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         tree_get(self,key,value)
     }
-    /*
-    fn iterate<'a,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(&'a self, key:&[u8], value:Option<&[u8]>, f:F) {
+
+    pub fn iterate<'a,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(&'a self, key:&[u8], value:Option<&[u8]>, f:F) {
         if let Some(root_page)=self.load_root() {
             let root=root_page.root();
             tree_iterate(self,&root_page,key,value,f,root as u32,false);
         }
     }
-     */
+
     #[doc(hidden)]
     pub fn debug<P:AsRef<Path>>(&self,p:P,off:u64) {
         debug(self,p,off)
@@ -1266,7 +1266,6 @@ fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&
 
 
 
-/*
 fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&Page, key:&[u8], value:Option<&[u8]>, f:F, current:u32, started:bool)->Option<bool> {
     unsafe {
         debug!("binary_tree_get:{:?}",page);
@@ -1274,17 +1273,26 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
 
         let value_=value.unwrap_or(b"");
         let (key0,value0)=read_key_value(&*(ptr as *const u8));
-        let cmp= if let Some(value_)=value {
-            (key,value_).cmp(&(key0,value0))
-        } else {
-            key.cmp(&key0)
+        let mut value0_loaded=None;
+        let cmp={
+            let cmp=key.cmp(&key0);
+            if cmp==Ordering::Equal {
+                if let Some(value)=value {
+                    value0_loaded = Some(t.load_value(&value0));
+                    value.cmp(&value0_loaded.unwrap())
+                } else {
+                    cmp
+                }
+            } else {
+                cmp
+            }
         };
         debug!("({:?},{:?}), {:?}, ({:?},{:?})",
                std::str::from_utf8_unchecked(key),
                std::str::from_utf8_unchecked(value_),
                cmp,
                std::str::from_utf8_unchecked(key0),
-               std::str::from_utf8_unchecked(value0));
+               std::str::from_utf8_unchecked(t.load_value(&value0)));
 
         // If we've already started iterating, or else if the key can be found on our left.
         let result_left = if started || (!started && (cmp==Ordering::Equal || cmp==Ordering::Less)) {
@@ -1311,8 +1319,24 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
                 }
             };
             match result {
-                Some(true)=>Some(f(key0,value0)),
-                None if cmp==Ordering::Equal => Some(f(key0,value0)),
+                Some(true)=>{
+                    let value0 = if let Some(value0)=value0_loaded {
+                        value0
+                    } else {
+                        value0_loaded=Some(t.load_value(&value0));
+                        value0_loaded.unwrap()
+                    };
+                    Some(f(key0,value0))
+                },
+                None if cmp==Ordering::Equal =>{
+                    let value0 = if let Some(value0)=value0_loaded {
+                        value0
+                    } else {
+                        value0_loaded=Some(t.load_value(&value0));
+                        value0_loaded.unwrap()
+                    };
+                    Some(f(key0,value0))
+                },
                 _=>result // we've stopped already
             }
         } else { None };
@@ -1348,12 +1372,6 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
         }
     }
 }
-
-*/
-
-
-
-
 
 
 
