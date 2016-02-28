@@ -32,8 +32,6 @@
 //!
 //! - dynamic loading of pages not in the map (in file 'transaction.rs', half-easy)
 //!
-//! - glues (not easy)
-//!
 //! - several databases (hard)
 //!
 //! - reference counting (half-easy)
@@ -54,7 +52,8 @@
 
 
 extern crate libc;
-use libc::{c_void,size_t,memcmp};
+use libc::{c_int};
+
 #[macro_use]
 extern crate log;
 extern crate fs2;
@@ -64,6 +63,8 @@ use std::ptr::copy_nonoverlapping;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufWriter,Write};
+
+mod memmap;
 mod transaction;
 
 pub use transaction::{Statistics};
@@ -136,103 +137,101 @@ struct Page {
     page:transaction::Page,
 }
 
-fn size_key_value(key:&[u8],value:&[u8])->usize {
-    let size=28 + key.len() + value.len();
-    size + ((4-(size&3))&3)
-}
+const MAX_KEY_SIZE:usize = PAGE_SIZE >> 2;
+const VALUE_SIZE_THRESHOLD:usize = PAGE_SIZE >> 2;
 
-trait P { // page
-    // returns a pointer to the last glue number.
-    fn page_offset(&self)->u64;
-    fn data(&self)->*const u64;
-    fn skip_glues(&self)->*const u64 {
-        unsafe {
-            let p=self.data() as *const u64;
-            while u64::from_le(*p) >= PAGE_SIZE_64 {
-                unimplemented!() // glue pages together.
-            }
-            p
+fn value_record_size(key:&[u8],value:Value)->u16 {
+    match value {
+        Value::S(s) if s.len() < VALUE_SIZE_THRESHOLD =>{
+            let size=28 + key.len() as u16 + value.len() as u16;
+            size + ((8-(size&7))&7)
+        },
+        Value::S(_) | Value::O{..}=>{
+            let size=28 + key.len() as u16 + 8;
+            size + ((8-(size&7))&7)
         }
     }
+}
 
-    fn can_alloc(&self,size:usize)->u32 {
+
+// Page layout: Starts with a header of 24 bytes.
+// - 64 bits: RC
+// - 16 bits: offset of the first free spot, from the byte before
+// - 16 bits: offset of the root of the tree, from the byte before
+// - 16 bits: how much space is occupied in this page? (controls compaction)
+// - 16 bits: padding
+// - beginning of coding space (different encodings in B-nodes and B-leaves)
+
+
+trait P { // page
+    /// offset of the page in the file.
+    fn page_offset(&self)->u64;
+
+    /// pointer to the first word of the page.
+    fn data(&self)->*const u64;
+
+    /// 0 if cannot alloc, valid offset else (offset in bytes from the byte before the coding section).
+    fn can_alloc(&self,size:u16)->u16 {
         unsafe {
-            assert!(size&3== 0); // 32 bits aligned.
-            let p=self.skip_glues() as *mut u32;
-            let first_free={
-                // Offset from the word before contents.
-                let f=u32::from_le(*(p.offset(3)));
-                if f>0 { f } else { 1 }
-            };
-            let zero=p.offset(5);
-            let next_page = (self.data() as *mut u8).offset(PAGE_SIZE as isize) as *mut u32;
-            let current=zero.offset(first_free as isize);
-            //println!("can_alloc: {:?} {:?}, {:?}",current,size,next_page);
-            if current.offset((size>>2) as isize) <= next_page {
+            assert!(size&7== 0); // 64 bits aligned.
+            let first_free=self.first_free();
+
+            let next_page = (self.data() as *mut u8).offset(PAGE_SIZE as isize) as *const u8;
+            let current=(self.data() as *const u8).offset(15+first_free as isize);
+            if current.offset(size as isize) <= next_page {
                 first_free
             } else {
                 0
             }
         }
     }
-    /*
-    fn can_alloc_key_value(&mut self,key:&[u8],value:&[u8])->u32 {
+
+    // Value of the page's reference counter.
+    fn rc(&self)->u64 {
         unsafe {
-            // size in bytes
-            debug!("can_alloc_key_value: {} {}",std::str::from_utf8_unchecked(key),std::str::from_utf8_unchecked(value));
-            self.can_alloc(size_key_value(key,value))
-        }
-    }
-     */
-    fn flags(&self)->u16 {
-        unsafe {
-            let p=self.skip_glues();
-            ((u64::from_le(*p)) & (PAGE_SIZE_64-1)) as u16
+            u64::from_le(*(self.data()))
         }
     }
 
-    fn rc(&self)->u32 {
-        unsafe {
-            let p=self.skip_glues().offset(1) as *const u32;
-            u32::from_le(*p)
-        }
-    }
     // First free spot in this page (head of the linked list, number of |u32| from the last glue.
-    fn first_free(&self)->u32 {
+    fn first_free(&self)->u16 {
         unsafe {
-            let p=(self.skip_glues() as *const u32).offset(3);
-            let f=u32::from_le(*p);
-            if f==0 { 1 } else { f }
+            let first_free=u16::from_le(*(self.p_first_free()));
+            let first_free = if first_free>0 { first_free } else { 1 };
+            first_free
+        }
+    }
+    fn p_first_free(&self)->*mut u16 {
+        unsafe {
+            self.data().offset(1) as *mut u16
         }
     }
 
-    fn root(&self)->u32 {
+    fn root(&self)->u16 {
         unsafe {
-            let p=self.skip_glues() as *mut u64;
-            let p_root=(p as *mut u32).offset(4);
-            u32::from_le(*p_root)
+            let p_root=(self.data() as *const u16).offset(5);
+            u16::from_le(*p_root)
         }
     }
-    fn set_root(&self,root:u32) {
+    fn set_root(&self,root:u16) {
         unsafe {
-            let p=self.skip_glues() as *mut u64;
-            let p_root=(p as *mut u32).offset(4);
+            let p_root=(self.data() as *mut u16).offset(5);
             *p_root = root.to_le()
         }
     }
     // Amount of space occupied in the page
-    fn occupied_space(&self)->u32 {
+    fn occupied_space(&self)->u16 {
         unsafe {
-            let p=(self.skip_glues() as *const u32).offset(5);
-            u32::from_le(*p)
+            let p_occ=(self.data() as *const u16).offset(6);
+            u16::from_le(*p_occ)
         }
     }
 
     // offset in u32.
-    fn offset(&self,off:u32)->*mut u32 {
+    fn offset(&self,off:isize)->*mut u8 {
         unsafe {
-            let p=self.skip_glues() as *mut u32;
-            p.offset(5+off as isize)
+            let p = self.data() as *mut u8;
+            p.offset(15+off)
         }
     }
 }
@@ -275,13 +274,6 @@ impl P for MutPage {
 
 impl MutPage {
 
-    // Page layout: Starts with a header of ((n>=1)*8 bytes + 16 bytes).
-    // - 64 bits: glueing number (0 for now), + flags on the 13 least significant bits
-    // - 32 bits: RC
-    // - 32 bits: offset of the first free spot, from the beginning of the page
-    // - 32 bits: offset of the root of the tree, from the beginning of the page
-    // - 32 bits: how much space is occupied in this page? (controls compaction)
-    // - beginning of coding space (different encodings in B-nodes and B-leaves)
 
     fn init(&mut self) {
         unsafe {
@@ -293,46 +285,58 @@ impl MutPage {
     /// Takes a size in bytes, returns an offset from the word before
     /// the beginning of the contents (0 is invalid, 1 is the first
     /// offset).
-    fn alloc(&mut self,first_free:u32,size:usize) {
+    fn alloc(&mut self,first_free:u16,size:u16) {
         unsafe {
-            assert!(size&3== 0); // 32 bits aligned.
-            let p=self.skip_glues() as *mut u32;
-            *(p.offset(3)) = (first_free + ((size as u32) >> 2)).to_le();
+            debug_assert!(size&7== 0); // 32 bits aligned.
+            *(self.p_first_free()) = (first_free + size).to_le();
         }
     }
 
-    // Layout of a node:
+    // Layout of a node: 24 + |key|+|value|, rounded up to 64-bits.
     // - 64 bits: left, little endian. if the first 32 bits == 1, local offset, else global in bytes.
     // - 64 bits: right, little endian. if the first 32 bits == 1, local offset, else global in bytes.
-    // - 32 bits: key length
-    // - 32 bits: value length
-    // - 32 bits: cardinal, = 1+sum of children in the same page
-    // - contents, |key|+|value|
-    // - padding for 32 bits/4 bytes alignment.
+    // - 32 bits: value length, if >PAGE_SIZE/4, the value is a 64-bits offset of a page.
+    // - 16 bits: key length
+    // - 16 bits: cardinal, = 1+sum of children in the same page
+    // - value
+    // - key
+    // - padding for 64 bits/8 bytes alignment.
 
     // allocate and write key, value, left and right neighbors.
-    fn alloc_key_value(&mut self,off_ptr:u32,size:usize,key:&[u8],value:&[u8],l:u64,r:u64) {
+    fn alloc_key_value(&mut self,off_ptr:u16,size:u16,key:&[u8],value:Value,l:u64,r:u64) {
         unsafe {
             self.alloc(off_ptr,size);
             //println!("off_ptr={:?}, size = {:?}",off_ptr, size);
             // off is the beginning of a free zone. Write the node there.
             //////////////////////////////////////////////////
-            let ptr=self.offset(off_ptr) as *mut u32;
+            let ptr=self.offset(off_ptr as isize) as *mut u32;
             //println!("ptr: {} {:?}",off_ptr,ptr0);
             // This is a leaf, so l and r are offsets in the file, not local offsets.
             let ptr=ptr as *mut u64;
             *ptr = l.to_le();
             *(ptr.offset(1)) = r.to_le();
             let ptr=ptr as *mut u32;
-            *(ptr.offset(4)) = (key.len() as u32).to_le();
-            *(ptr.offset(5)) = (value.len() as u32).to_le();
-            *(ptr.offset(6)) = 1;
-            //+(if l!=0 { 1 } else { 0 } + if r!=0 { 1 } else { 0 } as u32).to_le(); // balance number
+            *(ptr.offset(4)) = (value.len() as u32).to_le();
 
-            let ptr=ptr.offset(7) as *mut u8;
+            let ptr=ptr as *mut u16;
+            *(ptr.offset(10)) = (key.len() as u16).to_le();
+            *(ptr.offset(11)) = 1;
+            //+(if l!=0 { 1 } else { 0 } + if r!=0 { 1 } else { 0 } as u32).to_le(); // balance number
             //println!("alloc_key_value: copying {:?} {:?} to {:?}",key,value,ptr);
-            copy_nonoverlapping(key.as_ptr(), ptr, key.len());
-            copy_nonoverlapping(value.as_ptr(), ptr.offset(key.len() as isize), value.len());
+            match value {
+                Value::S(value)=>{
+                    let ptr=ptr as *mut u8;
+                    let ptr=ptr.offset(24);
+                    copy_nonoverlapping(value.as_ptr(), ptr,value.len());
+                    copy_nonoverlapping(key.as_ptr(),ptr.offset(value.len() as isize), key.len());
+                },
+                Value::O{offset,..}=>{
+                    debug_assert!(offset!=0);
+                    *((ptr as *mut u64).offset(3)) = offset.to_le();
+                    let ptr=ptr as *mut u8;
+                    copy_nonoverlapping(key.as_ptr(),ptr.offset(32), key.len());
+                }
+            }
         }
     }
 }
@@ -340,13 +344,19 @@ impl MutPage {
 
 
 
-fn read_key_value<'a>(p:&'a u8)->(&'a [u8],&'a[u8]) {
+fn read_key_value<'a>(p:&'a u8)->(&'a [u8],Value) {
     unsafe {
         let p32=p as *const u8 as *const u32;
-        let key_len=u32::from_le(*(p32.offset(4)));
-        let val_len=u32::from_le(*(p32.offset(5)));
-        (std::slice::from_raw_parts((p as *const u8).offset(28), key_len as usize),
-         std::slice::from_raw_parts((p as *const u8).offset(28 + key_len as isize), val_len as usize))
+        let key_len=u16::from_le(*(p32.offset(5) as *const u16));
+        let val_len=u32::from_le(*(p32.offset(4)));
+        if (val_len as usize) < VALUE_SIZE_THRESHOLD {
+            (std::slice::from_raw_parts((p as *const u8).offset(24 + val_len as isize), key_len as usize),
+             Value::S(std::slice::from_raw_parts((p as *const u8).offset(24), val_len as usize)))
+         } else {
+            (std::slice::from_raw_parts((p as *const u8).offset(32), key_len as usize),
+             {let offset = u64::from_le(*((p32 as *const u64).offset(3)));
+              Value::O{offset:offset,len:val_len}})
+        }
     }
 }
 
@@ -354,6 +364,7 @@ fn read_key_value<'a>(p:&'a u8)->(&'a [u8],&'a[u8]) {
 struct Cow(transaction::Cow);
 
 impl Cow {
+    /*
     fn from_mut_page(p:MutPage)->Cow {
         Cow(transaction::Cow::MutPage(p.page))
     }
@@ -361,6 +372,7 @@ impl Cow {
         let &Cow(ref s)=self;
         match s { &transaction::Cow::MutPage(_)=>true, _=>false }
     }
+     */
     fn into_mut_page(self,txn:&mut MutTxn)->MutPage {
         let Cow(s)=self;
         match s {
@@ -391,6 +403,7 @@ impl Cow {
 }
 
 trait LoadPage {
+    fn fd(&self)->c_int;
     fn length(&self)->u64;
     fn load_page(&self,off:u64)->Page;
     fn btree_root(&self)->u64;
@@ -401,11 +414,37 @@ trait LoadPage {
             Some(self.load_page(self.btree_root()))
         }
     }
+    fn load_value<'a>(&'a self,value:&Value<'a>)->&'a[u8] {
+        match *value {
+            Value::S(s)=>s,
+            Value::O{offset,len,..}=>{
+                unsafe {
+                    debug!("load_value {:?}",value);
+                    let page = memmap::mmap(self.fd(),None,offset,PAGE_SIZE_64);
+                    let mut total = PAGE_SIZE as isize;
+                    let mut cur = page as *const u64;
+                    debug!("pages, cur:{:?}",cur);
+                    while *cur != 0 {
+                        debug!("page:{:?}, cur:{:?} {:?}",page,*cur,total);
+                        let result=memmap::mmap(self.fd(),Some(page.offset(total)),*cur,PAGE_SIZE_64);
+                        debug!("result={:?}, asked {:?}",result,page.offset(total));
+                        assert!(result == page.offset(total));
+                        total+=PAGE_SIZE as isize;
+                        cur = cur.offset(1)
+                    }
+                    std::slice::from_raw_parts(cur.offset(1) as *const u8,len as usize)
+                }
+            }
+        }
+    }
 }
 
 impl<'env> LoadPage for MutTxn<'env>{
     fn length(&self)->u64 {
         self.txn.env.length
+    }
+    fn fd(&self)->c_int {
+        self.txn.env.fd
     }
     fn load_page(&self,off:u64)->Page {
         Page { page:self.txn.load_page(off) }
@@ -418,11 +457,29 @@ impl<'env> LoadPage for Txn<'env>{
     fn length(&self)->u64 {
         self.txn.env.length
     }
+    fn fd(&self)->c_int {
+        self.txn.env.fd
+    }
     fn load_page(&self,off:u64)->Page {
         Page { page:self.txn.load_page(off) }
     }
     fn btree_root(&self)->u64 {
         self.btree_root
+    }
+}
+
+#[derive(Debug,Clone,Copy)]
+enum Value<'a> {
+    S(&'a[u8]),
+    O{offset:u64,len:u32}
+}
+
+impl<'a> Value<'a> {
+    fn len(&self)->u32 {
+        match self {
+            &Value::S(s)=>s.len() as u32,
+            &Value::O{len,..}=>len
+        }
     }
 }
 
@@ -432,6 +489,7 @@ impl<'env> MutTxn<'env> {
         let extra=self.btree_root.to_le();
         self.txn.commit(&[extra])
     }
+
     fn load_cow_root(&mut self)->Option<Cow> {
         debug!("load_root: {:?}",self.btree_root);
         if self.btree_root == 0 {
@@ -445,16 +503,17 @@ impl<'env> MutTxn<'env> {
     }
 
     pub fn put(&mut self,key:&[u8],value:&[u8]) {
-        let put_result = if let Some(mut root) = self.load_cow_root() {
+        assert!(key.len() < MAX_KEY_SIZE);
+        let put_result = if let Some(root) = self.load_cow_root() {
             debug!("put root = {:?}",root.page_offset());
-            self.insert(root,key,value,0,0)
+            self.insert(root,key,Value::S(value),0,0)
         } else {
             debug!("put:no root");
-            let mut btree = self.alloc_page(1);
+            let mut btree = self.alloc_page();
             btree.init();
             let off=btree.page_offset();
             self.btree_root = off;
-            self.insert(Cow(transaction::Cow::MutPage(btree.page)),key,value,0,0)
+            self.insert(Cow(transaction::Cow::MutPage(btree.page)),key,Value::S(value),0,0)
         };
 
         if let Some((key0,value0,l,r,fr))=put_result {
@@ -464,13 +523,13 @@ impl<'env> MutTxn<'env> {
                 //println!("split root on {:?}",(key0,value0,l,r));
             }*/
             // the root page has split, we need to allocate a new one.
-            let mut btree = self.alloc_page(1);
+            let mut btree = self.alloc_page();
             debug!("new root page:{:?}",btree);
             btree.init();
             let off=btree.page_offset();
             self.btree_root = off;
 
-            let size=size_key_value(key0,value0);
+            let size=value_record_size(key0,value0);
             let off=btree.can_alloc(size);
             debug_assert!(off>0);
             btree.alloc_key_value(off,size,key0,value0,l,r);
@@ -484,36 +543,85 @@ impl<'env> MutTxn<'env> {
         Cow(self.txn.load_cow_page(off))
     }
 
-    fn alloc_page(&mut self,n_pages:usize)->MutPage {
-        assert!(n_pages==1);
+    fn alloc_page(&mut self)->MutPage {
         let page=self.txn.alloc_page().unwrap();
         MutPage{page:page}
     }
 
+    fn alloc_pages(&mut self,value:&[u8])->u64 {
+        unsafe {
+            // n*PAGE_SIZE - 8 * n
+            let actual_page_size = PAGE_SIZE-8;
+
+            let n = value.len() / actual_page_size;
+            let n = if n*actual_page_size < value.len() { n+1 } else { n };
+            assert!(8*(n+1) < PAGE_SIZE);
+
+            let first_page=self.alloc_page();
+            let mut page_ptr = first_page.data() as *mut u64;
+
+            let copyable_len=if value.len() < PAGE_SIZE-8*n { value.len() } else { PAGE_SIZE - 8*n };
+            copy_nonoverlapping(
+                value.as_ptr(),
+                (first_page.data() as *mut u8).offset(8*n as isize),
+                copyable_len);
+            let mut value_offset = copyable_len;
+
+            let mut total_length = PAGE_SIZE;
+
+            while total_length < 8*n + value.len() {
+                let page=self.alloc_page();
+                *page_ptr = page.page_offset().to_le();
+                page_ptr = page_ptr.offset(1);
+
+                let copyable_len = if value.len()-value_offset < PAGE_SIZE { value.len()-value_offset } else { PAGE_SIZE };
+                copy_nonoverlapping(value.as_ptr().offset(value_offset as isize),
+                                    page.data() as *mut u8,
+                                    copyable_len);
+                value_offset += copyable_len;
+                total_length += PAGE_SIZE
+            }
+            *page_ptr = 0;
+            first_page.page_offset()
+        }
+    }
+
+    fn alloc_value<'a>(&mut self,value:Value<'a>)->Value<'a> {
+        match value {
+            Value::S(s) if s.len() < VALUE_SIZE_THRESHOLD => value,
+            Value::O{..}=>value,
+            Value::S(s) => {
+                let off=self.alloc_pages(s);
+                Value::O{offset:off,len:s.len() as u32}
+            }
+        }
+    }
+    
     // Finds binary tree root and calls binary_tree_insert on it.
-    fn insert<'a>(&mut self,mut page:Cow, key:&[u8],value:&[u8],l:u64,r:u64)->Option<(&'a[u8],&'a[u8], u64, u64, u64)> {
+    fn insert<'a>(&mut self,page:Cow,key:&[u8],value:Value<'a>,l:u64,r:u64)->Option<(&'a[u8],Value<'a>, u64, u64, u64)> {
         let root = page.root();
         debug!("insert: root={:?}, {:?},{:?}",root,key,value);
         if root==0 {
-            // We need allocating
             let mut page=page.into_mut_page(self);
-            let size=size_key_value(key,value);
+            let size=value_record_size(key,value);
             let off=page.can_alloc(size);
             debug_assert!(off>0);
+
+            let value=self.alloc_value(value);
             page.alloc_key_value(off,size,key,value,l,r);
             debug!("inserted {}",off);
             page.set_root(off);
             debug!("root set 0");
             None
         } else {
-            let result=self.binary_tree_insert(page,key,value,l,r,0,0,root);
+            let result=self.binary_tree_insert(page,key,value,l,r,0,0,root as u32);
             debug!("result {:?}",result);
             match result {
                 Some(Insert::Split { key,value,left,right,free_page })=>{
                     Some((key,value,left,right,free_page))
                 },
                 Some(Insert::Ok{page,off})=>{
-                    page.set_root(off);
+                    page.set_root(off as u16);
                     /*unsafe {
                         let ptr=page.offset(root);
                         incr(ptr.offset(6));
@@ -526,31 +634,192 @@ impl<'env> MutTxn<'env> {
         }
     }
 
-    fn split_and_insert<'a>(&mut self, page:&Cow, k:&[u8], v:&[u8], l:u64, r:u64, fr:u64)->Insert<'a> {
+
+    // Returns None if the changes have been done in one of the children of "page", Some(Insert::Ok(..)) if "page" is a B-leaf or a B-node and we inserted something in it, and Some(Insert::Split(...)) if page was split.
+    fn binary_tree_insert<'a>(&mut self, page:Cow, key:&[u8], value:Value<'a>, l:u64,r:u64,depth:usize,path:u64,current:u32)->Option<Insert<'a>> {
+        unsafe {
+            debug!("binary tree insert:{} {}",depth,path);
+            unsafe fn node_ptr(page:&MutPage,mut length:usize,mut path:u64,mut current:u32)->u32 {
+                while length>0 {
+                    let ptr=page.offset(current as isize) as *mut u32;
+                    //println!("node_ptr:{:?}",if path&1==0 { u32::from_le(*ptr) } else { u32::from_le(*(ptr.offset(2))) });
+                    //assert!(if path&1==0 { u32::from_le(*ptr)==1 } else { u32::from_le(*(ptr.offset(2))) == 1 });
+                    current=if path&1==0 { u32::from_le(*(ptr.offset(1))) } else { u32::from_le(*(ptr.offset(3))) };
+                    length-=1;
+                    path >>= 1;
+                }
+                current
+            }
+            let ptr=page.offset(current as isize) as *mut u32;
+            // Inlining this closure takes the whole thing from 2.33 to 1.7 (ratio (sanakirja put time)/(lmdb put time)).
+            let continue_local=|txn:&mut MutTxn, page:Cow, side_offset:isize, next_path:u64| -> Option<Insert<'a>> {
+                let next=u32::from_le(*(ptr.offset(side_offset+1)));
+                if next==0 {
+                    // free branch.
+                    let size=value_record_size(key,value);
+                    debug!("size={:?}",size);
+                    let off_ptr=page.can_alloc(size);
+                    if off_ptr>0 {
+                        let mut page=page.into_mut_page(txn);
+                        let value=txn.alloc_value(value);
+                        debug!("continue_local, value={:?}",value);
+                        page.alloc_key_value(off_ptr,size,key,value,l,r);
+                        let current=node_ptr(&page,depth,path,page.root() as u32);
+                        let ptr=page.offset(current as isize);
+                        *((ptr as *mut u32).offset(side_offset)) = (1 as u32).to_le();
+                        *((ptr as *mut u32).offset(side_offset+1)) = (off_ptr as u32).to_le();
+                        incr((ptr as *mut u16).offset(11));
+                        Some(Insert::Ok{off:rebalance(&mut page,current),
+                                        page:page })
+                    } else {
+                        // No more space in this page
+                        Some(txn.split_and_insert(&page,key,value,l,r,0))
+                    }
+                } else {
+                    let result=txn.binary_tree_insert(page,key,value,l,r,depth+1,next_path,next);
+                    if let Some(Insert::Ok{off,mut page})=result {
+                        let current= node_ptr(&page,depth,path,page.root() as u32);
+                        let ptr=page.offset(current as isize);
+                        *((ptr as *mut u32).offset(side_offset)) = (1 as u32).to_le();
+                        *((ptr as *mut u32).offset(side_offset+1)) = off.to_le();
+                        incr((ptr as *mut u16).offset(11));
+                        Some(Insert::Ok{off:rebalance(&mut page,current),
+                                        page:page })
+                    } else {
+                        result
+                    }
+                }
+            };
+
+            let continue_global=|txn:&mut MutTxn, page:Cow, right_child:bool| {
+                debug!("continue_global");
+                // Global offset
+                let child_ptr = if right_child { (ptr as *const u64).offset(1)} else { ptr as *const u64 };
+                let child = u64::from_le(*child_ptr);
+                if child==0 {
+                    // free left child.
+                    let size=value_record_size(key,value);
+                    let off=page.can_alloc(size);
+                    if off>0 {
+                        let mut page=page.into_mut_page(txn);
+                        let value=txn.alloc_value(value);
+                        page.alloc_key_value(off,size,key,value,l,r);
+                        // Either there's room
+                        let current = node_ptr(&page,depth,path,page.root() as u32);
+                        let ptr = page.offset(current as isize);
+                        // page was mutable and has not been split. We can insert!
+                        if right_child {
+                            *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
+                            *((ptr as *mut u32).offset(3)) = (off as u32).to_le();
+                        } else {
+                            *((ptr as *mut u32).offset(0)) = (1 as u32).to_le();
+                            *((ptr as *mut u32).offset(1)) = (off as u32).to_le();
+                        }
+                        incr((ptr as *mut u16).offset(11));
+                        Some(Insert::Ok{off:rebalance(&mut page,current),
+                                        page:page })
+                    } else {
+                        //println!("page cannot allocate");
+                        Some(txn.split_and_insert(&page,key,value,l,r,0))
+                    }
+                } else {
+                    let page_=txn.load_cow_page(child);
+                    if let Some((k0,v0,l0,r0,fr0)) = txn.insert(page_,key,value,l,r) {
+                        let size=value_record_size(k0,v0);
+                        let off=page.can_alloc(size);
+                        if off>0 {
+                            let mut page=page.into_mut_page(txn);
+                            // page_ split, we need to insert the resulting key here.
+                            page.alloc_key_value(off,size,k0,v0,l0,r0);
+                            // Either there's room
+                            let current = node_ptr(&page,depth,path,page.root() as u32);
+                            let ptr = page.offset(current as isize);
+                            // Either there's room for it.
+                            if right_child {
+                                *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
+                                *((ptr as *mut u32).offset(3)) = (off as u32).to_le();
+                            } else {
+                                *((ptr as *mut u32).offset(0)) = (1 as u32).to_le();
+                                *((ptr as *mut u32).offset(1)) = (off as u32).to_le();
+                            }
+                            incr((ptr as *mut u16).offset(11));
+                            transaction::free(&mut txn.txn, fr0);
+                            let bal=rebalance(&mut page,current);
+                            Some(Insert::Ok{page:page, off:bal})
+                        } else {
+                            //debug!("Could not find space for child pages {} {}",l0,r0);
+                            // page_ was split and there is no space here to keep track of its replacement.
+                            Some(txn.split_and_insert(&page,k0,v0,l0,r0,fr0))
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+
+
+            //let count = u32::from_le(*(ptr.offset(6)));
+            let cmp={
+                let (key0,value0)=read_key_value(&*(ptr as *const u8));
+                let cmp=key.cmp(&key0);
+                if cmp==Ordering::Equal {
+                    let value = self.load_value(&value);
+                    let value0 = self.load_value(&value0);
+                    value.cmp(value0)
+                } else {
+                    cmp
+                }
+            };
+            match cmp {
+                Ordering::Less | Ordering::Equal => {
+                    let left0 = u32::from_le(*(ptr as *const u32));
+                    debug!("left0={:?}",left0);
+                    if left0 == 1 {
+                        //continue_local(self, page,ptr,1,path,key,value,l,r,depth,path)
+                        continue_local(self,page,0,path)
+                    } else {
+                        continue_global(self,page,false)
+                    }
+                },
+                _=> {
+                    let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
+                    debug!("right0={:?}",right0);
+                    if right0 == 1 {
+                        let next_path = path|(1<<depth);
+                        continue_local(self,page,2,next_path)
+                    } else {
+                        continue_global(self,page,true)
+                    }
+                }
+            }
+        }
+    }
+
+
+    fn split_and_insert<'a>(&mut self, page:&Cow, k:&[u8], v:Value<'a>, l:u64, r:u64, fr:u64)->Insert<'a> {
         // fr is the page where k and v live, if they're not from a lifetime larger than self.
 
         //page.page.free(&mut self.txn);
         self.debug("/tmp/before_split",0);
         //println!("split {:?}",page);
         unsafe {
-            debug!("split_and_insert: {:?},{:?},{:?},{:?}",
-                     std::str::from_utf8_unchecked(k),
-                     std::str::from_utf8_unchecked(v),
-                     l,r
-                     )
+            debug!("split_and_insert: {:?},{:?},{:?}",
+                   std::str::from_utf8_unchecked(k),
+                   l,r
+            )
         };
         debug!("\n\nsplit page {:?} !\n",page);
         // tree traversal
-        fn iter(txn:&mut MutTxn, page:&Cow, dest:&mut MutPage, current:u32)->u32 {
+        fn iter(txn:&mut MutTxn, page:&Cow, dest:&mut MutPage, current:u32)->u16 {
             unsafe {
-                let ptr=page.offset(current);
+                let ptr=page.offset(current as isize);
                 let (key,value)=read_key_value(&*(ptr as *const u8));
                 // set with lr=00 for now, will update immediately after.
-                let size=size_key_value(key,value);
+                let size=value_record_size(key,value);
                 let dest_off=dest.can_alloc(size);
                 debug_assert!(dest_off>0);
                 dest.alloc_key_value(dest_off,size,key,value,0,0);
-                let dest_ptr:*mut u32 = dest.offset(dest_off);
+                let dest_ptr:*mut u32 = dest.offset(dest_off as isize) as *mut u32;
 
                 let left0 = u32::from_le(*(ptr as *const u32));
                 if left0 == 1 {
@@ -558,7 +827,7 @@ impl<'env> MutTxn<'env> {
                     let left = u32::from_le(*((ptr as *const u32).offset(1)));
                     *(dest_ptr as *mut u32) = (1 as u32).to_le();
                     let left=iter(txn,page,dest,left);
-                    *((dest_ptr as *mut u32).offset(1)) = left.to_le();
+                    *((dest_ptr as *mut u32).offset(1)) = (left as u32).to_le();
                 } else {
                     // global offset, copy
                     let child=u64::from_le(*((ptr as *const u64).offset(1)));
@@ -575,7 +844,7 @@ impl<'env> MutTxn<'env> {
                     let right = u32::from_le(*((ptr as *const u32).offset(3)));
                     *((dest_ptr as *mut u32).offset(2)) = (1 as u32).to_le();
                     let right=iter(txn,page,dest,right);
-                    *((dest_ptr as *mut u32).offset(3)) = right.to_le();
+                    *((dest_ptr as *mut u32).offset(3)) = (right as u32).to_le();
                 } else {
                     // global offset, copy it
                     let child=u64::from_le(*((ptr as *const u64).offset(1)));
@@ -587,7 +856,8 @@ impl<'env> MutTxn<'env> {
                         }
                 }
                 // make counts equal
-                *dest_ptr.offset(6) = *ptr.offset(6);
+                let dest_ptr=dest_ptr as *mut u16;
+                *dest_ptr.offset(11) = *(ptr as *const u16).offset(11);
                 //
                 dest_off
             }
@@ -601,7 +871,7 @@ impl<'env> MutTxn<'env> {
             left_page.init();
             right_page.init();
 
-            let ptr_root=page.offset(page.root()) as *mut u32;
+            let ptr_root=page.offset(page.root() as isize) as *mut u32;
             debug!("filling left page");
             {
                 let left = u32::from_le(*ptr_root);
@@ -609,7 +879,7 @@ impl<'env> MutTxn<'env> {
                     // local offset
                     let left = u32::from_le(*((ptr_root as *const u32).offset(1)));
                     let left_root=iter(self,page,&mut left_page,left);
-                    left_page.set_root(left_root);
+                    left_page.set_root(left_root as u16);
                 } else {
                     // global offset, the tree is not balanced.
                     let path="/tmp/before_split";
@@ -624,7 +894,7 @@ impl<'env> MutTxn<'env> {
                     // local offset
                     let right = u32::from_le(*((ptr_root as *const u32).offset(3)));
                     let right_root = iter(self,page,&mut right_page,right);
-                    right_page.set_root(right_root);
+                    right_page.set_root(right_root as u16);
                 } else {
                     // global offset, the tree is not balanced.
                     let path="/tmp/before_split";
@@ -634,33 +904,43 @@ impl<'env> MutTxn<'env> {
             }
             debug!("done filling");
             let (key,value) = read_key_value(&*(ptr_root as *const u8));
-            debug!("split_and_insert, reinserting: {:?},{:?},{:?},{:?}",
+            debug!("split_and_insert, reinserting: {:?},{:?},{:?}",
                    std::str::from_utf8_unchecked(k),
-                   std::str::from_utf8_unchecked(v),
                    l,r
                    );
             let left_offset=left_page.page.offset;
             let right_offset=right_page.page.offset;
-            if (k,v) <= (key,value) {
-                let root=left_page.root();
-                let mut left_page=Cow(transaction::Cow::MutPage(left_page.page));
-                let result=self.binary_tree_insert(left_page,k,v,l,r,0,0,root);
-                if let Some(result)=result {
-                    if let Insert::Ok{page,off}=result {
-                        page.set_root(off)
-                    } else {
-                        panic!("problem left: {:?}",result)
-                    }
+
+            let cmp=k.cmp(key);
+            let cmp = match cmp {
+                Ordering::Less | Ordering::Greater => cmp,
+                Ordering::Equal => {
+                    (self.load_value(&v)).cmp(&self.load_value(&value))
                 }
-            } else {
-                let root=right_page.root();
-                let mut right_page=Cow(transaction::Cow::MutPage(right_page.page));
-                let result=self.binary_tree_insert(right_page,k,v,l,r,0,0,root);
-                if let Some(result)=result {
-                    if let Insert::Ok{page,off}=result {
-                        page.set_root(off)
-                    } else {
-                        panic!("problem right: {:?}",result)
+            };
+            match cmp {
+                Ordering::Less | Ordering::Equal => {
+                    let root=left_page.root();
+                    let left_page=Cow(transaction::Cow::MutPage(left_page.page));
+                    let result=self.binary_tree_insert(left_page,k,v,l,r,0,0,root as u32);
+                    if let Some(result)=result {
+                        if let Insert::Ok{page,off}=result {
+                            page.set_root(off as u16)
+                        } else {
+                            panic!("problem left: {:?}",result)
+                        }
+                    }
+                },
+                _=>{
+                    let root=right_page.root();
+                    let right_page=Cow(transaction::Cow::MutPage(right_page.page));
+                    let result=self.binary_tree_insert(right_page,k,v,l,r,0,0,root as u32);
+                    if let Some(result)=result {
+                        if let Insert::Ok{page,off}=result {
+                            page.set_root(off as u16)
+                        } else {
+                            panic!("problem right: {:?}",result)
+                        }
                     }
                 }
             }
@@ -672,159 +952,17 @@ impl<'env> MutTxn<'env> {
         }
     }
 
-
-
-    // Returns None if the changes have been done in one of the children of "page", Some(Insert::Ok(..)) if "page" is a B-leaf or a B-node and we inserted something in it, and Some(Insert::Split(...)) if page was split.
-    fn binary_tree_insert<'a>(&mut self, mut page:Cow, key:&[u8], value:&[u8], l:u64,r:u64,depth:usize,path:u64,current:u32)->Option<Insert<'a>> {
-        unsafe {
-            debug!("binary tree insert:{} {}",depth,path);
-            unsafe fn node_ptr(page:&MutPage,mut length:usize,mut path:u64,mut current:u32)->u32 {
-                while length>0 {
-                    let ptr=page.offset(current) as *mut u32;
-                    //println!("node_ptr:{:?}",if path&1==0 { u32::from_le(*ptr) } else { u32::from_le(*(ptr.offset(2))) });
-                    //assert!(if path&1==0 { u32::from_le(*ptr)==1 } else { u32::from_le(*(ptr.offset(2))) == 1 });
-                    current= if path&1==0 { u32::from_le(*(ptr.offset(1))) } else { u32::from_le(*(ptr.offset(3))) };
-                    length-=1;
-                    path >>= 1;
-                }
-                current
-            }
-            let ptr=page.offset(current) as *mut u32;
-            // Inlining this closure takes the whole thing from 2.33 to 1.7 (ratio (sanakirja put time)/(lmdb put time)).
-            let continue_local=|txn:&mut MutTxn, mut page:Cow, side_offset:isize, next_path:u64| -> Option<Insert<'a>> {
-                let next=u32::from_le(*(ptr.offset(side_offset+1)));
-                if next==0 {
-                    // free branch.
-                    let size=size_key_value(key,value);
-                    let off_ptr=page.can_alloc(size);
-                    if off_ptr>0 {
-                        let mut page=page.into_mut_page(txn);
-                        page.alloc_key_value(off_ptr,size,key,value,l,r);
-                        let current=node_ptr(&page,depth,path,page.root());
-                        let ptr=page.offset(current);
-                        *((ptr as *mut u32).offset(side_offset)) = (1 as u32).to_le();
-                        *((ptr as *mut u32).offset(side_offset+1)) = off_ptr.to_le();
-                        incr(ptr.offset(6));
-                        Some(Insert::Ok{off:rebalance(&mut page,current),
-                                        page:page })
-                    } else {
-                        Some(txn.split_and_insert(&page,key,value,l,r,0))
-                    }
-                } else {
-                    let result=txn.binary_tree_insert(page,key,value,l,r,depth+1,next_path,next);
-                    if let Some(Insert::Ok{off,mut page})=result {
-                        let current= node_ptr(&page,depth,path,page.root());
-                        let ptr=page.offset(current);
-                        *((ptr as *mut u32).offset(side_offset)) = (1 as u32).to_le();
-                        *((ptr as *mut u32).offset(side_offset+1)) = off.to_le();
-                        incr(ptr.offset(6));
-                        Some(Insert::Ok{off:rebalance(&mut page,current),
-                                        page:page })
-                    } else {
-                        result
-                    }
-                }
-            };
-
-            let continue_global=|txn:&mut MutTxn, mut page:Cow, right_child:bool| {
-                //println!("continue_global");
-                // Global offset
-                let child_ptr = if right_child { (ptr as *const u64).offset(1)} else { ptr as *const u64 };
-                let child = u64::from_le(*child_ptr);
-                if child==0 {
-                    // free left child.
-                    let size=size_key_value(key,value);
-                    let off=page.can_alloc(size);
-                    if off>0 {
-                        let mut page=page.into_mut_page(txn);
-                        page.alloc_key_value(off,size,key,value,l,r);
-                        // Either there's room
-                        let current = node_ptr(&page,depth,path,page.root());
-                        let ptr = page.offset(current);
-                        // page was mutable and has not been split. We can insert!
-                        if right_child {
-                            *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
-                            *((ptr as *mut u32).offset(3)) = off.to_le();
-                        } else {
-                            *((ptr as *mut u32).offset(0)) = (1 as u32).to_le();
-                            *((ptr as *mut u32).offset(1)) = off.to_le();
-                        }
-                        incr(ptr.offset(6));
-                        Some(Insert::Ok{off:rebalance(&mut page,current),
-                                        page:page })
-                    } else {
-                        //println!("page cannot allocate");
-                        Some(txn.split_and_insert(&page,key,value,l,r,0))
-                    }
-                } else {
-                    let mut page_=txn.load_cow_page(child);
-                    if let Some((k0,v0,l0,r0,fr0)) = txn.insert(page_,key,value,l,r) {
-                        let size=size_key_value(k0,v0);
-                        let off=page.can_alloc(size);
-                        if off>0 {
-                            let mut page=page.into_mut_page(txn);
-                            // page_ split, we need to insert the resulting key here.
-                            page.alloc_key_value(off,size,k0,v0,l0,r0);
-                            // Either there's room
-                            let current = node_ptr(&page,depth,path,page.root());
-                            let ptr = page.offset(current);
-                            // Either there's room for it.
-                            if right_child {
-                                *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
-                                *((ptr as *mut u32).offset(3)) = off.to_le();
-                            } else {
-                                *((ptr as *mut u32).offset(0)) = (1 as u32).to_le();
-                                *((ptr as *mut u32).offset(1)) = off.to_le();
-                            }
-                            incr(ptr.offset(6));
-                            transaction::free(&mut txn.txn, fr0);
-                            let bal=rebalance(&mut page,current);
-                            Some(Insert::Ok{page:page, off:bal})
-                        } else {
-                            //debug!("Could not find space for child pages {} {}",l0,r0);
-                            // page_ was split and there is no space here to keep track of its replacement.
-                            Some(txn.split_and_insert(&page,&k0,&v0,l0,r0,fr0))
-                        }
-                    } else {
-                        None
-                    }
-                }
-            };
-
-
-            //let count = u32::from_le(*(ptr.offset(6)));
-            let (key0,value0)=read_key_value(&*(ptr as *const u8));
-            if (key,value)<=(key0,value0) {
-                let left0 = u32::from_le(*(ptr as *const u32));
-                //debug!("left0={:?}",left0);
-                if left0 == 1 {
-                    //continue_local(self, page,ptr,1,path,key,value,l,r,depth,path)
-                    continue_local(self,page,0,path)
-                } else {
-                    continue_global(self,page,false)
-                }
-            } else {
-                let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
-                //debug!("right0={:?}",right0);
-                if right0 == 1 {
-                    let next_path = path|(1<<depth);
-                    continue_local(self,page,2,next_path)
-                } else {
-                    continue_global(self,page,true)
-                }
-            }
-        }
-    }
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         tree_get(self,key,value)
     }
+    /*
     fn iterate<'a,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(&'a self, key:&[u8], value:Option<&[u8]>, f:F) {
         if let Some(root_page)=self.load_root() {
             let root=root_page.root();
-            tree_iterate(self,&root_page,key,value,f,root,false);
+            tree_iterate(self,&root_page,key,value,f,root as u32,false);
         }
     }
-
+     */
     #[doc(hidden)]
     pub fn debug<P:AsRef<Path>>(&self,p:P,off:u64) {
         debug(self,p,off)
@@ -835,12 +973,14 @@ impl<'env> Txn<'env> {
     pub fn get<'a>(&'a self,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]> {
         tree_get(self,key,value)
     }
+    /*
     fn iterate<'a,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(&'a self, key:&[u8], value:Option<&[u8]>, f:F) {
         if let Some(root_page)=self.load_root() {
             let root=root_page.root();
-            tree_iterate(self,&root_page,key,value,f,root,false);
+            tree_iterate(self,&root_page,key,value,f,root as u32,false);
         }
     }
+     */
     #[doc(hidden)]
     pub fn debug<P:AsRef<Path>>(&self,p:P,off:u64) {
         debug(self,p,off)
@@ -871,7 +1011,7 @@ fn debug<P:AsRef<Path>,T:LoadPage>(t:&T,p:P,off:u64) {
             let mut h=Vec::new();
             let mut edges=Vec::new();
             let mut hh=HashSet::new();
-            print_tree(txn,&mut hh, buf,&mut edges,&mut h,p,root);
+            print_tree(txn,&mut hh, buf,&mut edges,&mut h,p,root as u32);
             if print_children {
                 writeln!(buf,"}}").unwrap();
             }
@@ -889,17 +1029,20 @@ fn debug<P:AsRef<Path>,T:LoadPage>(t:&T,p:P,off:u64) {
     fn print_tree<T:LoadPage>(txn:&T,nodes:&mut HashSet<u32>, buf:&mut BufWriter<File>,edges:&mut Vec<String>,pages:&mut Vec<Page>, p:&Page,off:u32) {
         unsafe {
             //println!("print tree:{:?}",off);
-            let ptr=p.offset(off);
-            let count=u32::from_le(*ptr.offset(6));
+            let ptr=p.offset(off as isize) as *const u32;
+            let count=u16::from_le(*(ptr as *const u16).offset(11));
             let (key,value)=read_key_value(&*(ptr as *const u8));
             let key=std::str::from_utf8_unchecked(key);
+            let value=txn.load_value(&value);
+            let mut value_=Vec::new();
+            let value = if value.len()>20 { value_.extend(&value[0..20]);value_.extend(b"...");&value_[..] } else { value };
             let value=std::str::from_utf8_unchecked(value);
             //println!("key,value={:?},{:?}",key,value);
             writeln!(buf,"n_{}_{}[label=\"{}, '{}'->'{}'\"];",p.page.offset,off,count,key,value).unwrap();
             if !nodes.contains(&off) {
                 nodes.insert(off);
 
-                let left_local= u32::from_le(*ptr);
+                let left_local= u32::from_le(*(ptr as *const u32));
                 //println!("debug, left_local={:?}",left_local);
                 if left_local == 1{
                     let left=u32::from_le(*(ptr.offset(1)));
@@ -922,7 +1065,7 @@ fn debug<P:AsRef<Path>,T:LoadPage>(t:&T,p:P,off:u64) {
                         }
                     }
                 }
-                let right_local= u32::from_le(*(ptr.offset(2)));
+                let right_local= u32::from_le(*((ptr as *const u32).offset(2)));
                 //println!("debug, right_local={:?}",right_local);
                 if right_local == 1{
                     let right=u32::from_le(*(ptr.offset(3)));
@@ -1035,7 +1178,7 @@ unsafe fn tree_get<'a,T:LoadPage>(t:&'a T, key:&[u8], value:Option<&[u8]>)->Opti
 
 fn tree_get<'a,T:LoadPage>(t:&'a T,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8]>{
     if let Some(root_page) = t.load_root() {
-        binary_tree_get(t,&root_page,key,value,root_page.root())
+        binary_tree_get(t,&root_page,key,value,root_page.root() as u32)
     } else {
         None
     }
@@ -1045,21 +1188,27 @@ fn tree_get<'a,T:LoadPage>(t:&'a T,key:&[u8],value:Option<&[u8]>)->Option<&'a[u8
 fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&[u8]>, current:u32)->Option<&'a[u8]> {
     unsafe {
         debug!("binary_tree_get:{:?}",page);
-        let ptr=page.offset(current) as *mut u32;
+        let ptr=page.offset(current as isize) as *mut u32;
 
-        let value_=value.unwrap_or(b"");
         let (key0,value0)=read_key_value(&*(ptr as *const u8));
         let cmp= if let Some(value_)=value {
-            (key,value_).cmp(&(key0,value0))
+            let cmp=key.cmp(&key0);
+            if cmp==Ordering::Equal {
+                value_.cmp(t.load_value(&value0))
+            } else {
+                cmp
+            }
         } else {
             key.cmp(&key0)
         };
+        /*
         debug!("({:?},{:?}), {:?}, ({:?},{:?})",
                std::str::from_utf8_unchecked(key),
-               std::str::from_utf8_unchecked(value_),
+               std::str::from_utf8_unchecked(t.load_value(value_)),
                cmp,
                std::str::from_utf8_unchecked(key0),
-               std::str::from_utf8_unchecked(value0));
+               std::str::from_utf8_unchecked(t.load_value(value0)));
+*/
         match cmp {
             Ordering::Equal | Ordering::Less=>{
                 let result={
@@ -1080,11 +1229,11 @@ fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&
                             // left child is another page.
                             let page_=t.load_page(left);
                             let root_=page_.root();
-                            binary_tree_get(t,&page_,key,value,root_)
+                            binary_tree_get(t,&page_,key,value,root_ as u32)
                         }
                     }
                 };
-                if cmp==Ordering::Equal { Some(value0) } else { result }
+                if cmp==Ordering::Equal { Some(t.load_value(&value0)) } else { result }
             },
             Ordering::Greater =>{
                 let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
@@ -1105,7 +1254,7 @@ fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&
                         // right child is another page
                         let page_=t.load_page(right);
                         let root_=page_.root();
-                        binary_tree_get(t,&page_,key,value,root_)
+                        binary_tree_get(t,&page_,key,value,root_ as u32)
                     }
                 }
             }
@@ -1117,11 +1266,11 @@ fn binary_tree_get<'a,T:LoadPage>(t:&'a T, page:&Page, key:&[u8], value:Option<&
 
 
 
-
+/*
 fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&Page, key:&[u8], value:Option<&[u8]>, f:F, current:u32, started:bool)->Option<bool> {
     unsafe {
         debug!("binary_tree_get:{:?}",page);
-        let ptr=page.offset(current) as *mut u32;
+        let ptr=page.offset(current as isize) as *mut u32;
 
         let value_=value.unwrap_or(b"");
         let (key0,value0)=read_key_value(&*(ptr as *const u8));
@@ -1157,7 +1306,7 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
                         // left child is another page.
                         let page_=t.load_page(left);
                         let root_=page_.root();
-                        tree_iterate(t,&page_,key,value,f,root_,started)
+                        tree_iterate(t,&page_,key,value,f,root_ as u32,started)
                     }
                 }
             };
@@ -1190,7 +1339,7 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
                         // right child is another page
                         let page_=t.load_page(right);
                         let root_=page_.root();
-                        tree_iterate(t,&page_,key,value,f,root_, started || result_left.is_some())
+                        tree_iterate(t,&page_,key,value,f,root_ as u32, started || result_left.is_some())
                     }
                 }
             } else {
@@ -1200,6 +1349,7 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
     }
 }
 
+*/
 
 
 
@@ -1209,9 +1359,8 @@ fn tree_iterate<'a,T:LoadPage,F:Fn(&'a[u8],&'a[u8])->bool +Copy>(t:&'a T, page:&
 
 
 
-
-unsafe fn incr(p:*mut u32) {
-    *p = (u32::from_le(*p) + 1).to_le()
+unsafe fn incr(p:*mut u16) {
+    *p = (u16::from_le(*p) + 1).to_le()
 }
 
 
@@ -1219,23 +1368,23 @@ unsafe fn incr(p:*mut u32) {
 fn tree_rotate_clockwise(page:&mut MutPage, v:u32)->u32 {
     debug!("rotate clockwise");
     unsafe {
-        let ptr=page.offset(v) as *mut u32;
+        let ptr=page.offset(v as isize) as *mut u32;
 
         let u_is_local = u32::to_le(*ptr) == 1;
         if u_is_local {
             let off_u = *(ptr.offset(1));
-            let ptr_u=page.offset(off_u) as *mut u32;
+            let ptr_u=page.offset(off_u as isize) as *mut u32;
 
             // fetch node size
-            let v_size=u32::from_le(*ptr.offset(6));
-            let u_size = u32::from_le(*(ptr_u.offset(6)));
+            let v_size = u16::from_le(*(ptr as *const u16).offset(11));
+            let u_size = u16::from_le(*((ptr_u as *const u16).offset(11)));
 
             let b_size = {
                 if u32::from_le(*(ptr_u.offset(2))) == 1 {
                     let off_b=u32::from_le(*(ptr_u.offset(3)));
                     if off_b!=0 {
-                        let ptr_b = page.offset( off_b);
-                        u32::from_le(*(ptr_b.offset(6)))
+                        let ptr_b = page.offset(off_b as isize);
+                        u16::from_le(*((ptr_b as *const u16).offset(11)))
                     } else {
                         0
                     }
@@ -1252,8 +1401,8 @@ fn tree_rotate_clockwise(page:&mut MutPage, v:u32)->u32 {
             *(ptr_u.offset(2)) = (1 as u32).to_le();
             *(ptr_u.offset(3)) = v.to_le();
             //debug!("overflow? {} {} {}",v_size,b_size,u_size);
-            *ptr.offset(6) = ((v_size+b_size) - u_size).to_le();
-            *ptr_u.offset(6) = v_size.to_le();
+            *(ptr as *mut u16).offset(11) = ((v_size+b_size) - u_size).to_le();
+            *(ptr_u as *mut u16).offset(11) = v_size.to_le();
             //
             off_u
         } else {
@@ -1267,22 +1416,22 @@ fn tree_rotate_clockwise(page:&mut MutPage, v:u32)->u32 {
 fn tree_rotate_anticlockwise(page:&mut MutPage, u:u32)->u32 {
     debug!("rotate anticlockwise");
     unsafe {
-        let ptr=page.offset(u) as *mut u32;
+        let ptr=page.offset(u as isize) as *mut u32;
 
         let v_is_local = u32::from_le(*(ptr.offset(2))) == 1;
         if v_is_local {
             let off_v = u32::from_le(*(ptr.offset(3)));
-            let ptr_v=page.offset(off_v) as *mut u32;
+            let ptr_v=page.offset(off_v as isize) as *mut u32;
 
             // fetch node size
-            let u_size=u32::from_le(*ptr.offset(6));
-            let v_size = u32::from_le(*(ptr_v.offset(6)));
+            let u_size= u16::from_le(*(ptr as *const u16).offset(11));
+            let v_size = u16::from_le(*((ptr_v as *const u16).offset(11)));
             let b_size = {
                 if u32::from_le(*ptr_v) == 1 {
                     let off_b =u32::from_le(*(ptr_v.offset(1)));
                     if off_b!=0 {
-                        let ptr_b = page.offset(off_b);
-                        u32::from_le(*(ptr_b.offset(6)))
+                        let ptr_b = page.offset(off_b as isize) as *const u16;
+                        u16::from_le(*(ptr_b.offset(11)))
                     } else {
                         0
                     }
@@ -1298,8 +1447,8 @@ fn tree_rotate_anticlockwise(page:&mut MutPage, u:u32)->u32 {
             // Change the left of v to u
             *ptr_v = (1 as u32).to_le();
             *(ptr_v.offset(1)) = u.to_le();
-            *ptr.offset(6) = ((u_size +b_size)- v_size).to_le();
-            *ptr_v.offset(6) = u_size.to_le();
+            *(ptr as *mut u16).offset(11) = ((u_size +b_size)- v_size).to_le();
+            *(ptr_v as *mut u16).offset(11) = u_size.to_le();
             //
             off_v
         } else {
@@ -1313,14 +1462,14 @@ fn tree_rotate_anticlockwise(page:&mut MutPage, u:u32)->u32 {
 fn rebalance(page:&mut MutPage,node:u32)->u32 {
     debug!("rebalance");
     let x=unsafe {
-        let ptr=page.offset(node) as *mut u32;
+        let ptr=page.offset(node as isize) as *mut u32;
         let left_local = u32::from_le(*ptr);
         let right_local = u32::from_le(*(ptr.offset(2)));
         let left_cardinal = {
             if left_local==1 {
                 let left=u32::from_le(*(ptr.offset(1)));
-                let left_ptr=page.offset(left);
-                u32::from_le(*(left_ptr.offset(6)))
+                let left_ptr=page.offset(left as isize) as *const u16;
+                u16::from_le(*(left_ptr.offset(11)))
             } else {
                 0//1
             }
@@ -1328,8 +1477,8 @@ fn rebalance(page:&mut MutPage,node:u32)->u32 {
         let right_cardinal = {
             if right_local==1 {
                 let right=u32::from_le(*(ptr.offset(3)));
-                let right_ptr=page.offset(right);
-                u32::from_le(*(right_ptr.offset(6)))
+                let right_ptr=page.offset(right as isize) as *const u16;
+                u16::from_le(*(right_ptr.offset(11)))
             } else {
                 0//1
             }
@@ -1350,7 +1499,7 @@ fn rebalance(page:&mut MutPage,node:u32)->u32 {
 #[derive(Debug)]
 enum Insert<'a> {
     Ok{page:MutPage, off:u32},
-    Split{key:&'a[u8],value:&'a[u8],left:u64,right:u64,free_page:u64}
+    Split{key:&'a[u8],value:Value<'a>,left:u64,right:u64,free_page:u64}
 }
 
 /*

@@ -23,7 +23,7 @@
 // LMDB takes care of zombie readers, at the cost of checking a file of size linear in the number of PIDs at the beginning of every transaction. Also, doesn't work on USB sticks. More details: mdb.c, line 2606: PID locks.
 
 use libc;
-use libc::{c_void,size_t,MS_SYNC,off_t,PROT_WRITE,PROT_READ,MAP_SHARED,munmap,c_int,O_CREAT,O_RDWR};
+use libc::{c_void,size_t,MS_SYNC,off_t,munmap,c_int,O_CREAT,O_RDWR};
 use std;
 
 use std::ffi::CString;
@@ -36,6 +36,8 @@ use std::ops::Shl;
 use fs2::FileExt;
 use std::fs::File;
 use std::path::Path;
+
+use memmap::mmap;
 
 // We need a fixed page size for compatibility reasons. Most systems will have half of this, but some (SPARC) don't...
 pub const PAGE_SIZE:usize=8192;
@@ -63,7 +65,7 @@ pub struct Env {
     lock_file:File,
     mutable_file:File,
     map:*mut u8,
-    fd:c_int,
+    pub fd:c_int,
     lock:RwLock<()>, // Ensure all reads are done when sync starts.
     mutable:Mutex<()> // Ensure only one mutable transaction can be started.
 }
@@ -108,19 +110,6 @@ pub struct Statistics {
     total_pages:u64
 }
 
-unsafe fn mmap(fd:c_int,place:Option<*mut u8>,length:u64)->*mut u8 {
-    let e=libc::mmap(place.unwrap_or(std::ptr::null_mut()) as *mut c_void,
-                     length as size_t,
-                     PROT_READ|PROT_WRITE,
-                     MAP_SHARED,
-                     fd,0);
-    if e == libc::MAP_FAILED {
-        std::ptr::null_mut()
-    } else {
-        e as *mut u8
-    }
-}
-
 
 impl Env {
     /// Initialize environment. log_length must be at least log(PAGE_SIZE)
@@ -135,7 +124,7 @@ impl Env {
             if ftrunc<0 {
                 Err(Error::IO(std::io::Error::last_os_error()))
             } else {
-                let memory=mmap(fd,None,length);
+                let memory=mmap(fd,None,0,length);
                 if memory.is_null() {
                     Err(Error::IO(std::io::Error::last_os_error()))
                 } else {
@@ -237,13 +226,11 @@ impl Env {
 }
 
 /// This is a semi-owned page: just as we can mutate several indices of an array in the same scope, we must be able to get several pages from a single environment in the same scope. However, pages don't outlive their environment. Pages longer than one PAGE_SIZE might trigger calls to munmap when they go out of scope.
-#[allow(raw_pointer_derive)]
 #[derive(Debug)]
 pub struct Page {
     pub data:*const u8,
     pub offset:u64
 }
-#[allow(raw_pointer_derive)]
 #[derive(Debug)]
 pub struct MutPage {
     pub data:*mut u8,
@@ -289,32 +276,6 @@ impl MutPage {
     pub fn into_page(self)->Page {
         unsafe { std::mem::transmute(self) }
     }*/
-}
-
-#[allow(raw_pointer_derive)]
-#[derive(Debug)]
-pub struct MutPages {
-    pub map:*mut u8,
-    pub offset:u64,
-    len:usize,
-}
-
-
-#[allow(raw_pointer_derive)]
-#[derive(Debug)]
-pub struct Pages {
-    pub map:*mut u8,
-    pub offset:u64,
-    len:usize,
-}
-
-impl Drop for Pages {
-    fn drop(&mut self) {
-        let memory=self.map;
-        unsafe {
-            munmap(memory as *mut c_void,self.len);
-        }
-    }
 }
 
 impl <'env>Txn<'env> {
