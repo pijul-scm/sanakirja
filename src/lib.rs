@@ -276,10 +276,15 @@ impl P for MutPage {
 impl MutPage {
     fn init(&mut self) {
         unsafe {
-            std::ptr::write_bytes(self.page.data as *mut u8, 0, 24);
+            std::ptr::write_bytes(self.page.data as *mut u8, 0, 16);
+            self.incr_rc()
         }
     }
-
+    fn incr_rc(&mut self) {
+        unsafe {
+            *(self.page.data as *mut u64) = (self.rc()+1).to_le();
+        }
+    }
 
     /// Takes a size in bytes, returns an offset from the word before
     /// the beginning of the contents (0 is invalid, 1 is the first
@@ -533,6 +538,10 @@ impl<'a> Value<'a> {
     }
 }
 
+// Insert must return the new root.
+// When searching the tree, note whether at least one page had RC >= 2. If so, reallocate + copy all pages on the path.
+
+
 impl<'env> MutTxn<'env> {
     pub fn commit(self) -> Result<(), transaction::Error> {
         let extra = self.btree_root.to_le();
@@ -556,19 +565,23 @@ impl<'env> MutTxn<'env> {
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         assert!(key.len() < MAX_KEY_SIZE);
         let put_result = if let Some(root) = self.load_cow_root() {
+            //root_offset = root.page_offset();
             debug!("put root = {:?}", root.page_offset());
-            self.insert(root, key, Value::S(value), 0, 0)
+            let rc=root.rc();
+            self.insert(root, key, Value::S(value), 0, 0, rc)
         } else {
             debug!("put:no root");
             let mut btree = self.alloc_page();
             btree.init();
             let off = btree.page_offset();
+            //root_offset = off;
             self.btree_root = off;
             self.insert(Cow(transaction::Cow::MutPage(btree.page)),
                         key,
                         Value::S(value),
                         0,
-                        0)
+                        0,
+                        1)
         };
 
         if let Some((key0,value0,l,r,fr))=put_result {
@@ -672,7 +685,8 @@ impl<'env> MutTxn<'env> {
                   key: &[u8],
                   value: Value<'a>,
                   l: u64,
-                  r: u64)
+                  r: u64,
+                  max_rc:u64)
                   -> Option<(&'a [u8], Value<'a>, u64, u64, u64)> {
         let root = page.root();
         debug!("insert: root={:?}, {:?},{:?}", root, key, value);
@@ -689,7 +703,8 @@ impl<'env> MutTxn<'env> {
             debug!("root set 0");
             None
         } else {
-            let result = self.binary_tree_insert(page, key, value, l, r, 0, 0, root as u32);
+            let rc = std::cmp::max(page.rc(),max_rc);
+            let result = self.binary_tree_insert(page, key, value, l, r, rc, 0, 0, root as u32);
             debug!("result {:?}", result);
             match result {
                 Some(Insert::Split { key,value,left,right,free_page }) => {
@@ -717,6 +732,7 @@ impl<'env> MutTxn<'env> {
                               value: Value<'a>,
                               l: u64,
                               r: u64,
+                              max_rc:u64,
                               depth: usize,
                               path: u64,
                               current: u32)
@@ -779,6 +795,7 @@ impl<'env> MutTxn<'env> {
                                                         value,
                                                         l,
                                                         r,
+                                                        max_rc,
                                                         depth + 1,
                                                         next_path,
                                                         next);
@@ -837,7 +854,8 @@ impl<'env> MutTxn<'env> {
                     }
                 } else {
                     let page_ = txn.load_cow_page(child);
-                    if let Some((k0, v0, l0, r0, fr0)) = txn.insert(page_, key, value, l, r) {
+                    let max_rc = std::cmp::max(max_rc,page_.rc());
+                    if let Some((k0, v0, l0, r0, fr0)) = txn.insert(page_, key, value, l, r, max_rc) {
                         let size = value_record_size(k0, v0);
                         let off = page.can_alloc(size);
                         if off > 0 {
@@ -1049,7 +1067,7 @@ impl<'env> MutTxn<'env> {
                 Ordering::Less | Ordering::Equal => {
                     let root = left_page.root();
                     let left_page = Cow(transaction::Cow::MutPage(left_page.page));
-                    let result = self.binary_tree_insert(left_page, k, v, l, r, 0, 0, root as u32);
+                    let result = self.binary_tree_insert(left_page, k, v, l, r, 1, 0, 0, root as u32);
                     if let Some(result) = result {
                         if let Insert::Ok{page,off} = result {
                             page.set_root(off as u16)
@@ -1061,7 +1079,7 @@ impl<'env> MutTxn<'env> {
                 _ => {
                     let root = right_page.root();
                     let right_page = Cow(transaction::Cow::MutPage(right_page.page));
-                    let result = self.binary_tree_insert(right_page, k, v, l, r, 0, 0, root as u32);
+                    let result = self.binary_tree_insert(right_page, k, v, l, r, 1, 0, 0, root as u32);
                     if let Some(result) = result {
                         if let Insert::Ok{page,off} = result {
                             page.set_root(off as u16)
