@@ -840,7 +840,6 @@ impl<'env> MutTxn<'env> {
             debug!("put:no root");
         };
          */
-        println!("put: {:?}",put_result);
         match put_result {
             Insert::Split { key:key0,value:value0,left:l,right:r,free_page:fr } => {
                 /*unsafe {
