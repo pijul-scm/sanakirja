@@ -525,13 +525,6 @@ trait LoadPage {
             } else {
                 key.cmp(&key0)
             };
-            // debug!("({:?},{:?}), {:?}, ({:?},{:?})",
-            // std::str::from_utf8_unchecked(key),
-            // std::str::from_utf8_unchecked(t.load_value(value_)),
-            // cmp,
-            // std::str::from_utf8_unchecked(key0),
-            // std::str::from_utf8_unchecked(t.load_value(value0)));
-            //
             match cmp {
                 Ordering::Equal | Ordering::Less => {
                     let result = {
@@ -557,14 +550,13 @@ trait LoadPage {
                         }
                     };
                     if cmp == Ordering::Equal {
-                        Some(value0)
+                        result.or(Some(value0))
                     } else {
                         result
                     }
                 }
                 Ordering::Greater => {
                     let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
-                    debug!("right0={:?}", right0);
                     if right0 == 1 {
                         let next = u32::from_le(*(ptr.offset(3)));
                         if next == 0 {
