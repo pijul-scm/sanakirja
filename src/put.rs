@@ -51,7 +51,7 @@ fn insert<'a>(txn: &mut MutTxn,
         let off = page.can_alloc(size);
         debug_assert!(off > 0);
 
-        let value = txn.alloc_value(value);
+        let value = alloc_value(txn,value);
         page.alloc_key_value(off, size, key, value, l, r);
         debug!("inserted {}", off);
         page.set_root(off);
@@ -131,7 +131,7 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                 let off_ptr = page.can_alloc(size);
                 if off_ptr > 0 {
                     let mut page = page.into_mut_page(txn);
-                    let value = txn.alloc_value(value);
+                    let value = alloc_value(txn,value);
                     debug!("continue_local, value={:?}", value);
                     page.alloc_key_value(off_ptr, size, key, value, l, r);
                     let current = node_ptr(&page, depth, path, page.root() as u32);
@@ -189,7 +189,7 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                 let off = page.can_alloc(size);
                 if off > 0 {
                     let mut page = page.into_mut_page(txn);
-                    let value = txn.alloc_value(value);
+                    let value = alloc_value(txn, value);
                     page.alloc_key_value(off, size, key, value, l, r);
                     // Either there's room
                     let current = node_ptr(&page, depth, path, page.root() as u32);

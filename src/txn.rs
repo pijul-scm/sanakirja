@@ -31,6 +31,13 @@ pub struct Txn<'env> {
 }
 
 impl<'env> MutTxn<'env> {
+    pub fn alloc_page(&mut self) -> MutPage {
+        let page = self.txn.alloc_page().unwrap();
+        MutPage { page: page }
+    }
+    pub fn load_cow_page(&mut self, off: u64) -> Cow {
+        Cow { cow: self.txn.load_cow_page(off) }
+    }
     #[doc(hidden)]
     pub fn debug<P: AsRef<Path>>(&self, db: Db, p: P) {
         debug(self, db, p)
@@ -66,6 +73,78 @@ impl<'a> Value<'a> {
         }
     }
 }
+
+
+pub fn alloc_value<'a>(txn:&mut MutTxn, value: Value<'a>) -> Value<'a> {
+    match value {
+        Value::S(s) if s.len() < VALUE_SIZE_THRESHOLD => value,
+        Value::O{..} => value,
+        Value::S(s) => {
+            fn alloc_pages(txn:&mut MutTxn, value: &[u8]) -> u64 {
+                unsafe {
+                    // n*PAGE_SIZE - 8 * n
+                    let actual_page_size = PAGE_SIZE - 8;
+
+                    let n = value.len() / actual_page_size;
+                    let n = if n * actual_page_size < value.len() {
+                        n + 1
+                    } else {
+                        n
+                    };
+                    assert!(8 * (n + 1) < PAGE_SIZE);
+
+                    let first_page = txn.alloc_page();
+                    let mut page_ptr = first_page.data() as *mut u64;
+
+                    let copyable_len = if value.len() < PAGE_SIZE - 8 * n {
+                        value.len()
+                    } else {
+                        PAGE_SIZE - 8 * n
+                    };
+                    copy_nonoverlapping(value.as_ptr(),
+                                        (first_page.data() as *mut u8).offset(8 * n as isize),
+                                        copyable_len);
+                    let mut value_offset = copyable_len;
+
+                    let mut total_length = PAGE_SIZE;
+
+                    while total_length < 8 * n + value.len() {
+                        let page = txn.alloc_page();
+                        *page_ptr = page.page_offset().to_le();
+                        page_ptr = page_ptr.offset(1);
+
+                        let copyable_len = if value.len() - value_offset < PAGE_SIZE {
+                            value.len() - value_offset
+                        } else {
+                            PAGE_SIZE
+                        };
+                        copy_nonoverlapping(value.as_ptr().offset(value_offset as isize),
+                                            page.data() as *mut u8,
+                                            copyable_len);
+                        value_offset += copyable_len;
+                        total_length += PAGE_SIZE
+                    }
+                    *page_ptr = 0;
+                    first_page.page_offset()
+                }
+            }
+            let off = alloc_pages(txn,s);
+            Value::O {
+                offset: off,
+                len: s.len() as u32,
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
 
 
 // Difference between mutpage and mutpages: mutpages might also contain just one page, but it is unmapped whenever it goes out of scope, whereas P belongs to the main map. Useful for 32-bits platforms.
@@ -663,13 +742,6 @@ impl<'env> LoadPage for Txn<'env> {
         Page { page: self.txn.load_page(off) }
     }
 }
-
-
-
-
-
-
-
 
 
 fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: Db, p: P) {

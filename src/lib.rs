@@ -40,13 +40,14 @@
 //!
 //! ```
 //! use sanakirja::Env;
-//! let env=Env::new("/tmp/test").unwrap();
-//! let mut txn=env.mut_txn_begin();
-//! txn.put(b"test key", b"test value");
+//! let env = Env::new("/tmp/test").unwrap();
+//! let mut txn = env.mut_txn_begin();
+//! let mut root = txn.root_db();
+//! root = txn.put(root,b"test key", b"test value");
 //! txn.commit().unwrap();
 //!
-//! let txn=env.txn_begin();
-//! assert!(txn.get(b"test key",None) == Some(b"test value"))
+//! let txn = env.txn_begin();
+//! assert!(txn.get(&root, b"test key", None).map(|x| x.as_slice()) == Some(b"test value"))
 //! ```
 //!
 
@@ -58,17 +59,15 @@ extern crate log;
 extern crate fs2;
 
 use std::path::Path;
-use std::ptr::copy_nonoverlapping;
 
 mod memmap;
 mod transaction;
 
 pub use transaction::Statistics;
-use transaction::PAGE_SIZE;
 
 mod txn;
 pub use txn::{MutTxn, Txn, Value, Db, Loaded, Cow};
-use txn::{MutPage, VALUE_SIZE_THRESHOLD, P, LoadPage};
+use txn::{P, LoadPage};
 mod rebalance;
 mod put;
 
@@ -160,78 +159,6 @@ impl<'env> MutTxn<'env> {
     pub fn put(&mut self, db: Db, key: &[u8], value: &[u8]) -> Db {
         put::put(self, db, key, value)
     }
-    fn load_cow_page(&mut self, off: u64) -> Cow {
-        Cow { cow: self.txn.load_cow_page(off) }
-    }
-
-    fn alloc_page(&mut self) -> MutPage {
-        let page = self.txn.alloc_page().unwrap();
-        MutPage { page: page }
-    }
-
-    fn alloc_pages(&mut self, value: &[u8]) -> u64 {
-        unsafe {
-            // n*PAGE_SIZE - 8 * n
-            let actual_page_size = PAGE_SIZE - 8;
-
-            let n = value.len() / actual_page_size;
-            let n = if n * actual_page_size < value.len() {
-                n + 1
-            } else {
-                n
-            };
-            assert!(8 * (n + 1) < PAGE_SIZE);
-
-            let first_page = self.alloc_page();
-            let mut page_ptr = first_page.data() as *mut u64;
-
-            let copyable_len = if value.len() < PAGE_SIZE - 8 * n {
-                value.len()
-            } else {
-                PAGE_SIZE - 8 * n
-            };
-            copy_nonoverlapping(value.as_ptr(),
-                                (first_page.data() as *mut u8).offset(8 * n as isize),
-                                copyable_len);
-            let mut value_offset = copyable_len;
-
-            let mut total_length = PAGE_SIZE;
-
-            while total_length < 8 * n + value.len() {
-                let page = self.alloc_page();
-                *page_ptr = page.page_offset().to_le();
-                page_ptr = page_ptr.offset(1);
-
-                let copyable_len = if value.len() - value_offset < PAGE_SIZE {
-                    value.len() - value_offset
-                } else {
-                    PAGE_SIZE
-                };
-                copy_nonoverlapping(value.as_ptr().offset(value_offset as isize),
-                                    page.data() as *mut u8,
-                                    copyable_len);
-                value_offset += copyable_len;
-                total_length += PAGE_SIZE
-            }
-            *page_ptr = 0;
-            first_page.page_offset()
-        }
-    }
-
-    fn alloc_value<'a>(&mut self, value: Value<'a>) -> Value<'a> {
-        match value {
-            Value::S(s) if s.len() < VALUE_SIZE_THRESHOLD => value,
-            Value::O{..} => value,
-            Value::S(s) => {
-                let off = self.alloc_pages(s);
-                Value::O {
-                    offset: off,
-                    len: s.len() as u32,
-                }
-            }
-        }
-    }
-
     pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a>> {
         self.get_(db, key, value)
     }
