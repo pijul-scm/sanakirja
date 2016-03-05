@@ -1,7 +1,7 @@
 use super::txn::*;
 
 /// Converts v(u(a,b),c) into u(a,v(b,c))
-fn tree_rotate_clockwise(page: &mut MutPage, v: u16) -> u16 {
+pub fn tree_rotate_clockwise(page: &mut MutPage, v: u16) -> u16 {
     debug!("rotate clockwise");
     unsafe {
         let ptr = page.offset(v as isize) as *mut u32;
@@ -49,7 +49,7 @@ fn tree_rotate_clockwise(page: &mut MutPage, v: u16) -> u16 {
 }
 
 /// Converts u(a,v(b,c)) into v(u(a,b),c)
-fn tree_rotate_anticlockwise(page: &mut MutPage, u: u16) -> u16 {
+pub fn tree_rotate_anticlockwise(page: &mut MutPage, u: u16) -> u16 {
     debug!("rotate anticlockwise");
     unsafe {
         let ptr = page.offset(u as isize) as *mut u32;

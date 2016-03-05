@@ -39,18 +39,19 @@
 //! # Example
 //!
 //! ```
-//! use sanakirja::Env;
-//! let env = Env::new("/tmp/test").unwrap();
+//! let dir = "/tmp/test";
+//! let env = sanakirja::Env::new(dir).unwrap();
 //! let mut txn = env.mut_txn_begin();
 //! let mut root = txn.root_db();
 //! root = txn.put(root,b"test key", b"test value");
+//! txn.set_global_root(root);
 //! txn.commit().unwrap();
 //!
 //! let txn = env.txn_begin();
+//! let root = txn.root_db();
 //! assert!(txn.get(&root, b"test key", None).map(|x| x.as_slice()) == Some(b"test value"))
 //! ```
 //!
-
 
 extern crate libc;
 
@@ -66,10 +67,11 @@ mod transaction;
 pub use transaction::Statistics;
 
 mod txn;
-pub use txn::{MutTxn, Txn, Value, Db, Loaded, Cow};
+pub use txn::{MutTxn, Txn, Value, Db, Loaded};
 use txn::{P, LoadPage};
 mod rebalance;
 mod put;
+mod del;
 
 /// Environment, containing in particular a pointer to the memory-mapped file.
 pub struct Env {
@@ -159,6 +161,9 @@ impl<'env> MutTxn<'env> {
     pub fn put(&mut self, db: Db, key: &[u8], value: &[u8]) -> Db {
         put::put(self, db, key, value)
     }
+    pub fn del(&mut self, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
+        del::del(self, db, key, value)
+    }
     pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a>> {
         self.get_(db, key, value)
     }
@@ -193,4 +198,22 @@ impl<'env> Txn<'env> {
         let root = root_page.root();
         self.tree_iterate(&root_page, key, value, f, root as u32, false);
     }
+}
+
+
+#[test]
+fn basic_test() -> ()
+{
+    extern crate tempdir;
+    let dir = tempdir::TempDir::new("pijul").unwrap();
+    let env = Env::new(dir.path()).unwrap();
+    let mut txn = env.mut_txn_begin();
+    let mut root = txn.root_db();
+    root = txn.put(root,b"test key", b"test value");
+    txn.set_global_root(root);
+    txn.commit().unwrap();
+
+    let txn = env.txn_begin();
+    let root = txn.root_db();
+    assert!(txn.get(&root, b"test key", None).map(|x| x.as_slice()) == Some(b"test value"))
 }

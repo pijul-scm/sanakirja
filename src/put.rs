@@ -97,25 +97,6 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                           -> Insert<'a> {
     unsafe {
         debug!("binary tree insert:{} {}", depth, path);
-        unsafe fn node_ptr(page: &MutPage,
-                           mut length: usize,
-                           mut path: u64,
-                           mut current: u32)
-                           -> u16 {
-            while length > 0 {
-                let ptr = page.offset(current as isize) as *mut u32;
-                // println!("node_ptr:{:?}",if path&1==0 { u32::from_le(*ptr) } else { u32::from_le(*(ptr.offset(2))) });
-                // assert!(if path&1==0 { u32::from_le(*ptr)==1 } else { u32::from_le(*(ptr.offset(2))) == 1 });
-                current = if path & 1 == 0 {
-                    u32::from_le(*(ptr.offset(1)))
-                } else {
-                    u32::from_le(*(ptr.offset(3)))
-                };
-                length -= 1;
-                path >>= 1;
-            }
-            current as u16
-        }
         let ptr = page.offset(current as isize) as *mut u32;
         // Inlining this closure takes the whole thing from 2.33 to 1.7 (ratio (sanakirja put time)/(lmdb put time)).
         let continue_local = |txn: &mut MutTxn,

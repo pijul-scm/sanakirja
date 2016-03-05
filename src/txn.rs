@@ -14,6 +14,7 @@ use std::io::Write;
 pub const MAX_KEY_SIZE: usize = PAGE_SIZE >> 2;
 pub const VALUE_SIZE_THRESHOLD: usize = PAGE_SIZE >> 2;
 
+#[derive(Debug)]
 pub struct Db {
     pub root: u64,
 }
@@ -39,14 +40,14 @@ impl<'env> MutTxn<'env> {
         Cow { cow: self.txn.load_cow_page(off) }
     }
     #[doc(hidden)]
-    pub fn debug<P: AsRef<Path>>(&self, db: Db, p: P) {
+    pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P) {
         debug(self, db, p)
     }
 }
 
 impl<'env> Txn<'env> {
     #[doc(hidden)]
-    pub fn debug<P: AsRef<Path>>(&self, db: Db, p: P) {
+    pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P) {
         debug(self, db, p)
     }
 }
@@ -260,6 +261,7 @@ pub trait LoadPage {
         }
     }
     fn get_<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a>> {
+        debug!("db.root={:?}",db.root);
         let root_page = self.load_page(db.root);
         self.binary_tree_get(&root_page, key, value, root_page.root() as u32)
     }
@@ -682,6 +684,7 @@ pub struct Cow {
 }
 
 impl Cow {
+
     // fn from_mut_page(p:MutPage)->Cow {
     // Cow(transaction::Cow::MutPage(p.page))
     // }
@@ -690,6 +693,16 @@ impl Cow {
     // match s { &transaction::Cow::MutPage(_)=>true, _=>false }
     // }
     //
+
+    /*
+    // NOTE: the following function (from_page) should not be used,
+    // as they might lead to useless copying when into_mut_page is
+    // called. use load_cow_page instead.
+    
+    pub fn from_page(p:Page)->Cow {
+        Cow { cow: transaction::Cow::Page(p.page) }
+    }
+     */
     pub fn into_mut_page(self, txn: &mut MutTxn) -> MutPage {
         match self.cow {
             transaction::Cow::MutPage(p) => MutPage { page: p },
@@ -744,7 +757,7 @@ impl<'env> LoadPage for Txn<'env> {
 }
 
 
-fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: Db, p: P) {
+fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
     let page = t.load_page(db.root);
     let f = File::create(p.as_ref()).unwrap();
     let mut buf = BufWriter::new(f);
@@ -883,4 +896,24 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: Db, p: P) {
     }
     print_page(t, &mut h, &mut buf, &page, true /* print children */);
     writeln!(&mut buf, "}}").unwrap();
+}
+
+pub unsafe fn node_ptr(page: &MutPage,
+                   mut length: usize,
+                   mut path: u64,
+                   mut current: u32)
+                   -> u16 {
+    while length > 0 {
+        let ptr = page.offset(current as isize) as *mut u32;
+        // println!("node_ptr:{:?}",if path&1==0 { u32::from_le(*ptr) } else { u32::from_le(*(ptr.offset(2))) });
+        // assert!(if path&1==0 { u32::from_le(*ptr)==1 } else { u32::from_le(*(ptr.offset(2))) == 1 });
+        current = if path & 1 == 0 {
+            u32::from_le(*(ptr.offset(1)))
+        } else {
+            u32::from_le(*(ptr.offset(3)))
+        };
+        length -= 1;
+        path >>= 1;
+    }
+    current as u16
 }
