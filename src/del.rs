@@ -114,7 +114,7 @@ fn delete(txn: &mut MutTxn,
                                         off,
                                         key,
                                         value,
-                                        (path << 1),
+                                        path,
                                         depth + 1,
                                         true),root)
                             } else {
@@ -124,7 +124,7 @@ fn delete(txn: &mut MutTxn,
                                         off,
                                         key,
                                         value,
-                                        (path << 1)|1,
+                                        path | (1<<depth),
                                         depth + 1,
                                         true), root)
                             };
@@ -203,7 +203,7 @@ fn delete(txn: &mut MutTxn,
                 if right0 == 1 {
                     let right1 = u32::from_le(*(ptr.offset(3)));
                     if right1 > 0 {
-                        match delete(txn, page, right1 as u16, key, value, (path << 1) | 1, depth + 1, false) {
+                        match delete(txn, page, right1 as u16, key, value, path | (1<<depth), depth + 1, false) {
                             Delete::NewPage { mut page,off }=>{
                                 let ptr_off = node_ptr(&page,depth,path,page.root() as u32);
                                 let ptr = page.offset(ptr_off as isize) as *mut u32;
