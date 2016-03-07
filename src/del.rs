@@ -11,34 +11,37 @@ pub fn del(txn: &mut MutTxn, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
     let page = txn.load_cow_page(db.root);
     let current = page.root();
     let value = value.unwrap();
-    match delete(txn, page, current as u32, key, value, 0, 0) {
-        Delete::NewPage{page} => {
-            Db { root:page }
+    match delete(txn, page, current, key, value, 0, 0, false) {
+        Delete::NewPage{mut page,off} => {
+            if off == 0 {
+                // the page was deleted
+                unimplemented!()
+            } else {
+                let off = rebalance(&mut page,off);
+                page.set_root(off);
+                Db { root:page.page_offset() }
+            }
         },
         Delete::NotFound => {
             db
-        },
-        Delete::PageDeleted => {
-            // The database has become empty
-            unimplemented!()
         }
     }
 }
 
 enum Delete {
     NotFound,
-    NewPage { page:u64 },
-    PageDeleted
+    NewPage { page:MutPage, off: u16 },
 }
 
 
 fn delete(txn: &mut MutTxn,
           page: Cow,
-          current: u32,
+          current: u16,
           key: &[u8],
           value: &[u8],
-          mut path: u64,
-          mut depth: usize)
+          path: u64,
+           depth: usize,
+          eq:bool)
           -> Delete {
     unsafe {
         println!("delete: current={:?}",current);
@@ -52,109 +55,128 @@ fn delete(txn: &mut MutTxn,
                  std::str::from_utf8_unchecked(key0),
                  std::str::from_utf8_unchecked(value0)
         );
-        let cmp = (key, value).cmp(&(key0, value0));
+        let cmp = if eq { Ordering::Equal } else { (key, value).cmp(&(key0, value0)) };
         match cmp {
             Ordering::Equal => {
                 // Find the smallest children in the right subtree, or the largest one in the left subtree
 
                 // De toute façon, il va se passer un truc, on CoW maintenant.
                 let mut page = page.into_mut_page(txn);
-                let off = node_ptr(&page,depth,path,page.root() as u32);
-                let ptr = page.offset(off as isize) as *mut u32;
-                let mut parent_ptr = if depth>0 {
-                    let off = node_ptr(&page,depth-1,path>>1,page.root() as u32);
-                    let ptr = page.offset(off as isize);
-                    if path&1 == 0 {
-                        ptr as *mut u64
-                    } else {
-                        (ptr as *mut u64).offset(1)
-                    }
+                let (off,ptr) = if eq {
+                    (current,ptr)
                 } else {
-                    std::ptr::null_mut()
+                    let off = node_ptr(&page,depth,path,page.root() as u32);
+                    let ptr = page.offset(off as isize) as *mut u32;
+                    (off,ptr)
                 };
-                // This loop either deletes and returns, or rotates
-                // and repeats until the current node has at least one
-                // (page or null) child.
-                loop {
-                    let left0 = u32::from_le(*ptr);
-                    let left1 = u32::from_le(*(ptr.offset(1)));
-                    let right0 = u32::from_le(*(ptr.offset(2)));
-                    let right1 = u32::from_le(*(ptr.offset(3)));
-                    if (left0 <= 1 && left1 == 0) || (right0<=1 && right1==0) {
-                        // If the current node has at least one non-local child, we can delete it and return.
-                        let (child,child0) = if left0<=1 && left1==0 {
-                            (*((ptr as *const u64).offset(1)), right0)
-                        } else {
-                            (*(ptr as *const u64), left0)
-                        };
-                        if parent_ptr.is_null() {
-                            // If the current node is the root, change the page's root.
 
-                            // Either there is a local node to replace the root, or not
-                            if child0==1 || child==0 {
-                                // If ther is a local node
-                                if left0<=1 && left1==0 {
-                                    page.set_root(node_ptr(&page,depth+1,(path<<1)|1,page.root() as u32));
-                                } else {
-                                    page.set_root(node_ptr(&page,depth+1,(path<<1),page.root() as u32));
-                                }
-                                return Delete::NewPage { page:page.page_offset() }
-                            } else {
-                                // Else, delete the current page and update its parent.
-                                unimplemented!();
-                                return Delete::PageDeleted
-                            }
-                        } else {
-                            // Else (i.e. if the current node is not the root), 
-                            if child0!=1 {
-                                *parent_ptr = child
-                            } else {
-                                *(parent_ptr as *mut u32) = (1 as u32).to_le();
-                                if left0<=1 && left1==0 {
-                                    *((parent_ptr as *mut u32).offset(1)) = (node_ptr(&page,depth+1,(path<<1)|1,page.root() as u32) as u32).to_le()
-                                } else {
-                                    *((parent_ptr as *mut u32).offset(1)) = (node_ptr(&page,depth+1,(path<<1),page.root() as u32) as u32).to_le()
-                                }
-                            };
-                            return Delete::NewPage { page:page.page_offset() }
-                        }
+                let left0 = u32::from_le(*ptr);
+                let left1 = u32::from_le(*(ptr.offset(1)));
+                let right0 = u32::from_le(*(ptr.offset(2)));
+                let right1 = u32::from_le(*(ptr.offset(3)));
+                if left0 <= 1 && left1 == 0 {
+                    println!("deleting, left");
+                    if right0<=1 && right1 == 0 {
+                        // Else, delete the current page and update its parent.
+                        Delete::NewPage { page: page,
+                                          off: 0 }
                     } else {
-                        // Both children are taken. Rotate.
-                        if left0!=1 && right0!=1 {
-                            // Both children are pages.  Take the
-                            // smallest (largest) descendant of the
-                            // right (left) page, and copy it in place
-                            // of the current node, with (malloc new)
-                            // + (free current).
-                            //
-                            // Then, recursively delete the page from
-                            // which the key was taken, and update the
-                            // pointer here.
-                            unimplemented!()
-                        } else {
-                            println!("rotating");
-                            if parent_ptr.is_null() {
-                                let root=tree_rotate_anticlockwise(&mut page, off);
-                                parent_ptr = page.offset(root as isize) as *mut u64;
-                                page.set_root(root);
+                        Delete::NewPage { page:page,
+                                          off: right1 as u16 }
+                    }
+                } else if right0<=1 && right1==0 {
+                    println!("deleting, right");
+                    Delete::NewPage { page: page,
+                                      off: left1 as u16 }
+                } else {
+                    if left0!=1 && right0!=1 {
+                        // Both children are pages.  Take the
+                        // smallest (largest) descendant of the
+                        // right (left) page, and copy it in place
+                        // of the current node, with (malloc new)
+                        // + (free current).
+                        //
+                        // Then, recursively delete the page from
+                        // which the key was taken, and update the
+                        // pointer here:
+                        // - If the page was deleted, CoW, write 0, return new current page.
+                        // - If it wasn't deleted, update
+                        // - If NotFound, unreachable!()
+                        unimplemented!()
+                    } else {
+                        // Both children are taken, at least one is not a page. Rotate.
+                        println!("rotating");
+                        let (result,root) =
+                            if right0==1 {
+                                let root = tree_rotate_anticlockwise(&mut page, off);
+                                (delete(txn,
+                                        Cow::from_mut_page(page),
+                                        off,
+                                        key,
+                                        value,
+                                        (path << 1),
+                                        depth + 1,
+                                        true),root)
                             } else {
-                                *(parent_ptr as *mut u32) = (1 as u32).to_le();
-                                let p=tree_rotate_anticlockwise(&mut page, off);
-                                *((parent_ptr as *mut u32).offset(1)) = (p as u32).to_le();
-                                parent_ptr = page.offset(p as isize) as *mut u64;
-                            }
-                            depth+=1;
-                            path = path<<1;
+                                let root = tree_rotate_clockwise(&mut page, off);
+                                (delete(txn,
+                                        Cow::from_mut_page(page),
+                                        off,
+                                        key,
+                                        value,
+                                        (path << 1)|1,
+                                        depth + 1,
+                                        true), root)
+                            };
+                        match result {
+                            Delete::NewPage { mut page, off } => {
+                                println!("rotated, off={:?}",off);
+                                let ptr = page.offset(root as isize) as *mut u32;
+                                *((ptr as *mut u16).offset(11)) = (u16::from_le(*((ptr as *mut u16).offset(11))) - 1).to_le();
+                                if right0==1 {
+                                    if off==0 {
+                                        *(ptr as *mut u64) = 0;
+                                    } else {
+                                        *(ptr.offset(0)) = 1;
+                                        *(ptr.offset(1)) = (off as u32).to_le();
+                                    }
+                                } else {
+                                    if off==0 {
+                                        *((ptr as *mut u64).offset(1)) = 0;
+                                    } else {
+                                        *(ptr.offset(2)) = 1;
+                                        *(ptr.offset(3)) = (off as u32).to_le();
+                                    }
+                                }
+                                let root = rebalance(&mut page,root);
+                                Delete::NewPage { page: page, off: root }
+                            },
+                            Delete::NotFound => unreachable!()
                         }
                     }
                 }
-            }
+            },
             Ordering::Less => {
                 let left0 = u32::from_le(*ptr);
                 if left0 == 1 {
                     let left1 = u32::from_le(*(ptr.offset(1)));
                     if left1 > 0 {
-                        delete(txn, page, left1, key, value, path, depth + 1)
+                        match delete(txn, page, left1 as u16, key, value, path, depth + 1, false) {
+                            Delete::NewPage { mut page,off }=>{
+                                let ptr_off = node_ptr(&page,depth,path,page.root() as u32);
+                                let ptr = page.offset(ptr_off as isize) as *mut u32;
+                                *((ptr as *mut u16).offset(11)) = (u16::from_le(*((ptr as *mut u16).offset(11))) - 1).to_le();
+                                if off == 0 {
+                                    *(ptr as *mut u64) = 0;
+                                } else {
+                                    *(ptr.offset(0)) = 1;
+                                    *(ptr.offset(1)) = (off as u32).to_le();
+                                }
+                                let ptr_off = rebalance(&mut page,ptr_off);
+                                Delete::NewPage { page:page,off:ptr_off }
+                            },
+                            Delete::NotFound => Delete::NotFound,
+                        }
                     } else {
                         // not found
                         Delete::NotFound
@@ -169,13 +191,22 @@ fn delete(txn: &mut MutTxn,
                 if right0 == 1 {
                     let right1 = u32::from_le(*(ptr.offset(3)));
                     if right1 > 0 {
-                        delete(txn,
-                               page,
-                               right1,
-                               key,
-                               value,
-                               (path << 1) | 1,
-                               depth + 1)
+                        match delete(txn, page, right1 as u16, key, value, (path << 1) | 1, depth + 1, false) {
+                            Delete::NewPage { mut page,off }=>{
+                                let ptr_off = node_ptr(&page,depth,path,page.root() as u32);
+                                let ptr = page.offset(ptr_off as isize) as *mut u32;
+                                *((ptr as *mut u16).offset(11)) = (u16::from_le(*((ptr as *mut u16).offset(11))) - 1).to_le();
+                                if off == 0 {
+                                    *((ptr as *mut u64).offset(1)) = 0;
+                                } else {
+                                    *(ptr.offset(2)) = 1;
+                                    *(ptr.offset(3)) = (off as u32).to_le();
+                                }
+                                let ptr_off = rebalance(&mut page,ptr_off);
+                                Delete::NewPage { page:page,off:ptr_off }
+                            },
+                            Delete::NotFound => Delete::NotFound,
+                        }
                     } else {
                         // not found
                         Delete::NotFound

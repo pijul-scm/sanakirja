@@ -685,9 +685,9 @@ pub struct Cow {
 
 impl Cow {
 
-    // fn from_mut_page(p:MutPage)->Cow {
-    // Cow(transaction::Cow::MutPage(p.page))
-    // }
+    pub fn from_mut_page(p:MutPage)->Cow {
+        Cow{cow:transaction::Cow::MutPage(p.page)}
+    }
     // fn is_mutable(&self)->bool {
     // let &Cow(ref s)=self;
     // match s { &transaction::Cow::MutPage(_)=>true, _=>false }

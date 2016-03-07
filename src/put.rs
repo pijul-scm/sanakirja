@@ -65,7 +65,7 @@ fn insert<'a>(txn: &mut MutTxn,
         let result = binary_tree_insert(txn, page, key, value, l, r, rc, 0, 0, root as u32);
         debug!("result {:?}", result);
         match result {
-            Insert::Ok{page,off} => {
+            Insert::Ok{mut page,off} => {
                 page.set_root(off as u16);
                 // unsafe {
                 // let ptr=page.offset(root);
