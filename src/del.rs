@@ -89,7 +89,7 @@ fn delete(txn: &mut MutTxn,
                     Delete::NewPage { page: page,
                                       off: left1 as u16 }
                 } else {
-                    if left0!=1 && right0!=1 {
+                    if left0>1 && right0>1 {
                         // Both children are pages.  Take the
                         // smallest (largest) descendant of the
                         // right (left) page, and copy it in place
@@ -183,7 +183,19 @@ fn delete(txn: &mut MutTxn,
                     }
                 } else {
                     // Page child
-                    unimplemented!()
+                    let left = u64::from_le(*(ptr as *const u64));
+                    let left_page = txn.load_cow_page(left);
+                    let left_root = left_page.root();
+                    match delete(txn,left_page,left_root,key,value,0,0,false) {
+                        Delete::NotFound => Delete::NotFound,
+                        Delete::NewPage { page:left_page, off:left_root } => {
+                            let mut page = page.into_mut_page(txn);
+                            let off = node_ptr(&page, depth,path,page.root() as u32);
+                            let ptr = page.offset(off as isize);
+                            *(ptr as *mut u64) = left_page.page_offset().to_le();
+                            Delete::NewPage { page:page, off: off }
+                        }
+                    }
                 }
             }
             Ordering::Greater => {
@@ -213,7 +225,19 @@ fn delete(txn: &mut MutTxn,
                     }
                 } else {
                     // Page child
-                    unimplemented!()
+                    let right = u64::from_le(*((ptr as *const u64).offset(1)));
+                    let right_page = txn.load_cow_page(right);
+                    let right_root = right_page.root();
+                    match delete(txn,right_page,right_root,key,value,0,0,false) {
+                        Delete::NotFound => Delete::NotFound,
+                        Delete::NewPage { page:right_page, off:right_root } => {
+                            let mut page = page.into_mut_page(txn);
+                            let off = node_ptr(&page, depth,path,page.root() as u32);
+                            let ptr = page.offset(off as isize);
+                            *((ptr as *mut u64).offset(1)) = right_page.page_offset().to_le();
+                            Delete::NewPage { page:page, off: off }
+                        }
+                    }
                 }
             }
         }

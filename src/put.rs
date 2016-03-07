@@ -102,7 +102,7 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
         let continue_local = |txn: &mut MutTxn,
                               page: Cow,
                               side_offset: isize,
-                              next_path: u64|
+        next_path: u64|
                               -> Insert<'a> {
             let next = u32::from_le(*(ptr.offset(side_offset + 1)));
             if next == 0 {
@@ -196,38 +196,50 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                 let page_ = txn.load_cow_page(child);
                 let max_rc = std::cmp::max(max_rc, page_.rc());
                 let result = insert(txn, page_, key, value, l, r, max_rc);
-                if let Insert::Split { key:k0,value:v0,left:l0,right:r0,free_page:fr0 } = result {
-                    let size = value_record_size(k0, v0);
-                    let off = page.can_alloc(size);
-                    if off > 0 {
-                        let mut page = page.into_mut_page(txn);
-                        // page_ split, we need to insert the resulting key here.
-                        page.alloc_key_value(off, size, k0, v0, l0, r0);
-                        // Either there's room
+                match result {
+                    Insert::Split { key:k0,value:v0,left:l0,right:r0,free_page:fr0 } => {
+                        let size = value_record_size(k0, v0);
+                        let off = page.can_alloc(size);
+                        if off > 0 {
+                            let mut page = page.into_mut_page(txn);
+                            // page_ split, we need to insert the resulting key here.
+                            page.alloc_key_value(off, size, k0, v0, l0, r0);
+                            // Either there's room
+                            let current = node_ptr(&page, depth, path, page.root() as u32);
+                            let ptr = page.offset(current as isize);
+                            // Either there's room for it.
+                            if right_child {
+                                *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
+                                *((ptr as *mut u32).offset(3)) = (off as u32).to_le();
+                            } else {
+                                *((ptr as *mut u32).offset(0)) = (1 as u32).to_le();
+                                *((ptr as *mut u32).offset(1)) = (off as u32).to_le();
+                            }
+                            incr((ptr as *mut u16).offset(11));
+                            transaction::free(&mut txn.txn, fr0);
+                            let bal = rebalance(&mut page, current);
+                            Insert::Ok {
+                                page: page,
+                                off: bal,
+                            }
+                        } else {
+                            // debug!("Could not find space for child pages {} {}",l0,r0);
+                            // page_ was split and there is no space here to keep track of its replacement.
+                            split_and_insert(txn, &page, k0, v0, l0, r0, fr0)
+                        }
+                    },
+                    Insert::Ok { page:next_page,.. } => {
+                        let page = page.into_mut_page(txn);
                         let current = node_ptr(&page, depth, path, page.root() as u32);
                         let ptr = page.offset(current as isize);
                         // Either there's room for it.
                         if right_child {
-                            *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
-                            *((ptr as *mut u32).offset(3)) = (off as u32).to_le();
+                            *((ptr as *mut u64).offset(1)) = next_page.page_offset().to_le();
                         } else {
-                            *((ptr as *mut u32).offset(0)) = (1 as u32).to_le();
-                            *((ptr as *mut u32).offset(1)) = (off as u32).to_le();
+                            *((ptr as *mut u64)) = next_page.page_offset().to_le();
                         }
-                        incr((ptr as *mut u16).offset(11));
-                        transaction::free(&mut txn.txn, fr0);
-                        let bal = rebalance(&mut page, current);
-                        Insert::Ok {
-                            page: page,
-                            off: bal,
-                        }
-                    } else {
-                        // debug!("Could not find space for child pages {} {}",l0,r0);
-                        // page_ was split and there is no space here to keep track of its replacement.
-                        split_and_insert(txn, &page, k0, v0, l0, r0, fr0)
+                        Insert::Ok { page:page, off:current }
                     }
-                } else {
-                    result
                 }
             }
         };
