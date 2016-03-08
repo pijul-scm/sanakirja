@@ -1,3 +1,4 @@
+use super::transaction;
 use super::txn::*;
 use super::put;
 use std;
@@ -46,11 +47,15 @@ pub fn del(txn: &mut MutTxn, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
         }
     };
     if let Some(reinsert)=reinsert {
-        put::put_lr(txn,Cow::from_mut_page(page),
-                    reinsert.key,
-                    reinsert.value,
-                    reinsert.left,
-                    reinsert.right)
+        let db = put::put_lr(txn,Cow::from_mut_page(page),
+                             reinsert.key,
+                             reinsert.value,
+                             reinsert.left,
+                             reinsert.right);
+        if reinsert.free_page>0 {
+            unsafe { transaction::free(&mut txn.txn, reinsert.free_page) }
+        }
+        db
     } else {
         Db { root:page.page_offset() }
     }
