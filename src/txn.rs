@@ -274,10 +274,13 @@ pub trait LoadPage {
                            current: u32)
                            -> Option<Value<'a>> {
         unsafe {
-            debug!("binary_tree_get:{:?}", page);
+            //println!("binary_tree_get:{:?}", page);
             let ptr = page.offset(current as isize) as *mut u32;
 
             let (key0, value0) = read_key_value(&*(ptr as *const u8));
+            /*println!("binary_tree_get:{:?}, {:?}",
+            std::str::from_utf8_unchecked(key),
+            std::str::from_utf8_unchecked(key0));*/
             let cmp = if let Some(value_) = value {
                 let cmp = key.cmp(&key0);
                 if cmp == Ordering::Equal {
@@ -703,19 +706,26 @@ impl Cow {
         Cow { cow: transaction::Cow::Page(p.page) }
     }
      */
-    pub fn into_mut_page(self, txn: &mut MutTxn) -> MutPage {
+    pub fn into_mut_page_nonfree(self, txn: &mut MutTxn) -> (MutPage,Option<Page>) {
         match self.cow {
-            transaction::Cow::MutPage(p) => MutPage { page: p },
+            transaction::Cow::MutPage(p) => (MutPage { page: p },None),
             transaction::Cow::Page(p) => {
                 unsafe {
                     let result = txn.txn.alloc_page().unwrap();
                     copy_nonoverlapping(p.data, result.data, PAGE_SIZE);
                     // TODO: decrement and check RC
-                    p.free(&mut txn.txn);
-                    MutPage { page: result }
+                    // p.free(&mut txn.txn);
+                    (MutPage { page: result }, Some(Page{page:p}))
                 }
             }
         }
+    }
+    pub fn into_mut_page(self, txn: &mut MutTxn) -> MutPage {
+        let (a,b) = self.into_mut_page_nonfree(txn);
+        if let Some(b) = b {
+            b.page.free(&mut txn.txn);
+        }
+        a
     }
     // fn into_page(self)->Page {
     // let Cow(s)=self;
@@ -916,4 +926,16 @@ pub unsafe fn node_ptr(page: &MutPage,
         path >>= 1;
     }
     current as u16
+}
+pub fn value_record_size(key: &[u8], value: Value) -> u16 {
+    match value {
+        Value::S(s) if s.len() < VALUE_SIZE_THRESHOLD => {
+            let size = 28 + key.len() as u16 + value.len() as u16;
+            size + ((8 - (size & 7)) & 7)
+        }
+        Value::S(_) | Value::O{..} => {
+            let size = 28 + key.len() as u16 + 8;
+            size + ((8 - (size & 7)) & 7)
+        }
+    }
 }

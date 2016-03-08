@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use super::transaction;
 
 #[derive(Debug)]
-enum Insert<'a> {
+pub enum Result<'a> {
     Ok {
         page: MutPage,
         off: u16,
@@ -13,35 +13,22 @@ enum Insert<'a> {
     Split {
         key: &'a [u8],
         value: Value<'a>,
-        left: u64,
-        right: u64,
+        left: MutPage,
+        right: MutPage,
         free_page: u64,
     },
 }
-fn value_record_size(key: &[u8], value: Value) -> u16 {
-    match value {
-        Value::S(s) if s.len() < VALUE_SIZE_THRESHOLD => {
-            let size = 28 + key.len() as u16 + value.len() as u16;
-            size + ((8 - (size & 7)) & 7)
-        }
-        Value::S(_) | Value::O{..} => {
-            let size = 28 + key.len() as u16 + 8;
-            size + ((8 - (size & 7)) & 7)
-        }
-    }
-}
-
 
 
 // Finds binary tree root and calls binary_tree_insert on it.
-fn insert<'a>(txn: &mut MutTxn,
+pub fn insert<'a>(txn: &mut MutTxn,
               page: Cow,
               key: &[u8],
               value: Value<'a>,
               l: u64,
               r: u64,
               max_rc: u64)
-              -> Insert<'a> {
+              -> Result<'a> {
     // [u8], Value<'a>, u64, u64, u64)> {
     let root = page.root();
     debug!("insert: root={:?}, {:?},{:?}", root, key, value);
@@ -56,7 +43,7 @@ fn insert<'a>(txn: &mut MutTxn,
         debug!("inserted {}", off);
         page.set_root(off);
         debug!("root set 0");
-        Insert::Ok {
+        Result::Ok {
             page: page,
             off: off,
         }
@@ -65,14 +52,14 @@ fn insert<'a>(txn: &mut MutTxn,
         let result = binary_tree_insert(txn, page, key, value, l, r, rc, 0, 0, root as u32);
         debug!("result {:?}", result);
         match result {
-            Insert::Ok{mut page,off} => {
+            Result::Ok{page,off} => {
                 page.set_root(off as u16);
                 // unsafe {
                 // let ptr=page.offset(root);
                 // incr(ptr.offset(6));
                 // }
                 debug!("root set");
-                Insert::Ok {
+                Result::Ok {
                     page: page,
                     off: off,
                 }
@@ -83,7 +70,7 @@ fn insert<'a>(txn: &mut MutTxn,
 }
 
 
-// Returns None if the changes have been done in one of the children of "page", Some(Insert::Ok(..)) if "page" is a B-leaf or a B-node and we inserted something in it, and Some(Insert::Split(...)) if page was split.
+// Returns None if the changes have been done in one of the children of "page", Some(Result::Ok(..)) if "page" is a B-leaf or a B-node and we inserted something in it, and Some(Result::Split(...)) if page was split.
 fn binary_tree_insert<'a>(txn: &mut MutTxn,
                           page: Cow,
                           key: &[u8],
@@ -94,7 +81,7 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                           depth: usize,
                           path: u64,
                           current: u32)
-                          -> Insert<'a> {
+                          -> Result<'a> {
     unsafe {
         debug!("binary tree insert:{} {}", depth, path);
         let ptr = page.offset(current as isize) as *mut u32;
@@ -103,7 +90,7 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                               page: Cow,
                               side_offset: isize,
         next_path: u64|
-                              -> Insert<'a> {
+                              -> Result<'a> {
             let next = u32::from_le(*(ptr.offset(side_offset + 1)));
             if next == 0 {
                 // free branch.
@@ -120,7 +107,7 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                     *((ptr as *mut u32).offset(side_offset)) = (1 as u32).to_le();
                     *((ptr as *mut u32).offset(side_offset + 1)) = (off_ptr as u32).to_le();
                     incr((ptr as *mut u16).offset(11));
-                    Insert::Ok {
+                    Result::Ok {
                         off: rebalance(&mut page, current),
                         page: page,
                     }
@@ -139,13 +126,13 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                                                 depth + 1,
                                                 next_path,
                                                 next);
-                if let Insert::Ok{off,mut page} = result {
+                if let Result::Ok{off,mut page} = result {
                     let current = node_ptr(&page, depth, path, page.root() as u32);
                     let ptr = page.offset(current as isize);
                     *((ptr as *mut u32).offset(side_offset)) = (1 as u32).to_le();
                     *((ptr as *mut u32).offset(side_offset + 1)) = (off as u32).to_le();
                     incr((ptr as *mut u16).offset(11));
-                    Insert::Ok {
+                    Result::Ok {
                         off: rebalance(&mut page, current),
                         page: page,
                     }
@@ -184,7 +171,7 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                         *((ptr as *mut u32).offset(1)) = (off as u32).to_le();
                     }
                     incr((ptr as *mut u16).offset(11));
-                    Insert::Ok {
+                    Result::Ok {
                         off: rebalance(&mut page, current),
                         page: page,
                     }
@@ -197,13 +184,13 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                 let max_rc = std::cmp::max(max_rc, page_.rc());
                 let result = insert(txn, page_, key, value, l, r, max_rc);
                 match result {
-                    Insert::Split { key:k0,value:v0,left:l0,right:r0,free_page:fr0 } => {
+                    Result::Split { key:k0,value:v0,left:l0,right:r0,free_page:fr0 } => {
                         let size = value_record_size(k0, v0);
                         let off = page.can_alloc(size);
                         if off > 0 {
                             let mut page = page.into_mut_page(txn);
                             // page_ split, we need to insert the resulting key here.
-                            page.alloc_key_value(off, size, k0, v0, l0, r0);
+                            page.alloc_key_value(off, size, k0, v0, l0.page_offset(), r0.page_offset());
                             // Either there's room
                             let current = node_ptr(&page, depth, path, page.root() as u32);
                             let ptr = page.offset(current as isize);
@@ -218,17 +205,17 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                             incr((ptr as *mut u16).offset(11));
                             transaction::free(&mut txn.txn, fr0);
                             let bal = rebalance(&mut page, current);
-                            Insert::Ok {
+                            Result::Ok {
                                 page: page,
                                 off: bal,
                             }
                         } else {
                             // debug!("Could not find space for child pages {} {}",l0,r0);
                             // page_ was split and there is no space here to keep track of its replacement.
-                            split_and_insert(txn, &page, k0, v0, l0, r0, fr0)
+                            split_and_insert(txn, &page, k0, v0, l0.page_offset(), r0.page_offset(), fr0)
                         }
                     },
-                    Insert::Ok { page:next_page,.. } => {
+                    Result::Ok { page:next_page,.. } => {
                         let page = page.into_mut_page(txn);
                         let current = node_ptr(&page, depth, path, page.root() as u32);
                         let ptr = page.offset(current as isize);
@@ -238,8 +225,8 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
                         } else {
                             *((ptr as *mut u64)) = next_page.page_offset().to_le();
                         }
-                        Insert::Ok { page:page, off:current }
-                    }
+                        Result::Ok { page:page, off:current }
+                    },
                 }
             }
         };
@@ -284,7 +271,7 @@ fn binary_tree_insert<'a>(txn: &mut MutTxn,
     }
 }
 
-
+// Split the page given in argument, inserting k and v into one of the children, returning Result::Split with the correct parameters. fr is the page on which k and v live.
 fn split_and_insert<'a>(txn: &mut MutTxn,
                         page: &Cow,
                         k: &[u8],
@@ -292,18 +279,69 @@ fn split_and_insert<'a>(txn: &mut MutTxn,
                         l: u64,
                         r: u64,
                         fr: u64)
-                        -> Insert<'a> {
-    // fr is the page where k and v live, if they're not from a lifetime larger than self.
-
-    // page.page.free(&mut self.txn);
-    // self.debug("/tmp/before_split", 0);
-    // println!("split {:?}",page);
+                        -> Result<'a> {
     unsafe {
         debug!("split_and_insert: {:?},{:?},{:?}",
                std::str::from_utf8_unchecked(k),
                l,
                r)
     };
+    match split(txn,page) {
+        Result::Split { key,value,left,right,free_page } => {
+            unsafe {
+                debug!("split_and_insert, reinserting: {:?},{:?},{:?}",
+                       std::str::from_utf8_unchecked(k),
+                       l,
+                       r);
+            }
+            let cmp = k.cmp(key);
+            let cmp = match cmp {
+                Ordering::Less | Ordering::Greater => cmp,
+                Ordering::Equal => {
+                    let v = txn.load_value(&v);
+                    let value = txn.load_value(&value);
+                    v.contents().cmp(&value.contents())
+                }
+            };
+            match cmp {
+                Ordering::Less | Ordering::Equal => {
+                    let root = left.root();
+                    let left_page = Cow::from_mut_page(left);
+                    let result = binary_tree_insert(txn, left_page, k, v, l, r, 1, 0, 0, root as u32);
+                    if fr > 0 { unsafe { transaction::free(&mut txn.txn, fr) } }
+                    if let Result::Ok{page,off} = result {
+                        page.set_root(off as u16);
+                        Result::Split { key:key,value:value,left:page,right:right,free_page:free_page }
+                    } else {
+                        panic!("problem left: {:?}", result)
+                    }
+                }
+                _ => {
+                    let root = right.root();
+                    let right_page = Cow::from_mut_page(right);
+                    let result = binary_tree_insert(txn, right_page, k, v, l, r, 1, 0, 0, root as u32);
+                    if fr > 0 { unsafe { transaction::free(&mut txn.txn, fr) } }
+                    if let Result::Ok{page,off} = result {
+                        page.set_root(off as u16);
+                        Result::Split { key:key,value:value,left:left,right:page,free_page:free_page }
+                    } else {
+                        panic!("problem right: {:?}", result)
+                    }
+                }
+            }
+        },
+        Result::Ok{..} => unreachable!(),
+    }
+}
+
+// Split the page given in argument, inserting k and v into one of the children, returning Result::Split with the correct parameters. fr is the page on which k and v live.
+pub fn split<'a>(txn: &mut MutTxn, page: &Cow) -> Result<'a> {
+    // fr is the page where k and v live, if they're not from a lifetime larger than self.
+
+    // page.page.free(&mut self.txn);
+    // self.debug("/tmp/before_split", 0);
+    // println!("split {:?}",page);
+
     debug!("\n\nsplit page {:?} !\n", page);
     // tree traversal
     fn iter(txn: &mut MutTxn, page: &Cow, dest: &mut MutPage, current: u32) -> u16 {
@@ -402,56 +440,20 @@ fn split_and_insert<'a>(txn: &mut MutTxn,
         }
         debug!("done filling");
         let (key, value) = read_key_value(&*(ptr_root as *const u8));
-        debug!("split_and_insert, reinserting: {:?},{:?},{:?}",
-               std::str::from_utf8_unchecked(k),
-               l,
-               r);
         let left_offset = left_page.page_offset();
         let right_offset = right_page.page_offset();
 
-        let cmp = k.cmp(key);
-        let cmp = match cmp {
-            Ordering::Less | Ordering::Greater => cmp,
-            Ordering::Equal => {
-                let v = txn.load_value(&v);
-                let value = txn.load_value(&value);
-                v.contents().cmp(&value.contents())
-            }
-        };
-        match cmp {
-            Ordering::Less | Ordering::Equal => {
-                let root = left_page.root();
-                let left_page = Cow { cow: transaction::Cow::MutPage(left_page.page) };
-                let result = binary_tree_insert(txn, left_page, k, v, l, r, 1, 0, 0, root as u32);
-                if let Insert::Ok{page,off} = result {
-                    page.set_root(off as u16)
-                } else {
-                    panic!("problem left: {:?}", result)
-                }
-            }
-            _ => {
-                let root = right_page.root();
-                let right_page = Cow { cow: transaction::Cow::MutPage(right_page.page) };
-                let result = binary_tree_insert(txn, right_page, k, v, l, r, 1, 0, 0, root as u32);
-                if let Insert::Ok{page,off} = result {
-                    page.set_root(off as u16)
-                } else {
-                    panic!("problem right: {:?}", result)
-                }
-            }
-        }
-        if fr > 0 {
-            transaction::free(&mut txn.txn, fr)
-        }
-        Insert::Split {
+        Result::Split {
             key: key,
             value: value,
-            left: left_offset,
-            right: right_offset,
+            left: left_page,
+            right: right_page,
             free_page: page.page_offset(),
         }
     }
 }
+
+
 
 
 unsafe fn incr(p: *mut u16) {
@@ -461,9 +463,14 @@ unsafe fn incr(p: *mut u16) {
 pub fn put(txn: &mut MutTxn, db: Db, key: &[u8], value: &[u8]) -> Db {
     assert!(key.len() < MAX_KEY_SIZE);
     let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
-    let put_result = insert(txn, root_page, key, Value::S(value), 0, 0, 1);
+    let value = Value::S(value);
+    put_lr(txn,root_page,key,value,0,0)
+}
+
+pub fn put_lr(txn: &mut MutTxn, root_page:Cow, key: &[u8], value: Value, left:u64, right:u64) -> Db {
+    let put_result = insert(txn, root_page, key, value, left, right, 1);
     match put_result {
-        Insert::Split { key:key0,value:value0,left:l,right:r,free_page:fr } => {
+        Result::Split { key:key0,value:value0,left:l,right:r,free_page:fr } => {
             // the root page has split, we need to allocate a new one.
             let mut btree = txn.alloc_page();
             debug!("new root page:{:?}", btree);
@@ -472,13 +479,13 @@ pub fn put(txn: &mut MutTxn, db: Db, key: &[u8], value: &[u8]) -> Db {
             let size = value_record_size(key0, value0);
             let off = btree.can_alloc(size);
             debug_assert!(off > 0);
-            btree.alloc_key_value(off, size, key0, value0, l, r);
+            btree.alloc_key_value(off, size, key0, value0, l.page_offset(), r.page_offset());
             if fr > 0 {
                 unsafe { transaction::free(&mut txn.txn, fr) }
             }
             btree.set_root(off);
             Db { root: btree_off }
         }
-        Insert::Ok { page,.. } => Db { root: page.page_offset() },
+        Result::Ok { page,.. } => Db { root: page.page_offset() },
     }
 }
