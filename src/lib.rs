@@ -26,15 +26,21 @@
 //!
 //! - check that all dereferences are converted to/from little-endian. (easy)
 //!
-//! - error handling (easy)
+//! - improve error handling
 //!
-//! - delete (half-easy)
+//! - dynamic loading of pages not in the map, especially on 32-bits platforms ('transaction.rs', half-easy)
 //!
-//! - dynamic loading of pages not in the map (in file 'transaction.rs', half-easy)
+//! - deleting the last entry in a page.
 //!
-//! - several databases (hard)
+//! - merging pages (delete)
 //!
-//! - reference counting (half-easy)
+//! - making sure keys fit in cut pages (put)
+//!
+//! - reference counting, and then clone (half-easy)
+//!
+//! - B-node compaction on copy, and efficient copy when deleting.
+//!
+//! - decide whether to restrict the API to an iterator of &[u8], or keep concatenated mmaps (for very large values)
 //!
 //! # Example
 //!

@@ -175,7 +175,11 @@ fn delete<'a>(txn: &mut MutTxn,
                         let r = u64::from_le(*((ptr as *const u64).offset(1)));
                         let right_page = txn.load_cow_page(r);
                         let right_root = right_page.root();
-                        let (result,reins) = delete(txn, right_page, right_root, C::Less, 0, 0);
+                        let (result,mut reins) = delete(txn, right_page, right_root, C::Less, 0, 0);
+                        if let Some(ref mut reins)=reins {
+                            reins.left = u64::from_le(*(ptr as *const u64));
+                            reins.right = u64::from_le(*((ptr as *const u64).offset(1)));
+                        }
                         match result {
                             Result::Ok { page:right_page, off:right_off } => {
                                 //println!("{:?}", right_page);
