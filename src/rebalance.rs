@@ -37,8 +37,8 @@ pub fn tree_rotate_clockwise(page: &mut MutPage, v: u16) -> u16 {
             *(ptr_u.offset(2)) = (1 as u32).to_le();
             *(ptr_u.offset(3)) = (v as u32).to_le();
             // debug!("overflow? {} {} {}",v_size,b_size,u_size);
-            *(ptr as *mut u16).offset(11) = ((v_size + b_size) - u_size).to_le();
-            *(ptr_u as *mut u16).offset(11) = v_size.to_le();
+            //*(ptr as *mut u16).offset(11) = ((v_size + b_size) - u_size).to_le();
+            //*(ptr_u as *mut u16).offset(11) = v_size.to_le();
             //
             off_u as u16
         } else {
@@ -83,8 +83,8 @@ pub fn tree_rotate_anticlockwise(page: &mut MutPage, u: u16) -> u16 {
             // Change the left of v to u
             *ptr_v = (1 as u32).to_le();
             *(ptr_v.offset(1)) = (u as u32).to_le();
-            *(ptr as *mut u16).offset(11) = ((u_size + b_size) - v_size).to_le();
-            *(ptr_v as *mut u16).offset(11) = u_size.to_le();
+            //*(ptr as *mut u16).offset(11) = ((u_size + b_size) - v_size).to_le();
+            //*(ptr_v as *mut u16).offset(11) = u_size.to_le();
             //
             off_v as u16
         } else {
@@ -93,7 +93,7 @@ pub fn tree_rotate_anticlockwise(page: &mut MutPage, u: u16) -> u16 {
         }
     }
 }
-
+/*
 /// Rebalances a binary tree.
 pub fn rebalance(page: &mut MutPage, node: u16) -> u16 {
     debug!("rebalance");
@@ -130,3 +130,4 @@ pub fn rebalance(page: &mut MutPage, node: u16) -> u16 {
     debug!("/rebalance");
     x
 }
+*/

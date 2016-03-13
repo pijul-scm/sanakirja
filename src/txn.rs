@@ -630,7 +630,7 @@ impl MutPage {
     // - 64 bits: right, little endian. if the first 32 bits == 1, local offset, else global in bytes.
     // - 32 bits: value length, if >PAGE_SIZE/4, the value is a 64-bits offset of a page.
     // - 16 bits: key length
-    // - 16 bits: cardinal, = 1+sum of children in the same page
+    // - 16 bits: balance factor (2 LSB).
     // - value
     // - key
     // - padding for 64 bits/8 bytes alignment.
@@ -659,7 +659,7 @@ impl MutPage {
 
             let ptr = ptr as *mut u16;
             *(ptr.offset(10)) = (key.len() as u16).to_le();
-            *(ptr.offset(11)) = 1;
+            *(ptr.offset(11)) = (1 as u16).to_le();
             // +(if l!=0 { 1 } else { 0 } + if r!=0 { 1 } else { 0 } as u32).to_le(); // balance number
             // println!("alloc_key_value: copying {:?} {:?} to {:?}",key,value,ptr);
             match value {

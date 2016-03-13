@@ -14,12 +14,10 @@ enum Result {
     NotFound,
 }
 
-struct Reinsert<'a> {
-    free_page: u64,
-    key:&'a[u8],
-    value:Value<'a>,
-    left:u64,
-    right:u64
+#[derive(Debug)]
+struct Reinsert {
+    page: u64,
+    off:u16
 }
 
 // Del returns none if no page below its argument was modified.
@@ -46,7 +44,7 @@ pub fn del(txn: &mut MutTxn, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
             return db
         }
     };
-    if let Some(reinsert)=reinsert {
+    /*if let Some(reinsert)=reinsert {
         let db = put::put_lr(txn,Cow::from_mut_page(page),
                              reinsert.key,
                              reinsert.value,
@@ -58,7 +56,8 @@ pub fn del(txn: &mut MutTxn, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
         db
     } else {
         Db { root:page.page_offset() }
-    }
+    }*/
+    Db { root:page.page_offset() }
 }
 
 // The kind of comparison we want
@@ -82,9 +81,9 @@ fn delete<'a>(txn: &mut MutTxn,
               comp:C<'a>,
               path: u64,
               depth: usize)
-              -> (Result,Option<Reinsert<'a>>) {
+              -> (Result,Option<Reinsert>) {
     unsafe {
-        //println!("delete: current={:?}, {:?}",current, comp);
+        println!("delete: current={:?}, {:?}",current, comp);
         let ptr = page.offset(current as isize) as *mut u32;
         let cmp = match comp {
             C::Eq => Ordering::Equal,
@@ -94,10 +93,10 @@ fn delete<'a>(txn: &mut MutTxn,
                 let value_ = value_.contents();
                 let value0_ = txn.load_value(&value0);
                 let value0_ = value0_.contents();
-                /*println!("delete: current={:?}, key={:?}, value={:?}",current,
+                println!("delete: current={:?}, key={:?}, value={:?}",current,
                          std::str::from_utf8_unchecked(key0),
                          std::str::from_utf8_unchecked(value0_)
-                );*/
+                );
                 (key, value_).cmp(&(key0, value0_))
             },
             C::Less => {
@@ -124,23 +123,19 @@ fn delete<'a>(txn: &mut MutTxn,
 
 
                 let reins =
-                    if comp.is_less() && (left0 <= 1 && left1 == 0) || (right0<=1 && right1 == 0) {
-                        let (key0, value0) = read_key_value(&*(ptr as *const u8));
+                    if comp.is_less() && (left0 <= 1 && left1 == 0) {
+                        //let (key0, value0) = read_key_value(&*(ptr as *const u8));
                         Some(Reinsert {
-                            free_page: if let Some(p) = free { p.page_offset() } else { 0 },
-                            key: key0,
-                            value: value0,
-                            left: 0,
-                            right:0
+                            page: page.page_offset(), off: off
                         })
                     } else {
                         None
                     };
                 if left0 <= 1 && left1 == 0 {
-                    //println!("deleting, left");
+                    println!("deleting, left");
                     //println!("{:?}", page);
                     if right0<=1 && right1 == 0 {
-                        // Else, delete the current page and update its parent.
+                        // Else, delete the current node and update its parent.
                         (Result::Ok { page: page,
                                       off: 0 },
                          reins)
@@ -151,7 +146,7 @@ fn delete<'a>(txn: &mut MutTxn,
                         //free_page: if let Some(p) = free { p.page_offset() } else { 0 } }, None)
                     }
                 } else if right0<=1 && right1==0 {
-                    //println!("deleting, right");
+                    println!("deleting, right");
                     //println!("{:?}", page);
                     (Result::Ok { page: page,
                                   off: left1 as u16 },
@@ -176,10 +171,11 @@ fn delete<'a>(txn: &mut MutTxn,
                         let right_page = txn.load_cow_page(r);
                         let right_root = right_page.root();
                         let (result,mut reins) = delete(txn, right_page, right_root, C::Less, 0, 0);
-                        if let Some(ref mut reins)=reins {
-                            reins.left = u64::from_le(*(ptr as *const u64));
-                            reins.right = u64::from_le(*((ptr as *const u64).offset(1)));
-                        }
+                        let reins = if comp.is_less() {
+                            reins
+                        } else {
+                            unimplemented!()
+                        };
                         match result {
                             Result::Ok { page:right_page, off:right_off } => {
                                 //println!("{:?}", right_page);
@@ -190,51 +186,52 @@ fn delete<'a>(txn: &mut MutTxn,
                             Result::NotFound => unreachable!()
                         }
                     } else {
-                        // Both children are taken, at least one is not a page. Rotate.
-                        //println!("rotating");
-                        let ((result,reins),root) =
-                            if right0==1 {
-                                let root = tree_rotate_anticlockwise(&mut page, off);
-                                (delete(txn,
-                                        Cow::from_mut_page(page),
-                                        off,
-                                        C::Eq,
-                                        path,
-                                        depth + 1),root)
-                            } else {
-                                let root = tree_rotate_clockwise(&mut page, off);
-                                (delete(txn,
-                                        Cow::from_mut_page(page),
-                                        off,
-                                        C::Eq,
-                                        path | (1<<depth),
-                                        depth + 1), root)
-                            };
-                        match result {
-                            Result::Ok { mut page, off } => {
-                                //println!("rotated, off={:?}",off);
-                                let ptr = page.offset(root as isize) as *mut u32;
-                                *((ptr as *mut u16).offset(11)) = (u16::from_le(*((ptr as *mut u16).offset(11))) - 1).to_le();
-                                if right0==1 {
-                                    if off==0 {
-                                        *(ptr as *mut u64) = 0;
-                                    } else {
-                                        *(ptr.offset(0)) = 1;
-                                        *(ptr.offset(1)) = (off as u32).to_le();
-                                    }
+                        // Both children are taken, at least one is not a page.
+                        // Take the smallest element of the right child.
+                        let (result,reins) = delete(txn, Cow::from_mut_page(page), right1 as u16, C::Less, path|(1<<depth), depth+1);
+                        if let (Result::Ok { page:page, off:right_off },Some(reins)) = (result,reins) {
+                            // reins is the smallest element of the right child.
+                            println!("reins: {:?}",reins);
+                            if comp.is_less() {
+                                // If we're currently looking for the smallest descendant, just forward up.
+                                let ptr_off = node_ptr(&page,depth,path,page.root() as u32);
+                                let ptr = page.offset(ptr_off as isize) as *mut u32;
+                                if right_off == 0 {
+                                    *((ptr as *mut u64).offset(1)) = 0;
                                 } else {
-                                    if off==0 {
-                                        *((ptr as *mut u64).offset(1)) = 0;
-                                    } else {
-                                        *(ptr.offset(2)) = 1;
-                                        *(ptr.offset(3)) = (off as u32).to_le();
-                                    }
+                                    *((ptr as *mut u32).offset(2)) = (1 as u32).to_le();
+                                    *((ptr as *mut u32).offset(3)) = (right_off as u32).to_le();
                                 }
-                                //let root = rebalance(&mut page,root);
-                                (Result::Ok { page: page, off: root }, reins)
+                                (Result::Ok { page:page, off:ptr_off }, Some(reins))
+                            } else {
+                                // Else, two cases: either the smallest descendant is on the same page as ptr, or not.
+                                // - If it is, set its children to be the current node's children, and return it.
+                                // - Else, allocate a new node, set its children to the current node's children, and return it.
+                                (if reins.page == page.page_offset() {
+                                    let p = page.offset(reins.off as isize) as *mut u64;
+                                    *p = *(ptr as *const u64);
+                                    if right_off>0 {
+                                        *((p as *mut u32).offset(2)) = (1 as u32).to_le();
+                                        *((p as *mut u32).offset(3)) = (right_off as u32).to_le();
+                                    } else {
+                                        *(p.offset(1)) = 0
+                                    }
+                                    Result::Ok { page:page, off:reins.off }
+                                } else {
+                                    unimplemented!()
+                                }, None)
+                            }
+                        } else {
+                            unreachable!()
+                        }
+                        /*
+                        match result {
+                                println!("{:?} {:?}", page, right_off);
+                                //right_page.set_root(right_off);
                             },
                             Result::NotFound => unreachable!()
                         }
+                         */
                     }
                 }
             },
@@ -250,7 +247,7 @@ fn delete<'a>(txn: &mut MutTxn,
                                 //println!("less returned {:?}", off);
                                 let ptr_off = node_ptr(&page,depth,path,page.root() as u32);
                                 let ptr = page.offset(ptr_off as isize) as *mut u32;
-                                *((ptr as *mut u16).offset(11)) = (u16::from_le(*((ptr as *mut u16).offset(11))) - 1).to_le();
+                                //*((ptr as *mut u16).offset(11)) = (u16::from_le(*((ptr as *mut u16).offset(11))) - 1).to_le();
                                 if off == 0 {
                                     *(ptr as *mut u64) = 0;
                                 } else {
@@ -299,7 +296,7 @@ fn delete<'a>(txn: &mut MutTxn,
                                 //println!("greater returned {:?}", off);
                                 let ptr_off = node_ptr(&page,depth,path,page.root() as u32);
                                 let ptr = page.offset(ptr_off as isize) as *mut u32;
-                                *((ptr as *mut u16).offset(11)) = (u16::from_le(*((ptr as *mut u16).offset(11))) - 1).to_le();
+                                //*((ptr as *mut u16).offset(11)) = (u16::from_le(*((ptr as *mut u16).offset(11))) - 1).to_le();
                                 if off == 0 {
                                     *((ptr as *mut u64).offset(1)) = 0;
                                 } else {
@@ -340,45 +337,3 @@ fn delete<'a>(txn: &mut MutTxn,
         }
     }
 }
-
-// Removes and returns the maximal or minimal child from a tree, returning the updated page and the key/value
-// fn take_maximal_child(txn: &mut MutTxn,
-// page: Cow,
-// current: u32,
-// direction: bool) {
-// unsafe {
-// let ptr = page.offset(current as isize) as *mut u32;
-// if direction {
-// go right
-// let right0 = u32::from_le(*(ptr.offset(2)));
-// if right0==1 {
-// let right1 = u32::from_le(*(ptr.offset(3)));
-// if right1 == 0 {
-// See explanation for left node.
-// unimplemented!()
-// } else {
-// maximal_child(txn,page,right1,direction)
-// }
-// } else {
-// unimplemented!()
-// }
-// } else {
-// go left
-// let left0 = u32::from_le(*ptr);
-// if left0==1 {
-// let left1 = u32::from_le(*(ptr.offset(1)));
-// if left1 == 0 {
-// No left child, this is the smallest node.
-// However, it might have a right child.
-// Return this node, and update its parent to its right node.
-// unimplemented!()
-// } else {
-// maximal_child(txn,page,left1,direction)
-// }
-// } else {
-// unimplemented!()
-// }
-// }
-// }
-// }
-//
