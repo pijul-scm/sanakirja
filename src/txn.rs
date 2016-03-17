@@ -832,8 +832,9 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
             let value = std::str::from_utf8_unchecked(value);
             // println!("key,value={:?},{:?}",key,value);
             writeln!(buf,
-                     "n_{}_{}[label=\"{}, '{}'->'{}'\"];",
+                     "n_{}_{}[label=\"{}: {}, '{}'->'{}'\"];",
                      p.page.offset,
+                     off,
                      off,
                      count,
                      key,
