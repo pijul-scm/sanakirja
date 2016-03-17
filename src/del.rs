@@ -1,4 +1,6 @@
 use super::txn::*;
+use super::put;
+use super::transaction;
 use std;
 use super::rebalance::*;
 use std::cmp::Ordering;
@@ -16,7 +18,9 @@ enum Result {
 #[derive(Debug)]
 struct Reinsert {
     page: u64,
-    off:u16
+    off:u16,
+    left:u64,
+    right:u64
 }
 
 // Del returns none if no page below its argument was modified.
@@ -43,20 +47,27 @@ pub fn del(txn: &mut MutTxn, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
             return db
         }
     };
-    /*if let Some(reinsert)=reinsert {
-        let db = put::put_lr(txn,Cow::from_mut_page(page),
-                             reinsert.key,
-                             reinsert.value,
-                             reinsert.left,
-                             reinsert.right);
-        if reinsert.free_page>0 {
-            unsafe { transaction::free(&mut txn.txn, reinsert.free_page) }
+    if let Some(reinsert)=reinsert {
+        unsafe {
+
+            let reins_page = txn.load_cow_page(reinsert.page);
+            let reins_page = reins_page.into_mut_page(txn);
+            let ptr = reins_page.offset(reinsert.off as isize) as *mut u32;
+            let (key, value) = read_key_value(&*(ptr as *const u8));
+            let db = put::put_lr(txn,Cow::from_mut_page(page),
+                                 key,
+                                 value,
+                                 reinsert.left,
+                                 reinsert.right);
+            // Done copying the value, we can safely free its page.
+            if reinsert.page>0 {
+                transaction::free(&mut txn.txn, reinsert.page)
+            }
+            db
         }
-        db
     } else {
         Db { root:page.page_offset() }
-    }*/
-    Db { root:page.page_offset() }
+    }
 }
 
 // The kind of comparison we want
@@ -73,6 +84,14 @@ impl<'a> C<'a> {
         }
     }
 }
+
+
+/// The mechanics is non-trivial here. Sometimes during deletion, it
+/// might happen that we need to delete a key whose children are both
+/// other pages. In such a case, we might need to rebalance the B-tree
+/// by splitting or merging pages. Since most of the mechanics needed
+/// to do that is already written in put, we simply return arguments
+/// for put in an option, when this happens.
 fn delete<'a>(txn: &mut MutTxn,
               page: Cow,
               current: u16,
@@ -123,7 +142,7 @@ fn delete<'a>(txn: &mut MutTxn,
                     if comp.is_less() && (left0 <= 1 && left1 == 0) {
                         //let (key0, value0) = read_key_value(&*(ptr as *const u8));
                         Some(Reinsert {
-                            page: page.page_offset(), off: off
+                            page: page.page_offset(), off: off, left:0, right:0
                         })
                     } else {
                         None
@@ -170,17 +189,27 @@ fn delete<'a>(txn: &mut MutTxn,
                         let r = u64::from_le(*((ptr as *const u64).offset(1)));
                         let right_page = txn.load_cow_page(r);
                         let right_root = right_page.root();
-                        let (result,reins) = delete(txn, right_page, right_root, C::Less, 0, 0);
+                        let (result,mut reins) = delete(txn, right_page, right_root, C::Less, 0, 0);
                         let reins = if comp.is_less() {
                             reins
                         } else {
-                            unimplemented!()
+                            println!("reins: {:?}",reins);
+                            if let Some(ref mut reins) = reins {
+                                let l = u64::from_le(*(ptr as *const u64));
+                                reins.left = l;
+                                reins.right = r;
+                                *(ptr as *mut u64) = 0;
+                                *((ptr as *mut u64).offset(1)) = 0;
+                            }
+                            reins
                         };
                         match result {
                             Result::Ok { page:right_page, off:right_off, .. } => {
                                 //println!("{:?}", right_page);
                                 right_page.set_root(right_off);
-                                *((ptr as *mut u64).offset(1)) = right_page.page_offset().to_le();
+                                if *((ptr as *mut u64).offset(1)) != 0 {
+                                    *((ptr as *mut u64).offset(1)) = right_page.page_offset().to_le();
+                                }
                                 (Result::Ok { page:page, off:0, decr:false }, reins)
                             },
                             Result::NotFound => unreachable!()
