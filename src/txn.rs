@@ -10,6 +10,8 @@ use std::io::BufWriter;
 use std::collections::HashSet;
 use std::ptr::copy_nonoverlapping;
 use std::io::Write;
+use std::marker::PhantomData;
+use std::fmt;
 
 pub const MAX_KEY_SIZE: usize = PAGE_SIZE >> 2;
 pub const VALUE_SIZE_THRESHOLD: usize = PAGE_SIZE >> 2;
@@ -51,91 +53,113 @@ impl<'env> Txn<'env> {
         debug(self, db, p)
     }
 }
-#[derive(Debug,Clone,Copy)]
-pub enum Value<'a> {
-    S(&'a [u8]),
-    O {
-        offset: u64,
-        len: u32,
-    },
+#[derive(Clone,Copy)]
+pub enum UnsafeValue {
+    S { p:*const u8,
+        len:u32 },
+    O { offset: u64,
+        len: u32 }
 }
 
-impl<'a> Value<'a> {
-    pub fn len(&self) -> u32 {
-        match self {
-            &Value::S(s) => s.len() as u32,
-            &Value::O{len,..} => len,
+pub struct Value<'a,T:'a> {
+    pub txn:&'a T,
+    pub value:UnsafeValue
+}
+impl <'a,T:LoadPage>fmt::Debug for Value<'a,T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let it = Value { txn:self.txn, value:self.value.clone() };
+        try!(write!(f,"Value {{ value: ["));
+        let mut first = true;
+        for x in it {
+            if !first {
+                try!(write!(f, ", {:?}", x))
+            } else {
+                try!(write!(f, "{:?}", x));
+                first = false;
+            }
         }
-    }
-    pub fn as_slice(&self) -> &'a [u8] {
-        match self {
-            &Value::S(ref s) => s,
-            &Value::O{..} => unimplemented!(),
-        }
+        try!(write!(f,"] }}"));
+        Ok(())
     }
 }
-
-
-pub fn alloc_value<'a>(txn:&mut MutTxn, value: Value<'a>) -> Value<'a> {
-    match value {
-        Value::S(s) if s.len() < VALUE_SIZE_THRESHOLD => value,
-        Value::O{..} => value,
-        Value::S(s) => {
-            fn alloc_pages(txn:&mut MutTxn, value: &[u8]) -> u64 {
-                unsafe {
-                    // n*PAGE_SIZE - 8 * n
-                    let actual_page_size = PAGE_SIZE - 8;
-
-                    let n = value.len() / actual_page_size;
-                    let n = if n * actual_page_size < value.len() {
-                        n + 1
-                    } else {
-                        n
-                    };
-                    assert!(8 * (n + 1) < PAGE_SIZE);
-
-                    let first_page = txn.alloc_page();
-                    let mut page_ptr = first_page.data() as *mut u64;
-
-                    let copyable_len = if value.len() < PAGE_SIZE - 8 * n {
-                        value.len()
-                    } else {
-                        PAGE_SIZE - 8 * n
-                    };
-                    copy_nonoverlapping(value.as_ptr(),
-                                        (first_page.data() as *mut u8).offset(8 * n as isize),
-                                        copyable_len);
-                    let mut value_offset = copyable_len;
-
-                    let mut total_length = PAGE_SIZE;
-
-                    while total_length < 8 * n + value.len() {
-                        let page = txn.alloc_page();
-                        *page_ptr = page.page_offset().to_le();
-                        page_ptr = page_ptr.offset(1);
-
-                        let copyable_len = if value.len() - value_offset < PAGE_SIZE {
-                            value.len() - value_offset
+impl <'a,T:LoadPage> Iterator for Value<'a,T> {
+    type Item = &'a [u8];
+    fn next(&mut self)->Option<&'a [u8]> {
+        match self.value {
+            UnsafeValue::O { ref mut offset, ref mut len } => {
+                if *len == 0 {
+                    None
+                } else {
+                    unsafe {
+                        let page = self.txn.load_page(*offset).offset(0);
+                        let first = u64::from_le(*(page as *const u64));
+                        *offset = first;
+                        if first != 0 {
+                            *len -= (PAGE_SIZE-8) as u32;
+                            Some(std::slice::from_raw_parts(page, PAGE_SIZE-8))
                         } else {
-                            PAGE_SIZE
-                        };
-                        copy_nonoverlapping(value.as_ptr().offset(value_offset as isize),
-                                            page.data() as *mut u8,
-                                            copyable_len);
-                        value_offset += copyable_len;
-                        total_length += PAGE_SIZE
+                            Some(std::slice::from_raw_parts(page, *len as usize))
+                        }
                     }
-                    *page_ptr = 0;
-                    first_page.page_offset()
+                }
+            },
+            UnsafeValue::S{ref mut p,ref mut len} => {
+                if (*p).is_null() {
+                    None
+                } else {
+                    let pp = *p;
+                    *p = std::ptr::null_mut();
+                    Some(unsafe {
+                        std::slice::from_raw_parts(pp,*len as usize)
+                    })
                 }
             }
-            let off = alloc_pages(txn,s);
-            Value::O {
-                offset: off,
-                len: s.len() as u32,
+        }
+    }
+}
+
+
+impl UnsafeValue {
+    pub fn len(&self) -> u32 {
+        match self {
+            &UnsafeValue::S{len,..} => len,
+            &UnsafeValue::O{len,..} => len,
+        }
+    }
+}
+impl<'a,T> Value<'a,T> {
+    pub fn len(&self) -> u32 {
+        self.value.len()
+    }
+}
+
+pub fn alloc_value(txn:&mut MutTxn, value: &[u8]) -> UnsafeValue {
+    let mut len = value.len();
+    let mut p_value = value.as_ptr();
+    let mut ptr = std::ptr::null_mut();
+    let mut first_page = 0;
+    unsafe {
+        while len > 0 {
+            let page = txn.alloc_page();
+            if !ptr.is_null() {
+                *(ptr as *mut u64) = page.page_offset()
+            } else {
+                first_page = page.page_offset();
+            }
+            ptr = page.data() as *mut u64;
+            *(ptr as *mut u64) = 0;
+            if len > PAGE_SIZE-8 {
+                copy_nonoverlapping(p_value, (ptr as *mut u64).offset(1) as *mut u8, PAGE_SIZE-8);
+                len -= PAGE_SIZE - 8;
+                p_value.offset(PAGE_SIZE as isize-8);
+            } else {
+                copy_nonoverlapping(p_value, (ptr as *mut u64).offset(1) as *mut u8, len);
+                len = 0;
             }
         }
     }
+    debug_assert!(first_page > 0);
+    UnsafeValue::O { offset: first_page, len: value.len() as u32 }
 }
 
 
@@ -161,131 +185,68 @@ pub struct Page {
 }
 
 
-pub enum Loaded<'a> {
-    Map {
-        map: *mut u8,
-        len: u64,
-        contents: &'a [u8],
-    },
-    S(&'a [u8]),
-}
 
-impl<'a> Loaded<'a> {
-    pub fn contents(&self) -> &'a [u8] {
-        match self {
-            &Loaded::S(s) => s,
-            &Loaded::Map{contents,..} => contents,
-        }
-    }
-    pub fn len(&self) -> usize {
-        match self {
-            &Loaded::S(s) => s.len(),
-            &Loaded::Map{contents,..} => contents.len(),
-        }
-    }
-}
-
-impl<'a> Drop for Loaded<'a> {
-    fn drop(&mut self) {
-        match self {
-            &mut Loaded::Map{map,len,..} => unsafe { memmap::munmap(map, len) },
-            _ => {}
-        }
-    }
-}
-
-pub fn read_key_value<'a>(p: &'a u8) -> (&'a [u8], Value) {
-    unsafe {
-        let p32 = p as *const u8 as *const u32;
-        let key_len = u16::from_le(*(p32.offset(5) as *const u16));
-        let val_len = u32::from_le(*(p32.offset(4)));
-        if (val_len as usize) < VALUE_SIZE_THRESHOLD {
-            (std::slice::from_raw_parts((p as *const u8).offset(24 + val_len as isize),
-                                        key_len as usize),
-             Value::S(std::slice::from_raw_parts((p as *const u8).offset(24), val_len as usize)))
-        } else {
-            (std::slice::from_raw_parts((p as *const u8).offset(32), key_len as usize),
-             {
-                let offset = u64::from_le(*((p32 as *const u64).offset(3)));
-                Value::O {
-                    offset: offset,
-                    len: val_len,
-                }
-            })
-        }
-    }
-}
-
-
-pub trait LoadPage {
+pub trait LoadPage:Sized {
     fn fd(&self) -> c_int;
     fn length(&self) -> u64;
     fn root_db_(&self) -> Db;
     fn open_db_<'a>(&'a self, key: &[u8]) -> Option<Db> {
         let db = self.get_(&self.root_db_(), key, None);
-        if let Some(Value::S(db)) = db {
-            unsafe { Some(Db { root: u64::from_le(*(db.as_ptr() as *const u64)) }) }
+        if let Some(UnsafeValue::S{p,..}) = db {
+            unsafe { Some(Db { root: u64::from_le(*(p as *const u64)) }) }
         } else {
             None
         }
     }
 
 
-    fn load_page(&self, off: u64) -> Page;
-    fn load_value<'a>(&self, value: &Value<'a>) -> Loaded<'a> {
-        match *value {
-            Value::S(s) => Loaded::S(s),
-            Value::O{offset,len,..} => unsafe {
-                debug!("load_value {:?}", value);
-                let page = memmap::mmap(self.fd(), None, offset, PAGE_SIZE_64);
-                let mut total = PAGE_SIZE as isize;
-                let mut cur = page as *const u64;
-                debug!("pages, cur:{:?}", cur);
-                while *cur != 0 {
-                    debug!("page:{:?}, cur:{:?} {:?}", page, *cur, total);
-                    let result = memmap::mmap(self.fd(),
-                                              Some(page.offset(total)),
-                                              *cur,
-                                              PAGE_SIZE_64);
-                    debug!("result={:?}, asked {:?}", result, page.offset(total));
-                    assert!(result == page.offset(total));
-                    total += PAGE_SIZE as isize;
-                    cur = cur.offset(1)
-                }
-                Loaded::Map {
-                    map: page,
-                    len: total as u64,
-                    contents: std::slice::from_raw_parts(cur.offset(1) as *const u8, len as usize),
-                }
-            },
+    unsafe fn read_key_value<'a>(&'a self, p: *const u8) -> (&'a [u8], UnsafeValue) {
+        let p32 = p as *const u8 as *const u32;
+        let key_len = u16::from_le(*(p32.offset(5) as *const u16));
+        let val_len = u32::from_le(*(p32.offset(4)));
+        if (val_len as usize) < VALUE_SIZE_THRESHOLD {
+            (std::slice::from_raw_parts((p as *const u8).offset(24 + val_len as isize),
+                                        key_len as usize),
+             UnsafeValue::S { p:(p as *const u8).offset(24), len:val_len })
+        } else {
+            (std::slice::from_raw_parts((p as *const u8).offset(32), key_len as usize),
+             {
+                 let offset = u64::from_le(*((p32 as *const u64).offset(3)));
+                 UnsafeValue::O {
+                     offset: offset,
+                     len: val_len,
+                 }
+             })
         }
     }
-    fn get_<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a>> {
+
+    fn load_page(&self, off: u64) -> Page;
+
+    fn get_<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<UnsafeValue> {
         debug!("db.root={:?}",db.root);
         let root_page = self.load_page(db.root);
         self.binary_tree_get(&root_page, key, value, root_page.root() as u32)
     }
 
-    // non tail-rec version
-    fn binary_tree_get<'a>(&self,
+    fn binary_tree_get<'a>(&'a self,
                            page: &Page,
                            key: &[u8],
                            value: Option<&[u8]>,
                            current: u32)
-                           -> Option<Value<'a>> {
+                           -> Option<UnsafeValue> {
         unsafe {
             //println!("binary_tree_get:{:?}", page);
             let ptr = page.offset(current as isize) as *mut u32;
-
-            let (key0, value0) = read_key_value(&*(ptr as *const u8));
+            
+            let (key0, value0) = self.read_key_value(ptr as *const u8);
             /*println!("binary_tree_get:{:?}, {:?}",
             std::str::from_utf8_unchecked(key),
             std::str::from_utf8_unchecked(key0));*/
             let cmp = if let Some(value_) = value {
                 let cmp = key.cmp(&key0);
                 if cmp == Ordering::Equal {
-                    let value0 = self.load_value(&value0);
-                    value_.cmp(value0.contents())
+                    let value = UnsafeValue::S { p:value_.as_ptr(), len:value_.len() as u32 };
+                    Value { txn:self,value:value }.cmp(Value { txn:self,value:value0 })
                 } else {
                     cmp
                 }
@@ -352,7 +313,7 @@ pub trait LoadPage {
 
 
 
-    fn tree_iterate<'a, F: Fn(&'a [u8], &'a [u8]) -> bool + Copy>(&'a self,
+    fn tree_iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool + Copy>(&'a self,
                                                                   page: &Page,
                                                                   key: &[u8],
                                                                   value: Option<&[u8]>,
@@ -365,15 +326,14 @@ pub trait LoadPage {
             let ptr = page.offset(current as isize) as *mut u32;
 
             let value_ = value.unwrap_or(b"");
-            let (key0, value0) = read_key_value(&*(ptr as *const u8));
-            let mut value0_loaded = None;
+            let (key0, value0) = self.read_key_value(ptr as *const u8);
             let cmp = {
                 let cmp = key.cmp(&key0);
                 if cmp == Ordering::Equal {
                     if let Some(value) = value {
-                        value0_loaded = Some(self.load_value(&value0));
-                        let cont = value0_loaded.as_ref().unwrap();
-                        value.cmp(cont.contents())
+                        let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
+                        Value { txn:self,value:value }.cmp(Value { txn:self,value:value0 })
+                            //value.cmp(value0.clone())
                     } else {
                         cmp
                     }
@@ -381,12 +341,6 @@ pub trait LoadPage {
                     cmp
                 }
             };
-            debug!("({:?},{:?}), {:?}, ({:?},{:?})",
-                   std::str::from_utf8_unchecked(key),
-                   std::str::from_utf8_unchecked(value_),
-                   cmp,
-                   std::str::from_utf8_unchecked(key0),
-                   std::str::from_utf8_unchecked(self.load_value(&value0).contents()));
 
             // If we've already started iterating, or else if the key can be found on our left.
             let result_left = if started ||
@@ -415,22 +369,12 @@ pub trait LoadPage {
                 };
                 match result {
                     Some(true) => {
-                        let value0 = if let Some(value0) = value0_loaded {
-                            value0
-                        } else {
-                            value0_loaded = Some(self.load_value(&value0));
-                            value0_loaded.unwrap()
-                        };
-                        Some(f(key0, value0.contents()))
+                        let value0 = Value { txn:self,value:value0 };
+                        Some(f(key0, value0))
                     }
                     None if cmp == Ordering::Equal => {
-                        let value0 = if let Some(value0) = value0_loaded {
-                            value0
-                        } else {
-                            value0_loaded = Some(self.load_value(&value0));
-                            value0_loaded.unwrap()
-                        };
-                        Some(f(key0, value0.contents()))
+                        let value0 = Value { txn:self,value:value0 };
+                        Some(f(key0, value0))
                     }
                     _ => result, // we've stopped already
                 }
@@ -604,6 +548,7 @@ impl P for MutPage {
 
 impl MutPage {
     pub fn init(&mut self) {
+        debug!("mut page init: {:?}",self);
         unsafe {
             std::ptr::write_bytes(self.page.data as *mut u8, 0, 16);
             self.incr_rc()
@@ -639,8 +584,9 @@ impl MutPage {
     pub fn alloc_key_value(&mut self,
                            off_ptr: u16,
                            size: u16,
-                           key: &[u8],
-                           value: Value,
+                           key_ptr:*const u8,
+                           key_len:usize,
+                           value: UnsafeValue,
                            l: u64,
                            r: u64) {
         unsafe {
@@ -658,22 +604,22 @@ impl MutPage {
             *(ptr.offset(4)) = (value.len() as u32).to_le();
 
             let ptr = ptr as *mut u16;
-            *(ptr.offset(10)) = (key.len() as u16).to_le();
+            *(ptr.offset(10)) = (key_len as u16).to_le();
             *(ptr.offset(11)) = (1 as u16).to_le();
             // +(if l!=0 { 1 } else { 0 } + if r!=0 { 1 } else { 0 } as u32).to_le(); // balance number
             // println!("alloc_key_value: copying {:?} {:?} to {:?}",key,value,ptr);
             match value {
-                Value::S(value) => {
+                UnsafeValue::S{p,len} => {
                     let ptr = ptr as *mut u8;
                     let ptr = ptr.offset(24);
-                    copy_nonoverlapping(value.as_ptr(), ptr, value.len());
-                    copy_nonoverlapping(key.as_ptr(), ptr.offset(value.len() as isize), key.len());
+                    copy_nonoverlapping(p, ptr, len as usize);
+                    copy_nonoverlapping(key_ptr, ptr.offset(len as isize), key_len);
                 }
-                Value::O{offset,..} => {
+                UnsafeValue::O{offset,..} => {
                     debug_assert!(offset != 0);
                     *((ptr as *mut u64).offset(3)) = offset.to_le();
                     let ptr = ptr as *mut u8;
-                    copy_nonoverlapping(key.as_ptr(), ptr.offset(32), key.len());
+                    copy_nonoverlapping(key_ptr, ptr.offset(32), key_len);
                 }
             }
         }
@@ -818,16 +764,17 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
             // println!("print tree:{:?}",off);
             let ptr = p.offset(off as isize) as *const u32;
             let count = u16::from_le(*(ptr as *const u16).offset(11));
-            let (key, value) = read_key_value(&*(ptr as *const u8));
+            let (key, mut value) = txn.read_key_value(ptr as *const u8);
             let key = std::str::from_utf8_unchecked(key);
-            let value = txn.load_value(&value);
             let mut value_ = Vec::new();
+            let mut value = Value { txn:txn,value:value };
             let value = if value.len() > 20 {
-                value_.extend(&(value.contents())[0..20]);
+                let contents = value.next().unwrap();
+                value_.extend(&contents[0..20]);
                 value_.extend(b"...");
                 &value_[..]
             } else {
-                value.contents()
+                value.next().unwrap()
             };
             let value = std::str::from_utf8_unchecked(value);
             // println!("key,value={:?},{:?}",key,value);
@@ -928,14 +875,14 @@ pub unsafe fn node_ptr(page: &MutPage,
     }
     current as u16
 }
-pub fn value_record_size(key: &[u8], value: Value) -> u16 {
+pub fn value_record_size(key: usize, value: UnsafeValue) -> u16 {
     match value {
-        Value::S(s) if s.len() < VALUE_SIZE_THRESHOLD => {
-            let size = 28 + key.len() as u16 + value.len() as u16;
+        UnsafeValue::S { p,len,.. } if len < (VALUE_SIZE_THRESHOLD as u32) => {
+            let size = 28 + key as u16 + len as u16;
             size + ((8 - (size & 7)) & 7)
         }
-        Value::S(_) | Value::O{..} => {
-            let size = 28 + key.len() as u16 + 8;
+        UnsafeValue::S{..} | UnsafeValue::O{..} => {
+            let size = 28 + key as u16 + 8;
             size + ((8 - (size & 7)) & 7)
         }
     }

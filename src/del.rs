@@ -12,7 +12,7 @@ enum Result {
         off: u16,
         decr: bool
     },
-    NotFound,
+    NotFound
 }
 
 #[derive(Debug)]
@@ -29,19 +29,14 @@ struct Reinsert {
 pub fn del(txn: &mut MutTxn, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
     let page = txn.load_cow_page(db.root);
     let current = page.root();
-    let value = Value::S(value.unwrap());
-    let (result,reinsert)=delete(txn, page, current, C::KV { key:key, value:value }, 0, 0);
+    let value = value.unwrap();
+    let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
+    let (result,reinsert)=delete(txn, page, current, C::KV { key_ptr:key.as_ptr(), key_len:key.len(), value:value }, 0, 0);
     let page = match result {
         Result::Ok{page,off,..} => {
-            //panic!("Free not implemented");
-            if off == 0 {
-                // the page was deleted
-                unimplemented!()
-            } else {
-                //let off = rebalance(&mut page,off);
-                page.set_root(off);
-                page
-            }
+            // Maybe off==0, but every database needs to have at least one page.
+            page.set_root(off);
+            page
         },
         Result::NotFound => {
             return db
@@ -53,9 +48,13 @@ pub fn del(txn: &mut MutTxn, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
             let reins_page = txn.load_cow_page(reinsert.page);
             let reins_page = reins_page.into_mut_page(txn);
             let ptr = reins_page.offset(reinsert.off as isize) as *mut u32;
-            let (key, value) = read_key_value(&*(ptr as *const u8));
+            let (key_ptr,key_len,value) = {
+                let (key, value) = txn.read_key_value(ptr as *const u8);
+                (key.as_ptr(),key.len(),value)
+            };
             let db = put::put_lr(txn,Cow::from_mut_page(page),
-                                 key,
+                                 key.as_ptr(),
+                                 key.len(),
                                  value,
                                  reinsert.left,
                                  reinsert.right);
@@ -71,12 +70,11 @@ pub fn del(txn: &mut MutTxn, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
 }
 
 // The kind of comparison we want
-#[derive(Debug,Clone,Copy)]
-enum C<'a> {
-    KV { key:&'a[u8], value:Value<'a> },
+enum C {
+    KV { key_ptr:*const u8, key_len:usize, value:UnsafeValue },
     Less
 }
-impl<'a> C<'a> {
+impl C {
     fn is_less(&self)->bool {
         match self {
             &C::Less => true,
@@ -92,28 +90,24 @@ impl<'a> C<'a> {
 /// by splitting or merging pages. Since most of the mechanics needed
 /// to do that is already written in put, we simply return arguments
 /// for put in an option, when this happens.
-fn delete<'a>(txn: &mut MutTxn,
-              page: Cow,
-              current: u16,
-              comp:C<'a>,
-              path: u64,
-              depth: usize)
-              -> (Result,Option<Reinsert>) {
+fn delete(txn: & mut MutTxn,
+          page: Cow,
+          current: u16,
+          comp:C,
+          path: u64,
+          depth: usize)
+          -> (Result,Option<Reinsert>) {
     unsafe {
-        println!("delete: current={:?}, {:?}",current, comp);
         let ptr = page.offset(current as isize) as *mut u32;
         let cmp = match comp {
-            C::KV { key,value } => {
-                let (key0, value0) = read_key_value(&*(ptr as *const u8));
-                let value_ = txn.load_value(&value);
-                let value_ = value_.contents();
-                let value0_ = txn.load_value(&value0);
-                let value0_ = value0_.contents();
-                println!("delete: current={:?}, key={:?}, value={:?}",current,
-                         std::str::from_utf8_unchecked(key0),
-                         std::str::from_utf8_unchecked(value0_)
-                );
-                (key, value_).cmp(&(key0, value0_))
+            C::KV { key_ptr, key_len, value } => {
+                let (key0, value0) = txn.read_key_value(ptr as *const u8);
+                match std::slice::from_raw_parts(key_ptr,key_len).cmp(key0) {
+                    Ordering::Equal => {
+                        Value{txn:txn,value:value}.cmp(Value{txn:txn,value:value0})
+                    },
+                    c => c
+                }
             },
             C::Less => {
                 let left0 = u32::from_le(*ptr);
@@ -172,20 +166,9 @@ fn delete<'a>(txn: &mut MutTxn,
                      reins)
                         //free_page: if let Some(p) = free { p.page_offset() } else { 0 } }, None)
                 } else {
-                    if left0>1 && right0>1 {
-                        // Both children are pages.  Take the
-                        // smallest (largest) descendant of the
-                        // right (left) page, and copy it in place
-                        // of the current node, with (malloc new)
-                        // + (free current).
-                        //
-                        // Then, recursively delete the page from
-                        // which the key was taken, and update the
-                        // pointer here:
-                        // - If the page was deleted, CoW, write 0, return new current page.
-                        // - If it wasn't deleted, update
-                        // - If NotFound, unreachable!()
-                        //let l = *(ptr as *const u64);
+                    // Take the smallest element of the right child.
+                    if right0 != 1 {
+                        // The right child is a page.
                         let r = u64::from_le(*((ptr as *const u64).offset(1)));
                         let right_page = txn.load_cow_page(r);
                         let right_root = right_page.root();
@@ -206,24 +189,31 @@ fn delete<'a>(txn: &mut MutTxn,
                         match result {
                             Result::Ok { page:right_page, off:right_off, .. } => {
                                 //println!("{:?}", right_page);
-                                right_page.set_root(right_off);
-                                if *((ptr as *mut u64).offset(1)) != 0 {
-                                    *((ptr as *mut u64).offset(1)) = right_page.page_offset().to_le();
+                                if right_off == 0 {
+                                    // The right page disappeared.
+                                    transaction::free(&mut txn.txn,right_page.page_offset());
+                                    *((ptr as *mut u64).offset(1)) = 0;
+                                    (Result::Ok { page:page, off:off, decr:false }, reins)
+                                } else {
+                                    right_page.set_root(right_off);
+                                    if *((ptr as *mut u64).offset(1)) != 0 {
+                                        *((ptr as *mut u64).offset(1)) = right_page.page_offset().to_le();
+                                    }
+                                    (Result::Ok { page:page, off:0, decr:false }, reins)
                                 }
-                                (Result::Ok { page:page, off:0, decr:false }, reins)
                             },
                             Result::NotFound => unreachable!()
                         }
                     } else {
-                        // Both children are taken, at least one is not a page.
-                        // Take the smallest element of the right child.
+                        // The right child is local.
                         let previous_balance = u16::from_le(*((ptr as *mut u16).offset(11)));
-                        let (result,reins) = delete(txn, Cow::from_mut_page(page), right1 as u16, C::Less, path|(1<<depth), depth+1);
-                        if let (Result::Ok { page, off:right_off, decr },Some(reins)) = (result,reins) {
+                        let (result,reins) = delete(txn, Cow::from_mut_page(page), right1 as u16, C::Less,
+                                                    path|(1<<depth), depth+1);
+                        if let (Result::Ok { mut page, off:right_off, decr },Some(reins)) = (result,reins) {
                             // reins is the smallest element of the right child.
                             println!("reins: {:?}, decr: {:?}",reins, decr);
                             if comp.is_less() {
-                                // If we're currently looking for the smallest descendant, just forward up.
+                                // If we're currently looking for the smallest descendant, just update the child and forward the result up.
                                 let ptr_off = node_ptr(&page,depth,path,page.root() as u32);
                                 let ptr = page.offset(ptr_off as isize) as *mut u32;
                                 if right_off == 0 {
@@ -247,7 +237,7 @@ fn delete<'a>(txn: &mut MutTxn,
                                 // Else, two cases: either the smallest descendant is on the same page as ptr, or not.
                                 // - If it is, set its children to be the current node's children, and return it.
                                 // - Else, allocate a new node, set its children to the current node's children, and return it.
-                                (if reins.page == page.page_offset() {
+                                if reins.page == page.page_offset() {
                                     let p = page.offset(reins.off as isize) as *mut u64;
                                     *p = *(ptr as *const u64);
                                     if right_off>0 {
@@ -260,17 +250,34 @@ fn delete<'a>(txn: &mut MutTxn,
                                     if decr {
                                         if previous_balance == 0 {
                                             // On a supprimé un truc à droite, rotation.
-                                            rebalance_right(page,reins.off,ptr)
+                                            (rebalance_right(page,reins.off,ptr),None)
                                         } else {
                                             *((p as *mut u16).offset(11)) = (previous_balance-1).to_le();
-                                            Result::Ok { page:page, off:reins.off, decr:previous_balance==2 }
+                                            (Result::Ok { page:page, off:reins.off, decr:previous_balance==2 },None)
                                         }
                                     } else {
-                                        Result::Ok { page:page, off:reins.off, decr:false }
+                                        (Result::Ok { page:page, off:reins.off, decr:false },None)
                                     }
                                 } else {
-                                    unimplemented!()
-                                }, None)
+                                    // Either there's space, or split.
+                                    let ptr_off = node_ptr(&page,depth,path,page.root() as u32);
+                                    let ptr = page.offset(ptr_off as isize) as *mut u32;
+
+                                    let ptr_ = txn.load_cow_page(reins.page).offset(reins.off as isize);
+                                    let (key,value) = txn.read_key_value(ptr_);
+                                    let size = value_record_size(key.len(), value);
+                                    debug!("size={:?}", size);
+                                    let off_ptr = page.can_alloc(size);
+                                    if off_ptr > 0 {
+                                        page.alloc_key_value(off_ptr, size, key.as_ptr(), key.len(), value,
+                                                             u64::from_le(*(ptr as *const u64)),
+                                                             u64::from_le(*((ptr as *const u64).offset(1))));
+                                        (Result::Ok { page:page, off:off_ptr, decr:false },None)
+                                    } else {
+                                        // split
+                                        unimplemented!()
+                                    }
+                                }
                             }
                         } else {
                             unreachable!()

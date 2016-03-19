@@ -75,7 +75,7 @@ mod transaction;
 pub use transaction::Statistics;
 
 mod txn;
-pub use txn::{MutTxn, Txn, Value, Db, Loaded};
+pub use txn::{MutTxn, Txn, Value, Db};
 use txn::{P, LoadPage};
 mod rebalance;
 mod put;
@@ -143,16 +143,13 @@ impl<'env> MutTxn<'env> {
         let extra = self.btree_root.to_le();
         self.txn.commit(&[extra])
     }
-    pub fn load<'a>(&self, value: &Value<'a>) -> Loaded<'a> {
-        self.load_value(value)
-    }
     pub fn create_db(&mut self) -> Db {
         let mut btree = self.alloc_page();
         btree.init();
         Db { root: btree.page_offset() }
         // root_offset = off;
     }
-    pub fn open_db<'a>(&'a self, key: &[u8]) -> Option<Db> {
+    pub fn open_db(&self, key: &[u8]) -> Option<Db> {
         self.open_db_(key)
     }
     pub fn put_db(&mut self, db: Db, key: &[u8], value: Db) -> Db {
@@ -169,18 +166,19 @@ impl<'env> MutTxn<'env> {
     pub fn put(&mut self, db: Db, key: &[u8], value: &[u8]) -> Db {
         put::put(self, db, key, value)
     }
+
     pub fn del(&mut self, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
         del::del(self, db, key, value)
     }
-    pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a>> {
-        self.get_(db, key, value)
+    pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a,Self>> {
+        self.get_(db, key, value).map(|x| Value { txn:self, value:x })
     }
 
-    pub fn iterate<'a, F: Fn(&'a [u8], &'a [u8]) -> bool + Copy>(&'a self,
-                                                                 db: Db,
-                                                                 key: &[u8],
-                                                                 value: Option<&[u8]>,
-                                                                 f: F) {
+    pub fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool + Copy>(&'a self,
+                                                                       db: Db,
+                                                                       key: &[u8],
+                                                                       value: Option<&[u8]>,
+                                                                       f: F) {
         let root_page = self.load_page(db.root);
         let root = root_page.root();
         self.tree_iterate(&root_page, key, value, f, root as u32, false);
@@ -191,13 +189,13 @@ impl<'env> Txn<'env> {
     pub fn root_db(&self) -> Db {
         self.root_db_()
     }
-    pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a>> {
-        self.get_(db, key, value)
+    pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a,Self>> {
+        self.get_(db, key, value).map(|x| Value { txn:self, value:x })
     }
     pub fn open_db<'a>(&'a self, key: &[u8]) -> Option<Db> {
         self.open_db_(key)
     }
-    pub fn iterate<'a, F: Fn(&'a [u8], &'a [u8]) -> bool + Copy>(&'a self,
+    pub fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool + Copy>(&'a self,
                                                                  db: Db,
                                                                  key: &[u8],
                                                                  value: Option<&[u8]>,

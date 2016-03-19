@@ -40,8 +40,8 @@ use std::path::Path;
 use memmap::mmap;
 
 // We need a fixed page size for compatibility reasons. Most systems will have half of this, but some (SPARC) don't...
-pub const PAGE_SIZE: usize = 8192;
-pub const PAGE_SIZE_64: u64 = 8192;
+pub const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE_64: u64 = 4096;
 
 pub const ZERO_HEADER: isize = 16; // size of the header on page 0, in bytes.
 
@@ -78,7 +78,6 @@ pub struct Txn<'env> {
     pub env: &'env Env,
     guard: RwLockReadGuard<'env, ()>,
 }
-
 
 pub struct MutTxn<'env> {
     pub env: &'env Env,
