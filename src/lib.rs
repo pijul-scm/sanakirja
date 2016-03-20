@@ -171,10 +171,13 @@ impl<'env> MutTxn<'env> {
     pub fn del<R:Rng>(&mut self, r:&mut R, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
         put_del::del(r, self, db, key, value)
     }
-    pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a,Self>> {
-        self.get_(db, key, value).map(|x| Value { txn:self, value:x })
+    pub fn get<'a>(&'a self, db: &Db, key: &[u8]) -> Option<Value<'a,Self>> {
+        unsafe {
+            let page = self.load_page(db.root);
+            self.get_(page, key, 8, 4).map(|x| Value { txn:self, value:x })
+        }
     }
-
+    /*
     pub fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool + Copy>(&'a self,
                                                                        db: Db,
                                                                        key: &[u8],
@@ -182,18 +185,23 @@ impl<'env> MutTxn<'env> {
                                                                        f: F) {
         unimplemented!()
     }
+     */
 }
 
 impl<'env> Txn<'env> {
     pub fn root_db(&self) -> Db {
         self.root_db_()
     }
-    pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a,Self>> {
-        self.get_(db, key, value).map(|x| Value { txn:self, value:x })
+    pub fn get<'a>(&'a self, db: &Db, key: &[u8]) -> Option<Value<'a,Self>> {
+        unsafe {
+            let page = self.load_page(db.root);
+            self.get_(page, key, 8, 4).map(|x| Value { txn:self, value:x })
+        }
     }
     pub fn open_db<'a>(&'a self, key: &[u8]) -> Option<Db> {
         self.open_db_(key)
     }
+    /*
     pub fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool + Copy>(&'a self,
                                                                  db: Db,
                                                                  key: &[u8],
@@ -201,6 +209,7 @@ impl<'env> Txn<'env> {
                                                                  f: F) {
         unimplemented!()
     }
+     */
 }
 
 

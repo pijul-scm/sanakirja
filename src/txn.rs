@@ -2,16 +2,14 @@ use super::transaction;
 use std;
 use std::path::Path;
 use libc::c_int;
-use super::memmap;
-use super::transaction::{PAGE_SIZE, PAGE_SIZE_64};
-use std::cmp::Ordering;
+use super::transaction::{PAGE_SIZE};
 use std::fs::File;
 use std::io::BufWriter;
 use std::collections::HashSet;
 use std::ptr::copy_nonoverlapping;
 use std::io::Write;
-use std::marker::PhantomData;
 use std::fmt;
+use std::cmp::Ordering;
 
 pub const MAX_KEY_SIZE: usize = PAGE_SIZE >> 2;
 pub const VALUE_SIZE_THRESHOLD: usize = PAGE_SIZE >> 2;
@@ -136,7 +134,7 @@ impl<'a,T> Value<'a,T> {
 
 pub fn alloc_value(txn:&mut MutTxn, value: &[u8]) -> UnsafeValue {
     let mut len = value.len();
-    let mut p_value = value.as_ptr();
+    let p_value = value.as_ptr();
     let mut ptr = std::ptr::null_mut();
     let mut first_page = 0;
     unsafe {
@@ -192,11 +190,14 @@ pub trait LoadPage:Sized {
     fn length(&self) -> u64;
     fn root_db_(&self) -> Db;
     fn open_db_<'a>(&'a self, key: &[u8]) -> Option<Db> {
-        let db = self.get_(&self.root_db_(), key, None);
-        if let Some(UnsafeValue::S{p,..}) = db {
-            unsafe { Some(Db { root: u64::from_le(*(p as *const u64)) }) }
-        } else {
-            None
+        let page = self.load_page(self.root_db_().root);
+        unsafe {
+            let db = self.get_(page, key, 8, 4);
+            if let Some(UnsafeValue::S{p,..}) = db {
+                Some(Db { root: u64::from_le(*(p as *const u64)) })
+            } else {
+                None
+            }
         }
     }
 
@@ -222,239 +223,47 @@ pub trait LoadPage:Sized {
 
     fn load_page(&self, off: u64) -> Page;
 
-    fn get_<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<UnsafeValue> {
-        unimplemented!()
-            /*
-        unsafe {
-            let mut page = self.load_page(db.root);
-            let mut current:*const u16 = {
-                let cur = u16::from_le(*((page.data() as *const u16).offset(4)));
-                if cur == 0 {
-                    return None
-                } else {
-                    (page.data() as *const u8).offset(31+cur as isize) as *const u16
-                }
-            };
-            let mut level = 4;
-            loop {
-                // Is (key,value) greater than the next element?
-                let next = u16::from_le(*(current.offset(level)));
-                if next == 0 {
-                    if level>0 {
-                        level -= 1
-                    } else {
-                        return None
-                    }
-                } else {
-                    let next_ptr = page.offset(next as isize);
-                    let (next_key,next_value) = self.read_key_value(next_ptr);
-                    if key < next_key {
-                        level -= 1;
-                    } else {
-                        current = next_ptr as *const u16
-                    }
-                }
+    unsafe fn get_<'a>(&'a self, page:Page, key: &[u8], current_off:u16, level:isize) -> Option<UnsafeValue> {
+        let current = page.offset(current_off as isize) as *mut u16;
+        let next = u16::from_le(*(current.offset(level)));
+        //debug!("put: current={:?}, level={:?}, next= {:?}", current, level, next);
+        let mut equal = None;
+        let continue_ = if next == 0 {
+            false
+        } else {
+            let next_ptr = page.offset(next as isize);
+            let (next_key,next_value) = self.read_key_value(next_ptr);
+            match key.cmp(next_key) {
+                Ordering::Less => false,
+                Ordering::Equal => {
+                    equal = Some(next_value);
+                    false
+                },
+                Ordering::Greater => true
             }
-        }*/
-    }
-    /*
-    fn binary_tree_get<'a>(&'a self,
-                           page: &Page,
-                           key: &[u8],
-                           value: Option<&[u8]>,
-                           current: u32)
-                           -> Option<UnsafeValue> {
-        unsafe {
-            //println!("binary_tree_get:{:?}", page);
-            let ptr = page.offset(current as isize) as *mut u32;
-            
-            let (key0, value0) = self.read_key_value(ptr as *const u8);
-            /*println!("binary_tree_get:{:?}, {:?}",
-            std::str::from_utf8_unchecked(key),
-            std::str::from_utf8_unchecked(key0));*/
-            let cmp = if let Some(value_) = value {
-                let cmp = key.cmp(&key0);
-                if cmp == Ordering::Equal {
-                    let value = UnsafeValue::S { p:value_.as_ptr(), len:value_.len() as u32 };
-                    Value { txn:self,value:value }.cmp(Value { txn:self,value:value0 })
-                } else {
-                    cmp
-                }
+        };
+        if continue_ {
+            // key > next_key, et next > 0
+            self.get_(page,key,next,level)
+        } else {
+            // pas de next_ptr, ou key <= next_key.
+            if level>0 {
+                self.get_(page,key,current_off,level-1)
             } else {
-                key.cmp(&key0)
-            };
-            match cmp {
-                Ordering::Equal | Ordering::Less => {
-                    let result = {
-                        let left0 = u32::from_le(*(ptr as *const u32));
-                        if left0 == 1 {
-                            let next = u32::from_le(*(ptr.offset(1)));
-                            if next == 0 {
-                                None
-                            } else {
-                                self.binary_tree_get(page, key, value, next)
-                            }
-                        } else {
-                            // Global offset
-                            let left = u64::from_le(*(ptr as *const u64));
-                            if left == 0 {
-                                None
-                            } else {
-                                // left child is another page.
-                                let page_ = self.load_page(left);
-                                let root_ = page_.root();
-                                self.binary_tree_get(&page_, key, value, root_ as u32)
-                            }
-                        }
-                    };
-                    if cmp == Ordering::Equal {
-                        result.or(Some(value0))
-                    } else {
-                        result
-                    }
-                }
-                Ordering::Greater => {
-                    let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
-                    if right0 == 1 {
-                        let next = u32::from_le(*(ptr.offset(3)));
-                        if next == 0 {
-                            None
-                        } else {
-                            self.binary_tree_get(page, key, value, next)
-                        }
-                    } else {
-                        // global offset, follow
-                        let right = u64::from_le(*((ptr as *const u64).offset(1)));
-                        if right == 0 {
-                            None
-                        } else {
-                            // right child is another page
-                            let page_ = self.load_page(right);
-                            let root_ = page_.root();
-                            self.binary_tree_get(&page_, key, value, root_ as u32)
-                        }
+                let next_page = u64::from_le(*((current as *const u64).offset(2)));
+                if next_page == 0 {
+                    equal
+                } else {
+                    debug!("this page: {:?}", page);
+                    let next_page = self.load_page(next_page);
+                    match self.get_(next_page,key,8,4) {
+                        None => equal,
+                        x => x
                     }
                 }
             }
         }
-*/
-
-
-/*
-
-
-
-    fn tree_iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool + Copy>(&'a self,
-                                                                  page: &Page,
-                                                                  key: &[u8],
-                                                                  value: Option<&[u8]>,
-                                                                  f: F,
-                                                                  current: u32,
-                                                                  started: bool)
-                                                                  -> Option<bool> {
-        unsafe {
-            debug!("binary_tree_get:{:?}", page);
-            let ptr = page.offset(current as isize) as *mut u32;
-
-            let value_ = value.unwrap_or(b"");
-            let (key0, value0) = self.read_key_value(ptr as *const u8);
-            let cmp = {
-                let cmp = key.cmp(&key0);
-                if cmp == Ordering::Equal {
-                    if let Some(value) = value {
-                        let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
-                        Value { txn:self,value:value }.cmp(Value { txn:self,value:value0 })
-                            //value.cmp(value0.clone())
-                    } else {
-                        cmp
-                    }
-                } else {
-                    cmp
-                }
-            };
-
-            // If we've already started iterating, or else if the key can be found on our left.
-            let result_left = if started ||
-                                 (!started && (cmp == Ordering::Equal || cmp == Ordering::Less)) {
-                let result = {
-                    let left0 = u32::from_le(*(ptr as *const u32));
-                    if left0 == 1 {
-                        let next = u32::from_le(*(ptr.offset(1)));
-                        if next == 0 {
-                            None
-                        } else {
-                            self.tree_iterate(page, key, value, f, next, started)
-                        }
-                    } else {
-                        // Global offset
-                        let left = u64::from_le(*(ptr as *const u64));
-                        if left == 0 {
-                            None
-                        } else {
-                            // left child is another page.
-                            let page_ = self.load_page(left);
-                            let root_ = page_.root();
-                            self.tree_iterate(&page_, key, value, f, root_ as u32, started)
-                        }
-                    }
-                };
-                match result {
-                    Some(true) => {
-                        let value0 = Value { txn:self,value:value0 };
-                        Some(f(key0, value0))
-                    }
-                    None if cmp == Ordering::Equal => {
-                        let value0 = Value { txn:self,value:value0 };
-                        Some(f(key0, value0))
-                    }
-                    _ => result, // we've stopped already
-                }
-            } else {
-                None
-            };
-
-
-            if result_left == Some(false) {
-                Some(false)
-            } else {
-                if (result_left.is_none() && cmp == Ordering::Greater) || result_left.is_some() {
-                    let right0 = u32::from_le(*((ptr as *const u32).offset(2)));
-                    if right0 == 1 {
-                        let next = u32::from_le(*(ptr.offset(3)));
-                        if next == 0 {
-                            None
-                        } else {
-                            self.tree_iterate(page,
-                                              key,
-                                              value,
-                                              f,
-                                              next,
-                                              started || result_left.is_some())
-                        }
-                    } else {
-                        // global offset, follow
-                        let right = u64::from_le(*((ptr as *const u64).offset(1)));
-                        if right == 0 {
-                            None
-                        } else {
-                            // right child is another page
-                            let page_ = self.load_page(right);
-                            let root_ = page_.root();
-                            self.tree_iterate(&page_,
-                                              key,
-                                              value,
-                                              f,
-                                              root_ as u32,
-                                              started || result_left.is_some())
-                        }
-                    }
-                } else {
-                    result_left
-                }
-            }
-        }
     }
-*/
 }
 
 
@@ -609,11 +418,6 @@ impl MutPage {
             }*/
         }
     }
-    pub fn set_tail(&mut self, off_ptr:u16, level:isize, ext:u16) {
-        unsafe {
-            *((self.offset(off_ptr as isize) as *mut u16).offset(level)) = ext.to_le();
-        }
-    }
 }
 
 
@@ -627,57 +431,13 @@ impl Cow {
     pub fn from_mut_page(p:MutPage)->Cow {
         Cow{cow:transaction::Cow::MutPage(p.page)}
     }
-    // fn is_mutable(&self)->bool {
-    // let &Cow(ref s)=self;
-    // match s { &transaction::Cow::MutPage(_)=>true, _=>false }
-    // }
-    //
 
-    /*
-    // NOTE: the following function (from_page) should not be used,
-    // as they might lead to useless copying when into_mut_page is
-    // called. use load_cow_page instead.
-    
-    pub fn from_page(p:Page)->Cow {
-        Cow { cow: transaction::Cow::Page(p.page) }
-    }
-     */
     pub fn unwrap_mut(self) -> MutPage {
         match self.cow {
             transaction::Cow::MutPage(p) => MutPage { page: p },
-            transaction::Cow::Page(p) => panic!("unwrap")
+            transaction::Cow::Page(_) => panic!("unwrap")
         }
     }
-
-    pub fn into_mut_page_nonfree(self, txn: &mut MutTxn) -> (MutPage,Option<Page>) {
-        match self.cow {
-            transaction::Cow::MutPage(p) => (MutPage { page: p },None),
-            transaction::Cow::Page(p) => {
-                unsafe {
-                    let result = txn.txn.alloc_page().unwrap();
-                    copy_nonoverlapping(p.data, result.data, PAGE_SIZE);
-                    // TODO: decrement and check RC
-                    // p.free(&mut txn.txn);
-                    (MutPage { page: result }, Some(Page{page:p}))
-                }
-            }
-        }
-    }
-    pub fn into_mut_page(self, txn: &mut MutTxn) -> MutPage {
-        let (a,b) = self.into_mut_page_nonfree(txn);
-        if let Some(b) = b {
-            b.page.free(&mut txn.txn);
-        }
-        a
-    }
-    // fn into_page(self)->Page {
-    // let Cow(s)=self;
-    // match s {
-    // transaction::Cow::Page(p)=> Page { page:p },
-    // transaction::Cow::MutPage(p)=> Page { page:p.into_page() }
-    // }
-    // }
-    //
 }
 
 impl<'env> LoadPage for MutTxn<'env> {
@@ -767,7 +527,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                     ("root","".to_string())
                 } else {
 
-                    let (key, mut value) = txn.read_key_value(ptr as *const u8);
+                    let (key, value) = txn.read_key_value(ptr as *const u8);
                     //println!("key,value = ({:?},{:?})", key.as_ptr(), value.len());
                     let key = std::str::from_utf8_unchecked(key);
                     let mut value_ = Vec::new();

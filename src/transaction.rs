@@ -259,36 +259,6 @@ pub unsafe fn free(txn: &mut MutTxn, offset: u64) {
     }
 }
 
-impl Page {
-    // pub unsafe fn as_slice<'a>(&'a self)->&'a[u8]{
-    // std::slice::from_raw_parts(self.data as *const u8,PAGE_SIZE)
-    // }
-    //
-    pub fn free(&self, txn: &mut MutTxn) {
-        // If this page was allocated during this transaction
-        unsafe { free(txn, self.offset) }
-    }
-}
-
-impl MutPage {
-    // pub unsafe fn as_slice<'a>(&'a self)->&'a[u8] {
-    // std::slice::from_raw_parts(self.data as *const u8,PAGE_SIZE)
-    // }
-    // pub unsafe fn as_mut_slice<'a>(&'a mut self)->&'a mut [u8]{
-    // std::slice::from_raw_parts_mut(self.data as *mut u8,PAGE_SIZE)
-    // }
-    //
-    // pub fn free(&self,txn:&mut MutTxn) {
-    // unsafe { free(txn,self.offset) }
-    // }
-    pub fn as_page(self)->Page {
-        unsafe { std::mem::transmute(self) }
-    }
-    // pub fn into_page(self)->Page {
-    // unsafe { std::mem::transmute(self) }
-    // }
-}
-
 impl<'env> Txn<'env> {
     /// Find the appropriate map segment
     pub fn load_page(&self, off: u64) -> Page {
