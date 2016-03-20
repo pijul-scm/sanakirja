@@ -281,9 +281,9 @@ impl MutPage {
     // pub fn free(&self,txn:&mut MutTxn) {
     // unsafe { free(txn,self.offset) }
     // }
-    // pub fn as_page<'a>(&'a self)->&'a Page {
-    // unsafe { std::mem::transmute(self) }
-    // }
+    pub fn as_page(self)->Page {
+        unsafe { std::mem::transmute(self) }
+    }
     // pub fn into_page(self)->Page {
     // unsafe { std::mem::transmute(self) }
     // }

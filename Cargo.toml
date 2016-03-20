@@ -15,6 +15,7 @@ log="0.3"
 env_logger="0.3"
 fs2="0.2"
 time="*"
+rand="*"
 
 [build-dependencies]
 libc="0.2"

@@ -53,7 +53,8 @@ impl<'env> Txn<'env> {
         debug(self, db, p)
     }
 }
-#[derive(Clone,Copy)]
+
+#[derive(Clone,Copy,Debug)]
 pub enum UnsafeValue {
     S { p:*const u8,
         len:u32 },
@@ -181,7 +182,7 @@ pub struct MutPage {
 }
 #[derive(Debug)]
 pub struct Page {
-    page: transaction::Page,
+    pub page: transaction::Page,
 }
 
 
@@ -201,17 +202,16 @@ pub trait LoadPage:Sized {
 
 
     unsafe fn read_key_value<'a>(&'a self, p: *const u8) -> (&'a [u8], UnsafeValue) {
-        let p32 = p as *const u8 as *const u32;
-        let key_len = u16::from_le(*(p32.offset(5) as *const u16));
-        let val_len = u32::from_le(*(p32.offset(4)));
+        let key_len = u16::from_le(*(p as *const u16).offset(5));
+        let val_len = u32::from_le(*(p as *const u32).offset(3));
+
         if (val_len as usize) < VALUE_SIZE_THRESHOLD {
-            (std::slice::from_raw_parts((p as *const u8).offset(24 + val_len as isize),
-                                        key_len as usize),
+            (std::slice::from_raw_parts((p as *const u8).offset(24 + val_len as isize), key_len as usize),
              UnsafeValue::S { p:(p as *const u8).offset(24), len:val_len })
         } else {
             (std::slice::from_raw_parts((p as *const u8).offset(32), key_len as usize),
              {
-                 let offset = u64::from_le(*((p32 as *const u64).offset(3)));
+                 let offset = u64::from_le(*((p as *const u64).offset(3)));
                  UnsafeValue::O {
                      offset: offset,
                      len: val_len,
@@ -223,11 +223,41 @@ pub trait LoadPage:Sized {
     fn load_page(&self, off: u64) -> Page;
 
     fn get_<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<UnsafeValue> {
-        debug!("db.root={:?}",db.root);
-        let root_page = self.load_page(db.root);
-        self.binary_tree_get(&root_page, key, value, root_page.root() as u32)
+        unimplemented!()
+            /*
+        unsafe {
+            let mut page = self.load_page(db.root);
+            let mut current:*const u16 = {
+                let cur = u16::from_le(*((page.data() as *const u16).offset(4)));
+                if cur == 0 {
+                    return None
+                } else {
+                    (page.data() as *const u8).offset(31+cur as isize) as *const u16
+                }
+            };
+            let mut level = 4;
+            loop {
+                // Is (key,value) greater than the next element?
+                let next = u16::from_le(*(current.offset(level)));
+                if next == 0 {
+                    if level>0 {
+                        level -= 1
+                    } else {
+                        return None
+                    }
+                } else {
+                    let next_ptr = page.offset(next as isize);
+                    let (next_key,next_value) = self.read_key_value(next_ptr);
+                    if key < next_key {
+                        level -= 1;
+                    } else {
+                        current = next_ptr as *const u16
+                    }
+                }
+            }
+        }*/
     }
-
+    /*
     fn binary_tree_get<'a>(&'a self,
                            page: &Page,
                            key: &[u8],
@@ -307,9 +337,10 @@ pub trait LoadPage:Sized {
                 }
             }
         }
-    }
+*/
 
 
+/*
 
 
 
@@ -423,19 +454,19 @@ pub trait LoadPage:Sized {
             }
         }
     }
+*/
 }
 
 
 
 
-
-
-// Page layout: Starts with a header of 24 bytes.
+// Page layout: Starts with a header of 32 bytes.
 // - 64 bits: RC
+// - 5*16 bits: pointers to all the skip lists.
 // - 16 bits: offset of the first free spot, from the byte before
-// - 16 bits: offset of the root of the tree, from the byte before
 // - 16 bits: how much space is occupied in this page? (controls compaction)
 // - 16 bits: padding
+// - 64 bits: smaller child
 // - beginning of coding space (different encodings in B-nodes and B-leaves)
 
 
@@ -446,14 +477,14 @@ pub trait P {
     /// pointer to the first word of the page.
     fn data(&self) -> *const u64;
 
-    /// 0 if cannot alloc, valid offset else (offset in bytes from the byte before the coding section).
+    /// 0 if cannot alloc, valid offset else (offset in bytes from the start of the page)
     fn can_alloc(&self, size: u16) -> u16 {
         unsafe {
             assert!(size & 7 == 0); // 64 bits aligned.
             let first_free = self.first_free();
 
             let next_page = (self.data() as *mut u8).offset(PAGE_SIZE as isize) as *const u8;
-            let current = (self.data() as *const u8).offset(15 + first_free as isize);
+            let current = (self.data() as *const u8).offset(first_free as isize);
             if current.offset(size as isize) <= next_page {
                 first_free
             } else {
@@ -471,43 +502,22 @@ pub trait P {
     fn first_free(&self) -> u16 {
         unsafe {
             let first_free = u16::from_le(*(self.p_first_free()));
-            let first_free = if first_free > 0 {
+            if first_free > 0 {
                 first_free
             } else {
-                1
-            };
-            first_free
+                32
+            }
         }
     }
     fn p_first_free(&self) -> *mut u16 {
-        unsafe { self.data().offset(1) as *mut u16 }
-    }
-
-    fn root(&self) -> u16 {
-        unsafe {
-            let p_root = (self.data() as *const u16).offset(5);
-            u16::from_le(*p_root)
-        }
-    }
-    fn set_root(&self, root: u16) {
-        unsafe {
-            let p_root = (self.data() as *mut u16).offset(5);
-            *p_root = root.to_le()
-        }
-    }
-    // Amount of space occupied in the page
-    fn occupied_space(&self) -> u16 {
-        unsafe {
-            let p_occ = (self.data() as *const u16).offset(6);
-            u16::from_le(*p_occ)
-        }
+        unsafe { (self.data() as *mut u16).offset(9) }
     }
 
     // offset in u32.
     fn offset(&self, off: isize) -> *mut u8 {
         unsafe {
             let p = self.data() as *mut u8;
-            p.offset(15 + off)
+            p.offset(off)
         }
     }
 }
@@ -550,7 +560,7 @@ impl MutPage {
     pub fn init(&mut self) {
         debug!("mut page init: {:?}",self);
         unsafe {
-            std::ptr::write_bytes(self.page.data as *mut u8, 0, 16);
+            std::ptr::write_bytes(self.page.data as *mut u8, 0, 32);
             self.incr_rc()
         }
     }
@@ -570,58 +580,38 @@ impl MutPage {
         }
     }
 
-    // Layout of a node: 24 + |key|+|value|, rounded up to 64-bits.
-    // - 64 bits: left, little endian. if the first 32 bits == 1, local offset, else global in bytes.
-    // - 64 bits: right, little endian. if the first 32 bits == 1, local offset, else global in bytes.
-    // - 32 bits: value length, if >PAGE_SIZE/4, the value is a 64-bits offset of a page.
-    // - 16 bits: key length
-    // - 16 bits: balance factor (2 LSB).
-    // - value
-    // - key
-    // - padding for 64 bits/8 bytes alignment.
-
     // allocate and write key, value, left and right neighbors.
     pub fn alloc_key_value(&mut self,
                            off_ptr: u16,
                            size: u16,
                            key_ptr:*const u8,
                            key_len:usize,
-                           value: UnsafeValue,
-                           l: u64,
-                           r: u64) {
+                           value: UnsafeValue) {
         unsafe {
             self.alloc(off_ptr, size);
-            // println!("off_ptr={:?}, size = {:?}",off_ptr, size);
-            // off is the beginning of a free zone. Write the node there.
-            // ///////////////////////////////////////////////
-            let ptr = self.offset(off_ptr as isize) as *mut u32;
-            // println!("ptr: {} {:?}",off_ptr,ptr0);
-            // This is a leaf, so l and r are offsets in the file, not local offsets.
-            let ptr = ptr as *mut u64;
-            *ptr = l.to_le();
-            *(ptr.offset(1)) = r.to_le();
-            let ptr = ptr as *mut u32;
-            *(ptr.offset(4)) = (value.len() as u32).to_le();
-
-            let ptr = ptr as *mut u16;
-            *(ptr.offset(10)) = (key_len as u16).to_le();
-            *(ptr.offset(11)) = (1 as u16).to_le();
-            // +(if l!=0 { 1 } else { 0 } + if r!=0 { 1 } else { 0 } as u32).to_le(); // balance number
-            // println!("alloc_key_value: copying {:?} {:?} to {:?}",key,value,ptr);
-            match value {
-                UnsafeValue::S{p,len} => {
-                    let ptr = ptr as *mut u8;
-                    let ptr = ptr.offset(24);
-                    copy_nonoverlapping(p, ptr, len as usize);
-                    copy_nonoverlapping(key_ptr, ptr.offset(len as isize), key_len);
-                }
-                UnsafeValue::O{offset,..} => {
-                    debug_assert!(offset != 0);
-                    *((ptr as *mut u64).offset(3)) = offset.to_le();
-                    let ptr = ptr as *mut u8;
-                    copy_nonoverlapping(key_ptr, ptr.offset(32), key_len);
-                }
-            }
+            let ptr = self.offset(off_ptr as isize) as *mut u8;
+            *(ptr as *mut u64) = 0;
+            *((ptr as *mut u64).offset(1)) = 0;
+            *((ptr as *mut u16).offset(5)) = (key_len as u16).to_le();
+            let target_key_ptr = match value {
+                UnsafeValue::S { p,len } => {
+                    *((ptr as *mut u32).offset(3)) = len.to_le();
+                    copy_nonoverlapping(p,(ptr as *mut u8).offset(24), len as usize);
+                    (ptr as *mut u8).offset(24 + len as isize)
+                },
+                _ => unimplemented!()
+            };
+            copy_nonoverlapping(key_ptr, target_key_ptr, key_len);
+            /*
+            for i in 0..5 {
+                println!("alloc_key_value:{:?} {:?}", (ptr as *const u16).offset(i),
+                         *((ptr as *const u16).offset(i)))
+            }*/
+        }
+    }
+    pub fn set_tail(&mut self, off_ptr:u16, level:isize, ext:u16) {
+        unsafe {
+            *((self.offset(off_ptr as isize) as *mut u16).offset(level)) = ext.to_le();
         }
     }
 }
@@ -652,6 +642,13 @@ impl Cow {
         Cow { cow: transaction::Cow::Page(p.page) }
     }
      */
+    pub fn unwrap_mut(self) -> MutPage {
+        match self.cow {
+            transaction::Cow::MutPage(p) => MutPage { page: p },
+            transaction::Cow::Page(p) => panic!("unwrap")
+        }
+    }
+
     pub fn into_mut_page_nonfree(self, txn: &mut MutTxn) -> (MutPage,Option<Page>) {
         match self.cow {
             transaction::Cow::MutPage(p) => (MutPage { page: p },None),
@@ -733,12 +730,13 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                          p.page.offset)
                     .unwrap();
             }
-            let root = p.root();
+            //let root = unsafe { u16::from_le(*(p.data() as *const u16).offset(8)) };
+            let root = 8;
             debug!("page root:{:?}", root);
             let mut h = Vec::new();
             let mut edges = Vec::new();
             let mut hh = HashSet::new();
-            print_tree(txn, &mut hh, buf, &mut edges, &mut h, p, root as u32);
+            print_tree(txn, &mut hh, buf, &mut edges, &mut h, p, root);
             if print_children {
                 writeln!(buf, "}}").unwrap();
             }
@@ -754,99 +752,74 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
     }
 
     fn print_tree<T: LoadPage>(txn: &T,
-                               nodes: &mut HashSet<u32>,
+                               nodes: &mut HashSet<u16>,
                                buf: &mut BufWriter<File>,
                                edges: &mut Vec<String>,
                                pages: &mut Vec<Page>,
                                p: &Page,
-                               off: u32) {
+                               off: u16) {
         unsafe {
-            // println!("print tree:{:?}",off);
+            //debug!("print tree:{:?}",off);
             let ptr = p.offset(off as isize) as *const u32;
-            let count = u16::from_le(*(ptr as *const u16).offset(11));
-            let (key, mut value) = txn.read_key_value(ptr as *const u8);
-            let key = std::str::from_utf8_unchecked(key);
-            let mut value_ = Vec::new();
-            let mut value = Value { txn:txn,value:value };
-            let value = if value.len() > 20 {
-                let contents = value.next().unwrap();
-                value_.extend(&contents[0..20]);
-                value_.extend(b"...");
-                &value_[..]
-            } else {
-                value.next().unwrap()
+
+            let (key,value) = {
+                if off == 8 {
+                    ("root","".to_string())
+                } else {
+
+                    let (key, mut value) = txn.read_key_value(ptr as *const u8);
+                    //println!("key,value = ({:?},{:?})", key.as_ptr(), value.len());
+                    let key = std::str::from_utf8_unchecked(key);
+                    let mut value_ = Vec::new();
+                    let mut value = Value { txn:txn,value:value };
+                    let value = if value.len() > 20 {
+                        let contents = value.next().unwrap();
+                        value_.extend(&contents[0..20]);
+                        value_.extend(b"...");
+                        &value_[..]
+                    } else {
+                        value.next().unwrap()
+                    };
+                    let value = std::str::from_utf8_unchecked(value);
+                    (key,value.to_string())
+                }
             };
-            let value = std::str::from_utf8_unchecked(value);
-            // println!("key,value={:?},{:?}",key,value);
+            //debug!("key,value={:?},{:?}",key,value);
             writeln!(buf,
-                     "n_{}_{}[label=\"{}: {}, '{}'->'{}'\"];",
+                     "n_{}_{}[label=\"{}: '{}'->'{}'\"];",
                      p.page.offset,
                      off,
                      off,
-                     count,
                      key,
                      value)
                 .unwrap();
             if !nodes.contains(&off) {
-                nodes.insert(off);
-
-                let left_local = u32::from_le(*(ptr as *const u32));
-                // println!("debug, left_local={:?}",left_local);
-                if left_local == 1 {
-                    let left = u32::from_le(*(ptr.offset(1)));
+                let next_page = u64::from_le(*((ptr as *const u64).offset(2)));
+                //println!("next_page = {:?} {:?}: {:?}", ptr, (ptr as *const u64).offset(2), next_page);
+                if next_page>0 {
+                    pages.push(txn.load_page(next_page));
                     writeln!(buf,
                              "n_{}_{}->n_{}_{}[color=\"red\"];",
                              p.page.offset,
                              off,
-                             p.page.offset,
-                             left)
+                             next_page,
+                             8)
                         .unwrap();
-                    print_tree(txn, nodes, buf, edges, pages, p, left);
-                } else {
-                    let page = u64::from_le(*(ptr as *const u64));
-                    // println!("debug, page={:?}",u32::from_le(*((ptr as *const u32).offset(1))));
-                    // println!("debug, page={:?}",page);
-                    if page > 0 && page < txn.length() {
-                        let page = txn.load_page(page);
-                        let root = page.root();
-                        edges.push(format!("n_{}_{}->n_{}_{}[color=\"red\"];",
-                                           p.page.offset,
-                                           off,
-                                           page.page.offset,
-                                           root));
-                        pages.push(page)
-                    } else {
-                        if page > 0 {
-                            panic!("Wrong page offset:{}", page);
-                        }
-                    }
-                }
-                let right_local = u32::from_le(*((ptr as *const u32).offset(2)));
-                // println!("debug, right_local={:?}",right_local);
-                if right_local == 1 {
-                    let right = u32::from_le(*(ptr.offset(3)));
-                    edges.push(format!("n_{}_{}->n_{}_{}[color=\"green\"];",
-                                       p.page.offset,
-                                       off,
-                                       p.page.offset,
-                                       right));
-                    print_tree(txn, nodes, buf, edges, pages, p, right);
-                } else {
-                    let page = u64::from_le(*((ptr as *const u64).offset(1)));
-                    // println!("debug, page={:?}",page);
-                    if page > 0 && page < txn.length() {
-                        let page = txn.load_page(page);
-                        let root = page.root();
-                        edges.push(format!("n_{}_{}->n_{}_{}[color=\"green\"];",
-                                           p.page.offset,
-                                           off,
-                                           page.page.offset,
-                                           root));
-                        pages.push(page)
-                    } else {
-                        if page > 0 {
-                            panic!("Wrong page offset:{}", page);
-                        }
+                };
+
+                nodes.insert(off);
+                for i in 0..5 {
+                    let left = u16::from_le(*((ptr as *const u16).offset(i)));
+                    //debug!("{:?}",((ptr as *const u16).offset(i)));
+                    if left>0 {
+                        writeln!(buf,
+                                 "n_{}_{}->n_{}_{}[color=\"blue\", label=\"{}\"];",
+                                 p.page.offset,
+                                 off,
+                                 p.page.offset,
+                                 left,i)
+                            .unwrap();
+                        print_tree(txn,nodes,buf,edges,pages,p,left)
                     }
                 }
             }
@@ -856,34 +829,13 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
     writeln!(&mut buf, "}}").unwrap();
 }
 
-pub unsafe fn node_ptr(page: &MutPage,
-                   mut length: usize,
-                   mut path: u64,
-                   mut current: u32)
-                   -> u16 {
-    while length > 0 {
-        let ptr = page.offset(current as isize) as *mut u32;
-        // println!("node_ptr:{:?}",if path&1==0 { u32::from_le(*ptr) } else { u32::from_le(*(ptr.offset(2))) });
-        // assert!(if path&1==0 { u32::from_le(*ptr)==1 } else { u32::from_le(*(ptr.offset(2))) == 1 });
-        current = if path & 1 == 0 {
-            u32::from_le(*(ptr.offset(1)))
-        } else {
-            u32::from_le(*(ptr.offset(3)))
-        };
-        length -= 1;
-        path >>= 1;
-    }
-    current as u16
-}
-pub fn value_record_size(key: usize, value: UnsafeValue) -> u16 {
-    match value {
-        UnsafeValue::S { p,len,.. } if len < (VALUE_SIZE_THRESHOLD as u32) => {
-            let size = 28 + key as u16 + len as u16;
-            size + ((8 - (size & 7)) & 7)
-        }
-        UnsafeValue::S{..} | UnsafeValue::O{..} => {
-            let size = 28 + key as u16 + 8;
-            size + ((8 - (size & 7)) & 7)
-        }
+pub fn record_size(key: usize, value: usize) -> u16 {
+    if value < VALUE_SIZE_THRESHOLD {
+        let size = 24 + key as u16 + value as u16;
+        size + ((8 - (size & 7)) & 7) // 64-bit alignment.
+    } else {
+        let size = 24 + key as u16 + 8;
+        size + ((8 - (size & 7)) & 7)
     }
 }
+

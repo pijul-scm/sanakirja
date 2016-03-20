@@ -62,11 +62,12 @@
 //!
 
 extern crate libc;
+extern crate rand;
 
 #[macro_use]
 extern crate log;
 extern crate fs2;
-
+use rand::Rng;
 use std::path::Path;
 
 mod memmap;
@@ -77,9 +78,9 @@ pub use transaction::Statistics;
 mod txn;
 pub use txn::{MutTxn, Txn, Value, Db};
 use txn::{P, LoadPage};
-mod rebalance;
+//mod rebalance;
 mod put;
-mod del;
+//mod del;
 
 /// Environment, containing in particular a pointer to the memory-mapped file.
 pub struct Env {
@@ -118,6 +119,7 @@ impl Env {
             let btree_root = u64::from_le(*p_extra);
             let btree_root = if btree_root == 0 {
                 let p = txn.alloc_page().unwrap();
+                std::ptr::write_bytes(p.data as *mut u8, 0, 24);
                 p.offset
             } else {
                 btree_root
@@ -152,23 +154,22 @@ impl<'env> MutTxn<'env> {
     pub fn open_db(&self, key: &[u8]) -> Option<Db> {
         self.open_db_(key)
     }
-    pub fn put_db(&mut self, db: Db, key: &[u8], value: Db) -> Db {
+    pub fn put_db<R:Rng>(&mut self, rng:&mut R, db: Db, key: &[u8], value: Db) -> Db {
         let mut val: [u8; 8] = [0; 8];
         unsafe {
             *(val.as_mut_ptr() as *mut u64) = value.root.to_le();
         }
         std::mem::forget(value); // No need to decrease the RC for that page.
-        self.put(db, key, &val)
+        self.put(rng, db, key, &val)
     }
     pub fn set_global_root(&mut self, db: Db) {
         self.btree_root = db.root
     }
-    pub fn put(&mut self, db: Db, key: &[u8], value: &[u8]) -> Db {
-        put::put(self, db, key, value)
+    pub fn put<R:Rng>(&mut self, r:&mut R, db: Db, key: &[u8], value: &[u8]) -> Db {
+        put::put(r, self, db, key, value)
     }
-
     pub fn del(&mut self, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
-        del::del(self, db, key, value)
+        put::del(self, db, key, value)
     }
     pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a,Self>> {
         self.get_(db, key, value).map(|x| Value { txn:self, value:x })
@@ -179,9 +180,7 @@ impl<'env> MutTxn<'env> {
                                                                        key: &[u8],
                                                                        value: Option<&[u8]>,
                                                                        f: F) {
-        let root_page = self.load_page(db.root);
-        let root = root_page.root();
-        self.tree_iterate(&root_page, key, value, f, root as u32, false);
+        unimplemented!()
     }
 }
 
@@ -200,9 +199,7 @@ impl<'env> Txn<'env> {
                                                                  key: &[u8],
                                                                  value: Option<&[u8]>,
                                                                  f: F) {
-        let root_page = self.load_page(db.root);
-        let root = root_page.root();
-        self.tree_iterate(&root_page, key, value, f, root as u32, false);
+        unimplemented!()
     }
 }
 
