@@ -168,8 +168,8 @@ impl<'env> MutTxn<'env> {
     pub fn put<R:Rng>(&mut self, r:&mut R, db: Db, key: &[u8], value: &[u8]) -> Db {
         put::put(r, self, db, key, value)
     }
-    pub fn del(&mut self, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
-        put::del(self, db, key, value)
+    pub fn del<R:Rng>(&mut self, r:&mut R, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
+        put::del(r, self, db, key, value)
     }
     pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a,Self>> {
         self.get_(db, key, value).map(|x| Value { txn:self, value:x })
