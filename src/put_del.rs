@@ -224,8 +224,34 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,key:&[u8],valu
     }
 }
 
-
-
+// Assumes result is of type Split.
+fn root_split<R:Rng>(rng:&mut R, txn: &mut MutTxn, x:Result) -> Db {
+    if let Result::Split { left,right,key_ptr,key_len,value,free_page } = x {
+        println!("SPLIT, value = {:?}",value);
+        let mut page = txn.alloc_page();
+        page.init();
+        println!("left = {:?}", left.page_offset());
+        println!("right = {:?}", right.page_offset());
+        unsafe {
+            let key = std::slice::from_raw_parts(key_ptr,key_len);
+            let right_offset = right.page_offset();
+            println!("insert");
+            let ins = page_insert(rng, txn, Cow::from_mut_page(page), key, value, right_offset);
+            println!("/insert");
+            transaction::free(&mut txn.txn, free_page);
+            match ins {
+                Result::Ok { page,.. } => {
+                    println!("WRITING LEFT in {:?}", (page.data() as *mut u64).offset(3));
+                    *((page.data() as *mut u64).offset(3)) = left.page_offset().to_le();
+                    Db { root:page.page_offset() }
+                },
+                _ => unreachable!()
+            }
+        }
+    } else {
+        unreachable!()
+    }
+}
 pub fn put<R:Rng>(rng:&mut R, txn: &mut MutTxn, db: Db, key: &[u8], value: &[u8]) -> Db {
     assert!(key.len() < MAX_KEY_SIZE);
     let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
@@ -237,29 +263,8 @@ pub fn put<R:Rng>(rng:&mut R, txn: &mut MutTxn, db: Db, key: &[u8], value: &[u8]
     debug!("value = {:?}", Value { txn:txn,value:value });
     match page_insert(rng, txn, root_page, key, value, 0) {
         Result::Ok { page,.. } => Db { root:page.page_offset() },
-        //Result::Split { .. } => {
-        Result::Split { left,right,key_ptr,key_len,value,free_page } => {
-            println!("SPLIT, value = {:?}",value);
-            let mut page = txn.alloc_page();
-            page.init();
-            println!("left = {:?}", left.page_offset());
-            println!("right = {:?}", right.page_offset());
-            unsafe {
-                let key = std::slice::from_raw_parts(key_ptr,key_len);
-                let right_offset = right.page_offset();
-                println!("insert");
-                let ins = page_insert(rng, txn, Cow::from_mut_page(page), key, value, right_offset);
-                println!("/insert");
-                transaction::free(&mut txn.txn, free_page);
-                match ins {
-                    Result::Ok { page,.. } => {
-                        println!("WRITING LEFT in {:?}", (page.data() as *mut u64).offset(3));
-                        *((page.data() as *mut u64).offset(3)) = left.page_offset().to_le();
-                        Db { root:page.page_offset() }
-                    },
-                    _ => unreachable!()
-                }
-            }
+        x => {
+            root_split(rng,txn,x)
         }
     }
 }
@@ -461,11 +466,10 @@ pub fn del<R:Rng>(rng:&mut R, txn:&mut MutTxn, db:Db, key:&[u8], value:Option<&[
     };
     match page_delete(rng,txn, root_page, C::KV { key:key, value:value }) {
         Some((Result::Ok { page,.. },_)) => {
-            println!("success");
             Db { root:page.page_offset() }
         },
-        Some((Result::Split { .. },_)) => {
-            unimplemented!()
+        Some((x,_)) => {
+            root_split(rng,txn,x)
         },
         None => db
     }

@@ -79,7 +79,7 @@ mod txn;
 pub use txn::{MutTxn, Txn, Value, Db};
 use txn::{P, LoadPage};
 //mod rebalance;
-mod put;
+mod put_del;
 //mod del;
 
 /// Environment, containing in particular a pointer to the memory-mapped file.
@@ -166,10 +166,10 @@ impl<'env> MutTxn<'env> {
         self.btree_root = db.root
     }
     pub fn put<R:Rng>(&mut self, r:&mut R, db: Db, key: &[u8], value: &[u8]) -> Db {
-        put::put(r, self, db, key, value)
+        put_del::put(r, self, db, key, value)
     }
     pub fn del<R:Rng>(&mut self, r:&mut R, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
-        put::del(r, self, db, key, value)
+        put_del::del(r, self, db, key, value)
     }
     pub fn get<'a>(&'a self, db: &Db, key: &[u8], value: Option<&[u8]>) -> Option<Value<'a,Self>> {
         self.get_(db, key, value).map(|x| Value { txn:self, value:x })
