@@ -6,7 +6,7 @@ use super::transaction;
 use rand::{Rng};
 
 enum Result {
-    Ok { page: MutPage, skip:u16 },
+    Ok { page: MutPage, position:u16, skip:bool },
     Split {
         key_ptr:*const u8,
         key_len:usize,
@@ -37,9 +37,9 @@ fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -
                             (std::slice::from_raw_parts(key.as_ptr(), key.len()), value)
                         };
                         match page_insert(rng, txn, cow, key, value, right_page) {
-                            Result::Ok { page,skip,.. } => {
+                            Result::Ok { page,position,.. } => {
                                 if current == pinpoint as isize {
-                                    pinpointed = skip
+                                    pinpointed = position
                                 }
                                 cow = Cow::from_mut_page(page)
                             },
@@ -81,15 +81,15 @@ fn page_insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, key:&[u8],value:Uns
             if level>0 {
                 let ins = insert(rng,txn,page,current_off,level-1,key,value,right_page);
                 match ins {
-                    Result::Ok { page, skip } => {
-                        if skip > 0 {
+                    Result::Ok { page, position, skip } => {
+                        if skip {
                             // create fast lane on top of off
-                            *(current.offset(level)) = skip.to_le();
+                            *(current.offset(level)) = position.to_le();
                             //debug!("{:?}",current.offset(level));
-                            *(page.offset(skip as isize + 2*level) as *mut u16) = next.to_le();
-                            Result::Ok { page:page, skip: if rng.gen() { skip } else { 0 } }
+                            *(page.offset(position as isize + 2*level) as *mut u16) = next.to_le();
+                            Result::Ok { page:page, skip: rng.gen(), position:position }
                         } else {
-                            Result::Ok { page:page,skip:skip }
+                            Result::Ok { page:page, position:position, skip:skip }
                         }
                     },
                     ins => ins
@@ -113,7 +113,7 @@ fn page_insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, key:&[u8],value:Uns
                         //debug!("{:?}",current);
                         *current = off.to_le();
                         // random number
-                        Result::Ok { page:page, skip:if rng.gen() { off } else { 0 } }
+                        Result::Ok { page:page, skip:rng.gen(), position:off }
                     } else {
                         // Split !
                         split_page(rng, txn, &page, size as usize)
@@ -126,7 +126,7 @@ fn page_insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, key:&[u8],value:Uns
                             let (page,current_off) = cow_pinpointing(rng, txn, page, current_off);
                             let current = page.offset(current_off as isize) as *mut u16;
                             *((current as *mut u64).offset(2)) = next_page.page_offset().to_le();
-                            Result::Ok { page:page, skip:0 }
+                            Result::Ok { page:page, skip:false, position:current_off }
                         },
                         Result::Split { key_ptr,key_len,value, left,right,free_page } => {
                             debug!("free_page: {:?}", free_page);
@@ -247,6 +247,7 @@ fn root_split<R:Rng>(rng:&mut R, txn: &mut MutTxn, x:Result) -> Db {
         unreachable!()
     }
 }
+
 pub fn put<R:Rng>(rng:&mut R, txn: &mut MutTxn, db: Db, key: &[u8], value: &[u8]) -> Db {
     assert!(key.len() < MAX_KEY_SIZE);
     let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
@@ -280,7 +281,8 @@ impl<'a> C<'a> {
 struct Smallest {
     key_ptr:*const u8,
     key_len:usize,
-    value:UnsafeValue
+    value:UnsafeValue,
+    reinsert_page:u64
 }
 
 fn page_delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C) -> Option<(Result,Option<Smallest>)> {
@@ -318,12 +320,12 @@ fn page_delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C) -> Option<(
             // key > next_key, et next > 0
             let deleted = delete(rng,txn,page,next,level,comp);
             match deleted {
-                Some((Result::Ok { page, skip },smallest)) => {
-                    if skip == next {
+                Some((Result::Ok { page, position, skip },smallest)) => {
+                    if position == next {
                         let next_next = u16::from_le(*(page.offset(next as isize + 2*level) as *const u16));
                         *(current.offset(level)) = next_next.to_le();
                     }
-                    Some((Result::Ok { page:page,skip:skip },smallest))
+                    Some((Result::Ok { page:page,position:position, skip:skip },smallest))
                 },
                 Some(_) => unreachable!(),
                 None => None
@@ -333,12 +335,12 @@ fn page_delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C) -> Option<(
             if level>0 {
                 let deleted = delete(rng,txn,page,current_off,level-1,comp);
                 match deleted {
-                    Some((Result::Ok { page, skip },smallest)) => {
-                        if skip == next {
+                    Some((Result::Ok { page, position, skip },smallest)) => {
+                        if position == next {
                             let next_next = u16::from_le(*(page.offset(next as isize + 2*level) as *const u16));
                             *(current.offset(level)) = next_next.to_le();
                         }
-                        Some((Result::Ok { page:page,skip:skip },smallest))
+                        Some((Result::Ok { page:page,position:position, skip:skip },smallest))
                     },
                     Some(_) => unreachable!(),
                     None => None
@@ -358,7 +360,7 @@ fn page_delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C) -> Option<(
                         let (page,current_off) = cow_pinpointing(rng,txn,page,current_off);
                         let current = page.offset(current_off as isize) as *mut u16;
                         *((current as *mut u64).offset(2)) = next_page.page_offset().to_le();
-                        Some((Result::Ok { page: page, skip:0 },smallest))
+                        Some((Result::Ok { page: page, position:0, skip:false },smallest))
                     },
                     Some((Result::Split { key_ptr,key_len,value, left,right,free_page },smallest)) => {
                         let (page,current_off) = cow_pinpointing(rng, txn, page, current_off);
@@ -386,12 +388,13 @@ fn page_delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C) -> Option<(
                                 };
                                 let next_next = u16::from_le(*(page.offset(next as isize) as *const u16));
                                 *current = next_next.to_le();
-                                Some((Result::Ok { page: page, skip:next },
+                                Some((Result::Ok { page: page, position:next, skip:false },
                                       if comp.is_smallest() {
                                           Some(Smallest {
                                               key_ptr: key_ptr,
                                               key_len: key_len,
-                                              value: value
+                                              value: value,
+                                              reinsert_page:0
                                           })
                                       } else {
                                           None
@@ -402,30 +405,17 @@ fn page_delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C) -> Option<(
                                     let next_page = u64::from_le(*((next_ptr as *const u64).offset(2)));
                                     txn.load_cow_page(next_page)
                                 };
-
                                 match page_delete(rng,txn,next_page,C::Smallest) {
-                                    Some((Result::Ok { page:next_page,.. }, Some(smallest))) => {
+                                    Some((Result::Ok { page:next_page,.. }, Some(mut smallest))) => {
 
                                         let (page,current_off) = cow_pinpointing(rng,txn,page,current_off);
-                                        let page = Cow::from_mut_page(page);
                                         let current = page.offset(current_off as isize);
-
-                                        // Temporarily remove next page to delete recursively without looping.
-                                        let _current = *((current as *mut u64).offset(2));
-                                        *((current as *mut u64).offset(2)) = 0;
-
-                                        match page_delete(rng,txn,page,comp) {
-                                            Some((Result::Ok { page,.. }, _)) => {
-
-                                                *((current as *mut u64).offset(2)) = _current;
-                                                let key = std::slice::from_raw_parts(smallest.key_ptr,smallest.key_len);
-                                                Some((page_insert(rng,txn,Cow::from_mut_page(page),key,smallest.value,next_page.page_offset()),
-                                                      None))
-                                            },
-                                            None => None, // not found.
-                                            _ => unreachable!() // This page cannot possibly split, since there's no reinsertion.
-                                        }
-                                    },
+                                        let next = u16::from_le(*(current as *const u16));
+                                        let next_next = u16::from_le(*(page.offset(next as isize) as *const u16));
+                                        *(current as *mut u16) = next_next.to_le();
+                                        smallest.reinsert_page = next_page.page_offset();
+                                        Some((Result::Ok { page:page, position: next, skip:false },Some(smallest)))
+                                    }
                                     None => None,
                                     _ => unreachable!() // Deleting the smallest element involves no reinsertion, hence no split.
                                 }
@@ -461,7 +451,19 @@ pub fn del<R:Rng>(rng:&mut R, txn:&mut MutTxn, db:Db, key:&[u8], value:Option<&[
         UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
     };
     match page_delete(rng,txn, root_page, C::KV { key:key, value:value }) {
-        Some((Result::Ok { page,.. },_)) => {
+        Some((Result::Ok { page,.. },Some(reinsert))) => {
+            unsafe {
+                let key = std::slice::from_raw_parts(reinsert.key_ptr,reinsert.key_len);
+                assert!(key.len() < MAX_KEY_SIZE);
+                match page_insert(rng, txn, Cow::from_mut_page(page), key, reinsert.value, reinsert.reinsert_page) {
+                    Result::Ok { page,.. } => Db { root:page.page_offset() },
+                    x => {
+                        root_split(rng,txn,x)
+                    }
+                }
+            }
+        },
+        Some((Result::Ok { page,.. },None)) => {
             Db { root:page.page_offset() }
         },
         Some((x,_)) => {
