@@ -47,17 +47,22 @@
 //! # Example
 //!
 //! ```
-//! let dir = "/tmp/test";
-//! let env = sanakirja::Env::new(dir).unwrap();
+//! extern crate rand;
+//! extern crate sanakirja;
+//! extern crate tempdir;
+//! let mut rng = rand::thread_rng();
+//! let dir = tempdir::TempDir::new("pijul").unwrap();
+//! let mut rng = rand::thread_rng();
+//! let env = sanakirja::Env::new(dir.path()).unwrap();
 //! let mut txn = env.mut_txn_begin();
 //! let mut root = txn.root_db();
-//! root = txn.put(root,b"test key", b"test value");
+//! root = txn.put(&mut rng, root,b"test key", b"test value");
 //! txn.set_global_root(root);
 //! txn.commit().unwrap();
 //!
 //! let txn = env.txn_begin();
 //! let root = txn.root_db();
-//! assert!(txn.get(&root, b"test key", None).map(|x| x.as_slice()) == Some(b"test value"))
+//! assert!(txn.get(&root, b"test key").and_then(|mut x| x.next()) == Some(b"test value"))
 //! ```
 //!
 
@@ -217,15 +222,17 @@ impl<'env> Txn<'env> {
 fn basic_test() -> ()
 {
     extern crate tempdir;
+    extern crate rand;
+    let mut rng = rand::thread_rng();
     let dir = tempdir::TempDir::new("pijul").unwrap();
     let env = Env::new(dir.path()).unwrap();
     let mut txn = env.mut_txn_begin();
     let mut root = txn.root_db();
-    root = txn.put(root,b"test key", b"test value");
+    root = txn.put(&mut rng, root,b"test key", b"test value");
     txn.set_global_root(root);
     txn.commit().unwrap();
 
     let txn = env.txn_begin();
     let root = txn.root_db();
-    assert!(txn.get(&root, b"test key", None).map(|x| x.as_slice()) == Some(b"test value"))
+    assert!(txn.get(&root, b"test key").and_then(|mut x| x.next()) == Some(b"test value"))
 }
