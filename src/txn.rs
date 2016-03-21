@@ -183,6 +183,24 @@ pub struct Page {
     pub page: transaction::Page,
 }
 
+pub unsafe fn read_key_value<'a>(p: *const u8) -> (&'a [u8], UnsafeValue) {
+    let key_len = u16::from_le(*(p as *const u16).offset(5));
+    let val_len = u32::from_le(*(p as *const u32).offset(3));
+
+    if (val_len as usize) < VALUE_SIZE_THRESHOLD {
+        (std::slice::from_raw_parts((p as *const u8).offset(24 + val_len as isize), key_len as usize),
+         UnsafeValue::S { p:(p as *const u8).offset(24), len:val_len })
+    } else {
+        (std::slice::from_raw_parts((p as *const u8).offset(32), key_len as usize),
+         {
+             let offset = u64::from_le(*((p as *const u64).offset(3)));
+             UnsafeValue::O {
+                 offset: offset,
+                 len: val_len,
+             }
+         })
+    }
+}
 
 
 pub trait LoadPage:Sized {
@@ -201,26 +219,6 @@ pub trait LoadPage:Sized {
         }
     }
 
-
-    unsafe fn read_key_value<'a>(&'a self, p: *const u8) -> (&'a [u8], UnsafeValue) {
-        let key_len = u16::from_le(*(p as *const u16).offset(5));
-        let val_len = u32::from_le(*(p as *const u32).offset(3));
-
-        if (val_len as usize) < VALUE_SIZE_THRESHOLD {
-            (std::slice::from_raw_parts((p as *const u8).offset(24 + val_len as isize), key_len as usize),
-             UnsafeValue::S { p:(p as *const u8).offset(24), len:val_len })
-        } else {
-            (std::slice::from_raw_parts((p as *const u8).offset(32), key_len as usize),
-             {
-                 let offset = u64::from_le(*((p as *const u64).offset(3)));
-                 UnsafeValue::O {
-                     offset: offset,
-                     len: val_len,
-                 }
-             })
-        }
-    }
-
     fn load_page(&self, off: u64) -> Page;
 
     unsafe fn get_<'a>(&'a self, page:Page, key: &[u8], current_off:u16, level:isize) -> Option<UnsafeValue> {
@@ -232,7 +230,7 @@ pub trait LoadPage:Sized {
             false
         } else {
             let next_ptr = page.offset(next as isize);
-            let (next_key,next_value) = self.read_key_value(next_ptr);
+            let (next_key,next_value) = read_key_value(next_ptr);
             match key.cmp(next_key) {
                 Ordering::Less => false,
                 Ordering::Equal => {
@@ -527,7 +525,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                     ("root","".to_string())
                 } else {
 
-                    let (key, value) = txn.read_key_value(ptr as *const u8);
+                    let (key, value) = read_key_value(ptr as *const u8);
                     //println!("key,value = ({:?},{:?})", key.as_ptr(), value.len());
                     let key = std::str::from_utf8_unchecked(key);
                     let mut value_ = Vec::new();

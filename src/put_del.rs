@@ -20,7 +20,7 @@ enum Result {
     },
 }
 
-
+// Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zore offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
 fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -> (MutPage,u16) {
     unsafe {
         match page.cow {
@@ -35,10 +35,7 @@ fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -
                     if current > 4 {
                         let p = p.offset(current);
                         let right_page = u64::from_le(*((p as *const u64).offset(2)));
-                        let (key,value) = {
-                            let (key,value) = txn.read_key_value(p);
-                            (std::slice::from_raw_parts(key.as_ptr(), key.len()), value)
-                        };
+                        let (key,value) = read_key_value(p);
                         match insert(rng, txn, cow, key, value, right_page, FIRST_HEAD, MAX_LEVEL) {
                             Result::Ok { page,position,.. } => {
                                 if current == pinpoint as isize {
@@ -58,7 +55,12 @@ fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -
     }
 }
 
-/// If right_page!=0, this function tries to insert (key,value) in this page (i.e. not in a child).
+// Important: page needs to be Cow and not MutPage, because a
+// MutPage would require a copy, and in the case of a split that would
+// mean copying the contents twice.
+//
+// Note: if right_page!=0, this function inserts (key,value) in this
+// page (i.e. not in a child) (possibly returning Result::Split).
 unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, key:&[u8],value:UnsafeValue,right_page:u64, current_off:u16, level:isize) -> Result {
     // Is (key,value) greater than the next element?
     let current = page.offset(current_off as isize) as *mut u16;
@@ -68,7 +70,7 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, key:&[u8],value:U
         false
     } else {
         let next_ptr = page.offset(next as isize);
-        let (next_key,next_value) = txn.read_key_value(next_ptr);
+        let (next_key,next_value) = read_key_value(next_ptr);
         match key.cmp(next_key) {
             Ordering::Less => false,
             Ordering::Equal => {
@@ -82,22 +84,24 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, key:&[u8],value:U
         }
     };
     if continue_ {
-        // key > next_key, et next > 0
+        // Here, next > 0 and key > next_key. We move on to the next element at the same level.
         insert(rng,txn,page,key,value,right_page,next,level)
     } else {
-        // pas de next_ptr, ou key <= next_key.
+        // Here, either there's no next element, or key <= next_key.
         if level>0 {
+            // If we're not at the bottom level, go down...
             let ins = insert(rng,txn,page,key,value,right_page,current_off,level-1);
             match ins {
                 Result::Ok { page, position, skip } => {
-                    if skip {
-                        // create fast lane on top of off
+                    // ...and update the list at this level randomly,
+                    // only if the previous level was updated (denoted by
+                    // skip==true).
+                    if skip && rng.gen() {
                         *(current.offset(level)) = position.to_le();
-                        //debug!("{:?}",current.offset(level));
                         *(page.offset(position as isize + 2*level) as *mut u16) = next.to_le();
-                        Result::Ok { page:page, skip: rng.gen(), position:position }
+                        Result::Ok { page:page, position:position, skip:true }
                     } else {
-                        Result::Ok { page:page, position:position, skip:skip }
+                        Result::Ok { page:page, position:position, skip:false }
                     }
                 },
                 ins => ins
@@ -110,20 +114,21 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, key:&[u8],value:U
                 let off = page.can_alloc(size);
                 debug!("can_alloc = {:?}, value={:?}",off,value);
                 if off > 0 {
-                    let (mut page,_) = cow_pinpointing(rng, txn, page, 0);
+                    // If there's enough space, copy the page and reinsert between current_off and next.
+                    let (mut page,current_off) = cow_pinpointing(rng, txn, page, current_off);
+                    let current = page.offset(current_off as isize) as *mut u16;
+                    let next = u16::from_le(*(current.offset(level)));
                     let off = page.can_alloc(size);
                     page.alloc_key_value(off, size, key.as_ptr(), key.len(), value);
-                    //println!("alloc, next_page = {:?}", page.offset(off as isize));
                     *((page.offset(off as isize) as *mut u64).offset(2)) = right_page.to_le();
-                    //debug!("alloc: {:?}",off);
-                    // insert
                     *(page.offset(off as isize) as *mut u16) = next.to_le();
-                    //debug!("{:?}",current);
                     *current = off.to_le();
-                    // random number
-                    Result::Ok { page:page, skip:rng.gen(), position:off }
+                    // Return the position of the new allocation, and
+                    // inform the level above that this list was
+                    // updated (skip = true).
+                    Result::Ok { page:page, position:off, skip:true }
                 } else {
-                    // Split !
+                    // Not enough space, split.
                     split_page(rng, txn, &page, size as usize)
                 }
             } else {
@@ -153,17 +158,6 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, key:&[u8],value:U
         }
     }
 }
-/*
-unsafe {
-    insert(rng,
-           txn,
-           page,
-           8,
-           4,
-           key,value,right_page)
-}
-}
-*/
 
 unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->Result {
     let mut left = txn.alloc_page();
@@ -176,7 +170,7 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->R
             let p = page.offset(current);
             let right_page = u64::from_le(*((p as *const u64).offset(2)));
             let (key,value) = {
-                let (key,value) = txn.read_key_value(p);
+                let (key,value) = read_key_value(p);
                 (std::slice::from_raw_parts(key.as_ptr(), key.len()), value)
             };
             let size = record_size(key.len(), value.len() as usize);
@@ -201,7 +195,7 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->R
             let p = page.offset(current);
             let right_page = u64::from_le(*((p as *const u64).offset(2)));
             let (key,value) = {
-                let (key,value) = txn.read_key_value(p);
+                let (key,value) = read_key_value(p);
                 (std::slice::from_raw_parts(key.as_ptr(), key.len()), value)
             };
             match insert(rng, txn, cow_right, key, value, right_page, FIRST_HEAD, MAX_LEVEL) {
@@ -211,10 +205,9 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->R
         }
         current = u16::from_le(*((page.data() as *const u8).offset(current) as *const u16)) as isize;
     }
-    println!("SPLIT middle = {:?}", middle);
     let p = page.offset(middle as isize);
     let (key_ptr,key_len,value) = {
-        let (key,value) = txn.read_key_value(p);
+        let (key,value) = read_key_value(p);
         (key.as_ptr(),key.len(),value)
     };
     let left = cow_left.unwrap_mut();
@@ -229,28 +222,22 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->R
     }
 }
 
-// Assumes result is of type Split.
+// This function deals with the case where the main page split, either during insert, or during delete.
 fn root_split<R:Rng>(rng:&mut R, txn: &mut MutTxn, x:Result) -> Db {
     if let Result::Split { left,right,key_ptr,key_len,value,free_page } = x {
-        println!("SPLIT, value = {:?}",value);
         let mut page = txn.alloc_page();
         page.init();
-        println!("left = {:?}", left.page_offset());
-        println!("right = {:?}", right.page_offset());
         unsafe {
             let key = std::slice::from_raw_parts(key_ptr,key_len);
             let right_offset = right.page_offset();
-            println!("insert");
             let ins = insert(rng, txn, Cow::from_mut_page(page), key, value, right_offset, FIRST_HEAD, MAX_LEVEL);
-            println!("/insert");
             transaction::free(&mut txn.txn, free_page);
             match ins {
                 Result::Ok { page,.. } => {
-                    println!("WRITING LEFT in {:?}", (page.data() as *mut u64).offset(3));
                     *((page.data() as *mut u64).offset(3)) = left.page_offset().to_le();
                     Db { root:page.page_offset() }
                 },
-                _ => unreachable!()
+                _ => unreachable!() // We just inserted a small enough value into a freshly allocated page, no split can possibly happen.
             }
         }
     } else {
@@ -321,7 +308,7 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C, current_o
                 false
             } else {
                 let next_ptr = page.offset(next as isize);
-                let (next_key,next_value) = txn.read_key_value(next_ptr);
+                let (next_key,next_value) = read_key_value(next_ptr);
                 match key.cmp(next_key) {
                     Ordering::Less => false,
                     Ordering::Equal => {
@@ -401,7 +388,7 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C, current_o
                 None => {
                     // not found in the child page.
                     if equal {
-                        println!("deleting, next_page = {:?}",next_page);
+                        debug!("deleting, next_page = {:?}",next_page);
                         if next_page == 0 {
                             // found!
                             let (page,current_off) = cow_pinpointing(rng,txn,page,current_off);
@@ -409,7 +396,7 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C, current_o
                             let next = u16::from_le(*(current.offset(level)));
                             let (key_ptr,key_len,value) = {
                                 let next_ptr = page.offset(next as isize);
-                                let (key,value) = txn.read_key_value(next_ptr);
+                                let (key,value) = read_key_value(next_ptr);
                                 (key.as_ptr(), key.len(), value)
                             };
                             let next_next = u16::from_le(*(page.offset(next as isize) as *const u16));
