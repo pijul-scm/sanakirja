@@ -260,6 +260,7 @@ pub trait LoadPage:Sized {
                                     }
                                 }
                             } else {
+                                equal = Some(next_value);
                                 break
                             },
                         Ordering::Greater => {

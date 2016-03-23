@@ -42,21 +42,25 @@
 //!
 //! ```
 //! extern crate rand;
-//! extern crate sanakirja;
 //! extern crate tempdir;
-//! let mut rng = rand::thread_rng();
-//! let dir = tempdir::TempDir::new("pijul").unwrap();
-//! let mut rng = rand::thread_rng();
-//! let env = sanakirja::Env::new(dir.path()).unwrap();
-//! let mut txn = env.mut_txn_begin();
-//! let mut root = txn.root_db();
-//! root = txn.put(&mut rng, root,b"test key", b"test value");
-//! txn.set_global_root(root);
-//! txn.commit().unwrap();
+//! extern crate sanakirja;
+//! use self::sanakirja::Transaction;
 //!
-//! let txn = env.txn_begin();
-//! let root = txn.root_db();
-//! assert!(txn.get(&root, b"test key").and_then(|mut x| x.next()) == Some(b"test value"))
+//! fn main() {
+//!   let mut rng = rand::thread_rng();
+//!   let dir = tempdir::TempDir::new("pijul").unwrap();
+//!   let mut rng = rand::thread_rng();
+//!   let env = sanakirja::Env::new(dir.path()).unwrap();
+//!   let mut txn = env.mut_txn_begin();
+//!   let mut root = txn.root_db();
+//!   root = txn.put(&mut rng, root,b"test key", b"test value");
+//!   txn.set_global_root(root);
+//!   txn.commit().unwrap();
+//!
+//!   let txn = env.txn_begin();
+//!   let root = txn.root_db();
+//!   assert!(txn.get(&root, b"test key",None).and_then(|mut x| x.next()) == Some(b"test value"))
+//! }
 //! ```
 //!
 
@@ -77,9 +81,7 @@ pub use transaction::Statistics;
 mod txn;
 pub use txn::{MutTxn, Txn, Value, Db};
 use txn::{P, LoadPage};
-//mod rebalance;
 mod put_del;
-//mod del;
 
 /// Environment, containing in particular a pointer to the memory-mapped file.
 pub struct Env {
@@ -213,5 +215,5 @@ fn basic_test() -> ()
 
     let txn = env.txn_begin();
     let root = txn.root_db();
-    assert!(txn.get(&root, b"test key").and_then(|mut x| x.next()) == Some(b"test value"))
+    assert!(txn.get(&root, b"test key",None).and_then(|mut x| x.next()) == Some(b"test value"))
 }
