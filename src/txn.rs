@@ -210,7 +210,7 @@ pub trait LoadPage:Sized {
     fn open_db_<'a>(&'a self, key: &[u8]) -> Option<Db> {
         let page = self.load_page(self.root_db_().root);
         unsafe {
-            let db = self.get_(page, key, 8, 4);
+            let db = self.get_(page, key, None);
             if let Some(UnsafeValue::S{p,..}) = db {
                 Some(Db { root: u64::from_le(*(p as *const u64)) })
             } else {
@@ -221,47 +221,60 @@ pub trait LoadPage:Sized {
 
     fn load_page(&self, off: u64) -> Page;
 
-    unsafe fn get_<'a>(&'a self, page:Page, key: &[u8], current_off:u16, level:isize) -> Option<UnsafeValue> {
-        let current = page.offset(current_off as isize) as *mut u16;
-        let next = u16::from_le(*(current.offset(level)));
-        //debug!("put: current={:?}, level={:?}, next= {:?}", current, level, next);
-        let mut equal = None;
-        let continue_ = if next == 0 {
-            false
-        } else {
-            let next_ptr = page.offset(next as isize);
-            let (next_key,next_value) = read_key_value(next_ptr);
-            match key.cmp(next_key) {
-                Ordering::Less => false,
-                Ordering::Equal => {
-                    equal = Some(next_value);
-                    false
-                },
-                Ordering::Greater => true
-            }
-        };
-        if continue_ {
-            // key > next_key, et next > 0
-            self.get_(page,key,next,level)
-        } else {
-            // pas de next_ptr, ou key <= next_key.
-            if level>0 {
-                self.get_(page,key,current_off,level-1)
-            } else {
-                let next_page = u64::from_le(*((current as *const u64).offset(2)));
-                if next_page == 0 {
-                    equal
+    unsafe fn get_<'a>(&'a self, page:Page, key: &[u8], value:Option<UnsafeValue>) -> Option<UnsafeValue> {
+        let mut current_off = 8;
+        let mut current = page.offset(current_off as isize) as *const u16;
+        let mut level = 4;
+        let mut next_page = 0;
+        let mut equal:Option<UnsafeValue> = None;
+        loop {
+            // advance in the list until there's nothing more to do.
+            loop {
+                let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
+                if next == 0 {
+                    break
                 } else {
-                    debug!("this page: {:?}", page);
-                    let next_page = self.load_page(next_page);
-                    match self.get_(next_page,key,8,4) {
-                        None => equal,
-                        x => x
+                    let next_ptr = page.offset(next as isize);
+                    let (next_key,next_value) = read_key_value(next_ptr);
+                    match key.cmp(next_key) {
+                        Ordering::Less => break,
+                        Ordering::Equal =>
+                            if let Some(value) = value {
+                                match (Value{txn:self,value:value}).cmp(Value{txn:self,value:next_value}) {
+                                    Ordering::Less => break,
+                                    Ordering::Equal => {
+                                        equal = Some(next_value);
+                                        break
+                                    },
+                                    Ordering::Greater => {
+                                        current_off = next;
+                                        current = page.offset(current_off as isize) as *const u16;
+                                    }
+                                }
+                            } else {
+                                break
+                            },
+                        Ordering::Greater => {
+                            current_off = next;
+                            current = page.offset(current_off as isize) as *const u16;
+                        }
                     }
                 }
             }
+            if level == 0 {
+                next_page = u64::from_le(*((current as *const u64).offset(2)));
+                break
+            } else {
+                level -= 1
+            }
         }
-    }
+        if next_page > 0 {
+            let next_page = self.load_page(next_page);
+            self.get_(next_page, key, value).or(equal)
+        } else {
+            equal
+        }
+    }    
 }
 
 

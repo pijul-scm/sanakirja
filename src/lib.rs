@@ -179,7 +179,7 @@ impl<'env> MutTxn<'env> {
     pub fn get<'a>(&'a self, db: &Db, key: &[u8]) -> Option<Value<'a,Self>> {
         unsafe {
             let page = self.load_page(db.root);
-            self.get_(page, key, 8, 4).map(|x| Value { txn:self, value:x })
+            self.get_(page, key, None).map(|x| Value { txn:self, value:x })
         }
     }
     /*
@@ -200,7 +200,7 @@ impl<'env> Txn<'env> {
     pub fn get<'a>(&'a self, db: &Db, key: &[u8]) -> Option<Value<'a,Self>> {
         unsafe {
             let page = self.load_page(db.root);
-            self.get_(page, key, 8, 4).map(|x| Value { txn:self, value:x })
+            self.get_(page, key, None).map(|x| Value { txn:self, value:x })
         }
     }
     pub fn open_db<'a>(&'a self, key: &[u8]) -> Option<Db> {
