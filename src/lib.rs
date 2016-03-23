@@ -28,8 +28,6 @@
 //!
 //! - improve error handling
 //!
-//! - making sure keys fit in cut pages, indication of available space (put).
-//!
 //! - reference counting, and then clone (half-easy)
 //!
 //! - dynamic loading of pages not in the map, especially on 32-bits platforms ('transaction.rs', half-easy)
