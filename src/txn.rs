@@ -183,6 +183,9 @@ pub struct Page {
     pub page: transaction::Page,
 }
 
+pub const FIRST_HEAD:u16 = 8;
+pub const MAX_LEVEL:usize = 4;
+
 pub unsafe fn read_key_value<'a>(p: *const u8) -> (&'a [u8], UnsafeValue) {
     let key_len = u16::from_le(*(p as *const u16).offset(5));
     let val_len = u32::from_le(*(p as *const u32).offset(3));
@@ -202,7 +205,12 @@ pub unsafe fn read_key_value<'a>(p: *const u8) -> (&'a [u8], UnsafeValue) {
     }
 }
 
-
+#[derive(PartialEq,Debug)]
+pub enum Iterate {
+    NotStarted,
+    Started,
+    Finished
+}
 pub trait LoadPage:Sized {
     fn fd(&self) -> c_int;
     fn length(&self) -> u64;
@@ -222,9 +230,9 @@ pub trait LoadPage:Sized {
     fn load_page(&self, off: u64) -> Page;
 
     unsafe fn get_<'a>(&'a self, page:Page, key: &[u8], value:Option<UnsafeValue>) -> Option<UnsafeValue> {
-        let mut current_off = 8;
+        let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
-        let mut level = 4;
+        let mut level = MAX_LEVEL;
         let mut next_page = 0;
         let mut equal:Option<UnsafeValue> = None;
         loop {
@@ -274,7 +282,83 @@ pub trait LoadPage:Sized {
         } else {
             equal
         }
-    }    
+    }
+
+    unsafe fn iterate_<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
+                                                                    mut state: Iterate,
+                                                                    page: Page,
+                                                                    key: &[u8],
+                                                                    value: Option<UnsafeValue>,
+                                                                    f: &F) -> Iterate {
+        let mut current_off = FIRST_HEAD;
+        let mut current = page.offset(current_off as isize) as *const u16;
+        let mut level = MAX_LEVEL;
+        let mut next_page = u64::from_le(*((current as *const u64).offset(2)));
+        let mut equal = false;
+        // First mission: find first element.
+        if state == Iterate::NotStarted {
+            loop {
+                // advance in the list until there's nothing more to do.
+                loop {
+                    let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
+                    if next == 0 {
+                        break
+                    } else {
+                        let next_ptr = page.offset(next as isize);
+                        let (next_key,next_value) = read_key_value(next_ptr);
+                        match key.cmp(next_key) {
+                            Ordering::Less => break,
+                            Ordering::Equal =>
+                                if let Some(value) = value {
+                                    match (Value{txn:self,value:value}).cmp(Value{txn:self,value:next_value}) {
+                                        Ordering::Less => break,
+                                        Ordering::Equal => break,
+                                        Ordering::Greater => {
+                                            current_off = next;
+                                            current = page.offset(current_off as isize) as *const u16;
+                                        }
+                                    }
+                                } else {
+                                    break
+                                },
+                            Ordering::Greater => {
+                                current_off = next;
+                                current = page.offset(current_off as isize) as *const u16;
+                            }
+                        }
+                    }
+                }
+                if level == 0 {
+                    break
+                } else {
+                    level -= 1
+                }
+            }
+        }
+        // Here, we know that "key" is smaller than or equal to the next element.
+        loop {
+            debug!("page {:?}, current: {:?} state: {:?}", page.page_offset(), current_off, state);
+            next_page = u64::from_le(*((current as *const u64).offset(2)));
+            if next_page>0 {
+                let next_page = self.load_page(next_page);
+                state = self.iterate_(state, next_page, key, value, f);
+            }
+            current_off = u16::from_le(*current);
+            if current_off == 0 {
+                break
+            }
+            current = page.offset(current_off as isize) as *const u16;
+            next_page = u64::from_le(*((current as *const u64).offset(2)));
+
+            // On the first time, the "current" entry must not be included.
+            let (key,value) = read_key_value(current as *const u8);
+            if ! f(key,Value{ txn:self, value:value }) {
+                state = Iterate::Finished;
+                break
+            }
+        }
+        state
+    }
 }
 
 

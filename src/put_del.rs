@@ -5,8 +5,6 @@ use std::cmp::Ordering;
 use super::transaction;
 use rand::{Rng};
 
-const FIRST_HEAD:u16 = 8;
-const MAX_LEVEL:usize = 4;
 
 enum Result {
     Ok { page: MutPage,

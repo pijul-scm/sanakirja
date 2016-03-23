@@ -143,9 +143,6 @@ impl Env {
 
 
 impl<'env> MutTxn<'env> {
-    pub fn root_db(&self) -> Db {
-        self.root_db_()
-    }
     pub fn commit(self) -> Result<(), transaction::Error> {
         let extra = self.btree_root.to_le();
         self.txn.commit(&[extra])
@@ -154,10 +151,6 @@ impl<'env> MutTxn<'env> {
         let mut btree = self.alloc_page();
         btree.init();
         Db { root: btree.page_offset() }
-        // root_offset = off;
-    }
-    pub fn open_db(&self, key: &[u8]) -> Option<Db> {
-        self.open_db_(key)
     }
     pub fn put_db<R:Rng>(&mut self, rng:&mut R, db: Db, key: &[u8], value: Db) -> Db {
         let mut val: [u8; 8] = [0; 8];
@@ -176,46 +169,38 @@ impl<'env> MutTxn<'env> {
     pub fn del<R:Rng>(&mut self, r:&mut R, db: Db, key: &[u8], value: Option<&[u8]>) -> Db {
         put_del::del(r, self, db, key, value)
     }
-    pub fn get<'a>(&'a self, db: &Db, key: &[u8]) -> Option<Value<'a,Self>> {
-        unsafe {
-            let page = self.load_page(db.root);
-            self.get_(page, key, None).map(|x| Value { txn:self, value:x })
-        }
-    }
-    /*
-    pub fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool + Copy>(&'a self,
-                                                                       db: Db,
-                                                                       key: &[u8],
-                                                                       value: Option<&[u8]>,
-                                                                       f: F) {
-        unimplemented!()
-    }
-     */
 }
 
-impl<'env> Txn<'env> {
-    pub fn root_db(&self) -> Db {
+pub trait Transaction:LoadPage {
+    fn root_db(&self) -> Db {
         self.root_db_()
     }
-    pub fn get<'a>(&'a self, db: &Db, key: &[u8]) -> Option<Value<'a,Self>> {
+    fn get<'a>(&'a self, db: &Db, key: &[u8], value:Option<&[u8]>) -> Option<Value<'a,Self>> {
         unsafe {
             let page = self.load_page(db.root);
-            self.get_(page, key, None).map(|x| Value { txn:self, value:x })
+            let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
+            self.get_(page, key, value).map(|x| Value { txn:self, value:x })
         }
     }
-    pub fn open_db<'a>(&'a self, key: &[u8]) -> Option<Db> {
+    fn open_db<'a>(&'a self, key: &[u8]) -> Option<Db> {
         self.open_db_(key)
     }
-    /*
-    pub fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool + Copy>(&'a self,
-                                                                 db: Db,
-                                                                 key: &[u8],
-                                                                 value: Option<&[u8]>,
-                                                                 f: F) {
-        unimplemented!()
+
+    fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
+                                                            db: &Db,
+                                                            key: &[u8],
+                                                            value: Option<&[u8]>,
+                                                            f: F) {
+        unsafe {
+            let page = self.load_page(db.root);
+            let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
+            self.iterate_(txn::Iterate::NotStarted,page,key,value,&f);
+        }
     }
-     */
 }
+
+impl<'env> Transaction for Txn<'env> {}
+impl<'env> Transaction for MutTxn<'env> {}
 
 
 #[test]
