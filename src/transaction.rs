@@ -250,6 +250,12 @@ pub struct MutPage {
     pub offset: u64,
 }
 
+impl MutPage {
+    pub fn as_page(&self) -> Page {
+        Page { data:self.data, offset: self.offset }
+    }
+}
+
 pub unsafe fn free(txn: &mut MutTxn, offset: u64) {
     if txn.occupied_clean_pages.remove(&offset) {
         txn.free_clean_pages.push(offset);

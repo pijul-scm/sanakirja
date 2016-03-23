@@ -296,7 +296,6 @@ pub trait LoadPage:Sized {
         let mut current = page.offset(current_off as isize) as *const u16;
         let mut level = MAX_LEVEL;
         let mut next_page = u64::from_le(*((current as *const u64).offset(2)));
-        let mut equal = false;
         // First mission: find first element.
         if state == Iterate::NotStarted {
             loop {
@@ -351,7 +350,7 @@ pub trait LoadPage:Sized {
             }
             current = page.offset(current_off as isize) as *const u16;
             next_page = u64::from_le(*((current as *const u64).offset(2)));
-
+            state = Iterate::Started;
             // On the first time, the "current" entry must not be included.
             let (key,value) = read_key_value(current as *const u8);
             if ! f(key,Value{ txn:self, value:value }) {
@@ -376,7 +375,7 @@ pub trait LoadPage:Sized {
 // - beginning of coding space (different encodings in B-nodes and B-leaves)
 
 
-pub trait P {
+pub trait P:std::fmt::Debug {
     /// offset of the page in the file.
     fn page_offset(&self) -> u64;
 
@@ -387,12 +386,8 @@ pub trait P {
     fn can_alloc(&self, size: u16) -> u16 {
         unsafe {
             assert!(size & 7 == 0); // 64 bits aligned.
-            let first_free = self.first_free();
-
-            let next_page = (self.data() as *mut u8).offset(PAGE_SIZE as isize) as *const u8;
-            let current = (self.data() as *const u8).offset(first_free as isize);
-            if current.offset(size as isize) <= next_page {
-                first_free
+            if self.occupied() + size < PAGE_SIZE as u16 {
+                self.first_free()
             } else {
                 0
             }
@@ -417,6 +412,20 @@ pub trait P {
     }
     fn p_first_free(&self) -> *mut u16 {
         unsafe { ((self.data() as *mut u8).offset(FIRST_HEAD as isize + 10) as *mut u16) }
+    }
+
+    fn occupied(&self) -> u16 {
+        unsafe {
+            let occupied = u16::from_le(*(self.p_occupied()));
+            if occupied > 0 {
+                occupied
+            } else {
+                FIRST_HEAD + 24
+            }
+        }
+    }
+    fn p_occupied(&self) -> *mut u16 {
+        unsafe { ((self.data() as *mut u8).offset(FIRST_HEAD as isize + 12) as *mut u16) }
     }
 
     // offset in u32.
@@ -473,7 +482,10 @@ impl MutPage {
             *((ptr as *mut u16).offset(2)) = NIL.to_le();
             *((ptr as *mut u16).offset(3)) = NIL.to_le();
             *((ptr as *mut u16).offset(4)) = NIL.to_le();
-            *((ptr as *mut u64).offset(2)) = 0;
+            *((ptr as *mut u16).offset(5)) = 0;
+            *((ptr as *mut u16).offset(6)) = 0;
+            *((ptr as *mut u16).offset(7)) = 0;
+            *((ptr as *mut u64).offset(2)) = 0; // next_page
         }
     }
 
@@ -495,6 +507,7 @@ impl MutPage {
                            key_len:usize,
                            value: UnsafeValue) {
         unsafe {
+            *(self.p_occupied()) = (self.occupied() + size).to_le();
             self.alloc(off_ptr, size);
             let ptr = self.offset(off_ptr as isize) as *mut u8;
             *(ptr as *mut u16) = NIL;
@@ -537,6 +550,12 @@ impl Cow {
         match self.cow {
             transaction::Cow::MutPage(p) => MutPage { page: p },
             transaction::Cow::Page(_) => panic!("unwrap")
+        }
+    }
+    pub fn as_nonmut(self) -> Cow {
+        match self.cow {
+            transaction::Cow::MutPage(p) => Cow { cow: transaction::Cow::Page(p.as_page()) },
+            x => Cow { cow: x }
         }
     }
 }
@@ -586,9 +605,11 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
             pages.insert(p.page.offset);
             if print_children {
                 writeln!(buf,
-                         "subgraph cluster{} {{\nlabel=\"Page {}\";\ncolor=black;",
+                         "subgraph cluster{} {{\nlabel=\"Page {}, first_free {}, occupied {}\";\ncolor=black;",
                          p.page.offset,
-                         p.page.offset)
+                         p.page.offset,
+                         p.first_free(),
+                         p.occupied())
                     .unwrap();
             }
             let root = FIRST_HEAD;
@@ -697,4 +718,3 @@ pub fn record_size(key: usize, value: usize) -> u16 {
         size + ((8 - (size & 7)) & 7)
     }
 }
-

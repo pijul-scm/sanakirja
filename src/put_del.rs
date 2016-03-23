@@ -26,27 +26,34 @@ fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -
     unsafe {
         match page.cow {
             transaction::Cow::Page(p) => {
+                let page_offset = p.offset;
                 let p = Page { page:p };
                 let mut page = txn.alloc_page();
                 page.init();
                 let mut current = FIRST_HEAD;
+                debug!("PINPOINTING: {:?} {:?} {:?}", page, page.first_free(), page.occupied());
                 let mut cow = Cow::from_mut_page(page);
                 let mut pinpointed = 0;
                 while current != NIL {
-                    let p = p.offset(current as isize);
-                    let right_page = u64::from_le(*((p as *const u64).offset(2)));
-                    let (key,value) = read_key_value(p);
-                    match insert(rng, txn, cow, key, value, right_page) {
-                        Result::Ok { page, position } => {
-                            if current == pinpoint {
-                                pinpointed = position
-                            }
-                            cow = Cow::from_mut_page(page)
-                        },
-                        _ => unreachable!()
+                    let pp = p.offset(current as isize);
+                    let right_page = u64::from_le(*((pp as *const u64).offset(2)));
+                    if current > FIRST_HEAD {
+                        let (key,value) = read_key_value(pp);
+                        match insert(rng, txn, cow, key, value, right_page) {
+                            Result::Ok { page, position } => {
+                                if current == pinpoint {
+                                    pinpointed = position
+                                }
+                                cow = Cow::from_mut_page(page) // not necessary.
+                            },
+                            _ => unreachable!()
+                        }
+                    } else {
+                        *((cow.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_page
                     }
-                    current = u16::from_le(*((cow.data() as *const u8).offset(current as isize) as *const u16));
+                    current = u16::from_le(*((p.offset(current as isize) as *const u16)));
                 }
+                transaction::free(&mut txn.txn, page_offset);
                 (cow.unwrap_mut(),pinpointed)
             }
             transaction::Cow::MutPage(p) => (MutPage { page:p }, pinpoint)
@@ -58,20 +65,41 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
     let mut levels:[u16;MAX_LEVEL+1] = [0;MAX_LEVEL+1];
     let mut level = MAX_LEVEL;
     let mut current_off = FIRST_HEAD;
-    let mut current = page.offset(current_off as isize) as *mut u16;
 
     let mut next_page = 0; // Next page to explore.
 
     let size = record_size(key.len(), value.len() as usize);
     {
         let off = page.can_alloc(size);
+        debug!("INSERT, off = {:?}, {:?} {:?}", off, page, page.occupied());
         if off > 0 {
-            // We'll need to mute something here anyway, whether or not we're a page.
-            let (page_, _) = cow_pinpointing(rng, txn, page, 0);
-            page = Cow::from_mut_page(page_)
+            // We'll need to mute something here anyway, whether or not we're a leaf.
+            // Several cases: either right_page>0, or we're a leaf, in which case we insert here.
+            // Or we need to mute the page.
+            let is_leaf = (*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2))) == 0;
+            if right_page>0 || is_leaf {
+                if off + size < PAGE_SIZE as u16 {
+                    // No need to compact.
+                    debug!("NO COMPACT");
+                    let (page_, _) = cow_pinpointing(rng, txn, page, 0);
+                    page = Cow::from_mut_page(page_)
+                } else {
+                    let page_off = page.page_offset();
+                    debug!("COMPACT");
+                    let (page_, _) = cow_pinpointing(rng, txn, page.as_nonmut(), 0);
+                    debug!("/COMPACT");
+                    //transaction::free(&mut txn.txn, page_off);
+                    page = Cow::from_mut_page(page_)
+                };
+            } else {
+                debug!("NOTALEAF");
+                let (page_, _) = cow_pinpointing(rng, txn, page, 0);
+                debug!("/NOTALEAF");
+                page = Cow::from_mut_page(page_)
+            }
         }
     }
-
+    let mut current = page.offset(current_off as isize) as *mut u16;
     loop {
         // advance in the list until there's nothing more to do.
         loop {
@@ -133,10 +161,9 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
         let off = page.can_alloc(size);
         if off > 0 {
             // If there's enough space, copy the page and reinsert between current_off and next.
+            let mut page = page.unwrap_mut();
             let current = page.offset(current_off as isize) as *mut u16;
             let next = u16::from_le(*current);
-            let off = page.can_alloc(size);
-            let mut page = page.unwrap_mut();
             page.alloc_key_value(off, size, key.as_ptr(), key.len(), value);
             *((page.offset(off as isize) as *mut u64).offset(2)) = right_page.to_le();
             *(page.offset(off as isize) as *mut u16) = next.to_le();
@@ -156,6 +183,7 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
             // Return the position of the new allocation.
             Result::Ok { page:page, position:off }
         } else {
+            debug!("SPLIT");
             // Not enough space, split.
             split_page(rng, txn, &page, size as usize)
         }
@@ -373,14 +401,18 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
                 let next_off = u16::from_le(*(current.offset(level as isize)));
                 let next = page.offset(next_off as isize) as *mut u16;
                 if next_off == equal {
-                    // Delete the entry at this level.
                     let next_next_off = *(next.offset(level as isize));
-                    if level == 0 && next_next_off == 0 && current_off == FIRST_HEAD {
-                        page_becomes_empty = true;
-                        break;
-                    } else {
-                        *current.offset(level as isize) = next_next_off;
+                    if level == 0 {
+                        let (key,value) = read_key_value(next as *const u8);
+                        let size = record_size(key.len(),value.len() as usize);
+                        *(page.p_occupied()) = (page.occupied() - size).to_le();
+                        if next_next_off == 0 && current_off == FIRST_HEAD {
+                            page_becomes_empty = true;
+                            break;
+                        }
                     }
+                    // Delete the entry at this level.
+                    *current.offset(level as isize) = next_next_off;
                 }
             }
             // If there's a page below, replace with the smallest element in that page.
@@ -435,6 +467,11 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
                         let ptr = (page.offset(off as isize) as *mut u16).offset(level as isize);
                         let next = u16::from_le(*ptr);
                         if next == current_off {
+
+                            let (key,value) = read_key_value(next as *const u8);
+                            let size = record_size(key.len(),value.len() as usize);
+                            *(page.p_occupied()) = (page.occupied() - size).to_le();
+
                             let next_next = u16::from_le(*((page.offset(next as isize) as *const u16)
                                                            .offset(level as isize)));
                             *ptr = next_next;
