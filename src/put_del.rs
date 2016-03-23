@@ -29,25 +29,23 @@ fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -
                 let p = Page { page:p };
                 let mut page = txn.alloc_page();
                 page.init();
-                let mut current = 8;
+                let mut current = FIRST_HEAD;
                 let mut cow = Cow::from_mut_page(page);
                 let mut pinpointed = 0;
-                while current > 0 {
-                    if current > 4 {
-                        let p = p.offset(current);
-                        let right_page = u64::from_le(*((p as *const u64).offset(2)));
-                        let (key,value) = read_key_value(p);
-                        match insert(rng, txn, cow, key, value, right_page) {
-                            Result::Ok { page, position } => {
-                                if current == pinpoint as isize {
-                                    pinpointed = position
-                                }
-                                cow = Cow::from_mut_page(page)
-                            },
-                            _ => unreachable!()
-                        }
+                while current != NIL {
+                    let p = p.offset(current as isize);
+                    let right_page = u64::from_le(*((p as *const u64).offset(2)));
+                    let (key,value) = read_key_value(p);
+                    match insert(rng, txn, cow, key, value, right_page) {
+                        Result::Ok { page, position } => {
+                            if current == pinpoint {
+                                pinpointed = position
+                            }
+                            cow = Cow::from_mut_page(page)
+                        },
+                        _ => unreachable!()
                     }
-                    current = u16::from_le(*((cow.data() as *const u8).offset(current) as *const u16)) as isize;
+                    current = u16::from_le(*((cow.data() as *const u8).offset(current as isize) as *const u16));
                 }
                 (cow.unwrap_mut(),pinpointed)
             }
@@ -78,7 +76,8 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
         // advance in the list until there's nothing more to do.
         loop {
             let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
-            if next == 0 {
+            //println!("first loop, next = {:?}", next);
+            if next == NIL {
                 levels[level] = current_off;
                 break
             } else {
@@ -119,7 +118,7 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
                 let (page, current_off) = cow_pinpointing(rng, txn, page, current_off);
                 let current = page.offset(current_off as isize);
                 *((current as *mut u64).offset(2)) = next_page.page_offset().to_le();
-                Result::Ok { page:page, position: 0 }
+                Result::Ok { page:page, position: NIL }
             },
             Result::Split { key_ptr,key_len,value,left,right,free_page } => {
                 *((current as *mut u64).offset(2)) = 0; //left.page_offset().to_le();
@@ -166,12 +165,12 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
 unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->Result {
     let mut left = txn.alloc_page();
     left.init();
-    let mut left_bytes = 32;
-    let mut current = 8;
+    let mut left_bytes = FIRST_HEAD;
+    let mut current = FIRST_HEAD;
     let mut cow_left = Cow::from_mut_page(left);
-    while left_bytes + (size as usize) < PAGE_SIZE && left_bytes < PAGE_SIZE/2 && current > 0 {
-        if current > 8 {
-            let p = page.offset(current);
+    while left_bytes + (size as u16) < (PAGE_SIZE as u16) && left_bytes < (PAGE_SIZE as u16)/2 && current != NIL {
+        if current > FIRST_HEAD {
+            let p = page.offset(current as isize);
             let right_page = u64::from_le(*((p as *const u64).offset(2)));
             let (key,value) = {
                 let (key,value) = read_key_value(p);
@@ -182,21 +181,21 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->R
                 Result::Ok { page,.. } => cow_left = Cow::from_mut_page(page),
                 _ => unreachable!()
             }
-            left_bytes += size as usize;
+            left_bytes += size as u16;
         }
-        current = u16::from_le(*((page.data() as *const u8).offset(current) as *const u16)) as isize;
+        current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
     }
     let middle = current;
     debug_assert!(middle>0);
     // move on to next
-    current = u16::from_le(*((page.data() as *const u8).offset(current) as *const u16)) as isize;
+    current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
 
     let mut right = txn.alloc_page();
     right.init();
     let mut cow_right = Cow::from_mut_page(right);
-    while current != 0 {
-        if current > 8 {
-            let p = page.offset(current);
+    while current != NIL {
+        if current > FIRST_HEAD {
+            let p = page.offset(current as isize);
             let right_page = u64::from_le(*((p as *const u64).offset(2)));
             let (key,value) = {
                 let (key,value) = read_key_value(p);
@@ -207,7 +206,7 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->R
                 _ => unreachable!()
             }
         }
-        current = u16::from_le(*((page.data() as *const u8).offset(current) as *const u16)) as isize;
+        current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
     }
     let p = page.offset(middle as isize);
     let (key_ptr,key_len,value) = {
@@ -310,7 +309,7 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
         loop {
             let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
             if let C::KV { key,value } = comp {
-                if next == 0 {
+                if next == NIL {
                     levels[level] = current_off;
                     break
                 } else {
@@ -370,19 +369,17 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
             // Delete the entries in all lists.
             for level in 0..(MAX_LEVEL+1) {
                 let &current_off = levels.get_unchecked(level);
-                if current_off > 0 {
-                    let current = page.offset(current_off as isize) as *mut u16;
-                    let next_off = u16::from_le(*(current.offset(level as isize)));
-                    let next = page.offset(next_off as isize) as *mut u16;
-                    if next_off == equal {
-                        // Delete the entry at this level.
-                        let next_next_off = *(next.offset(level as isize));
-                        if level == 0 && next_next_off == 0 && current_off == FIRST_HEAD {
-                            page_becomes_empty = true;
-                            break;
-                        } else {
-                            *current.offset(level as isize) = next_next_off;
-                        }
+                let current = page.offset(current_off as isize) as *mut u16;
+                let next_off = u16::from_le(*(current.offset(level as isize)));
+                let next = page.offset(next_off as isize) as *mut u16;
+                if next_off == equal {
+                    // Delete the entry at this level.
+                    let next_next_off = *(next.offset(level as isize));
+                    if level == 0 && next_next_off == 0 && current_off == FIRST_HEAD {
+                        page_becomes_empty = true;
+                        break;
+                    } else {
+                        *current.offset(level as isize) = next_next_off;
                     }
                 }
             }
@@ -434,7 +431,7 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
                 // the entry we're interested in.
                 for level in 0..(MAX_LEVEL+1) {
                     let mut off = FIRST_HEAD;
-                    while off != 0 {
+                    while off != NIL {
                         let ptr = (page.offset(off as isize) as *mut u16).offset(level as isize);
                         let next = u16::from_le(*ptr);
                         if next == current_off {

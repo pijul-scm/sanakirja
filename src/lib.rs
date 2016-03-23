@@ -28,15 +28,19 @@
 //!
 //! - improve error handling
 //!
-//! - dynamic loading of pages not in the map, especially on 32-bits platforms ('transaction.rs', half-easy)
-//!
-//! - merging pages (delete).
-//!
-//! - combined "CoW + delete".
-//!
-//! - making sure keys fit in cut pages, indication of available space (put). Then, documenting the format.
+//! - making sure keys fit in cut pages, indication of available space (put).
 //!
 //! - reference counting, and then clone (half-easy)
+//!
+//! - dynamic loading of pages not in the map, especially on 32-bits platforms ('transaction.rs', half-easy)
+//!
+//! - documenting the format.
+//!
+//! # For future versions
+//!
+//! - merging pages to rebalance more (delete).
+//!
+//! - combined "CoW + delete".
 //!
 //! # Example
 //!
@@ -120,8 +124,9 @@ impl Env {
             let btree_root = u64::from_le(*p_extra);
             let btree_root = if btree_root == 0 {
                 let p = txn.alloc_page().unwrap();
-                std::ptr::write_bytes(p.data as *mut u8, 0, 24);
-                p.offset
+                let off = p.offset;
+                (txn::MutPage{page:p}).init();
+                off
             } else {
                 btree_root
             };
@@ -144,9 +149,9 @@ impl<'env> MutTxn<'env> {
         self.txn.commit(&[extra])
     }
     pub fn create_db(&mut self) -> Db {
-        let mut btree = self.alloc_page();
-        btree.init();
-        Db { root: btree.page_offset() }
+        let mut db = self.alloc_page();
+        db.init();
+        Db { root: db.page_offset() }
     }
     pub fn put_db<R:Rng>(&mut self, rng:&mut R, db: Db, key: &[u8], value: Db) -> Db {
         let mut val: [u8; 8] = [0; 8];

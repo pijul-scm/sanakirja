@@ -13,6 +13,9 @@ use std::cmp::Ordering;
 
 pub const MAX_KEY_SIZE: usize = PAGE_SIZE >> 2;
 pub const VALUE_SIZE_THRESHOLD: usize = PAGE_SIZE >> 2;
+pub const NIL:u16 = 0;
+pub const FIRST_HEAD:u16 = 8;
+pub const MAX_LEVEL:usize = 4;
 
 #[derive(Debug)]
 pub struct Db {
@@ -183,8 +186,6 @@ pub struct Page {
     pub page: transaction::Page,
 }
 
-pub const FIRST_HEAD:u16 = 8;
-pub const MAX_LEVEL:usize = 4;
 
 pub unsafe fn read_key_value<'a>(p: *const u8) -> (&'a [u8], UnsafeValue) {
     let key_len = u16::from_le(*(p as *const u16).offset(5));
@@ -239,7 +240,7 @@ pub trait LoadPage:Sized {
             // advance in the list until there's nothing more to do.
             loop {
                 let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
-                if next == 0 {
+                if next == NIL {
                     break
                 } else {
                     let next_ptr = page.offset(next as isize);
@@ -302,7 +303,7 @@ pub trait LoadPage:Sized {
                 // advance in the list until there's nothing more to do.
                 loop {
                     let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
-                    if next == 0 {
+                    if next == NIL {
                         break
                     } else {
                         let next_ptr = page.offset(next as isize);
@@ -345,7 +346,7 @@ pub trait LoadPage:Sized {
                 state = self.iterate_(state, next_page, key, value, f);
             }
             current_off = u16::from_le(*current);
-            if current_off == 0 {
+            if current_off == NIL {
                 break
             }
             current = page.offset(current_off as isize) as *const u16;
@@ -410,12 +411,12 @@ pub trait P {
             if first_free > 0 {
                 first_free
             } else {
-                32
+                FIRST_HEAD + 24
             }
         }
     }
     fn p_first_free(&self) -> *mut u16 {
-        unsafe { (self.data() as *mut u16).offset(9) }
+        unsafe { ((self.data() as *mut u8).offset(FIRST_HEAD as isize + 10) as *mut u16) }
     }
 
     // offset in u32.
@@ -465,13 +466,14 @@ impl MutPage {
     pub fn init(&mut self) {
         debug!("mut page init: {:?}",self);
         unsafe {
-            std::ptr::write_bytes(self.page.data as *mut u8, 0, 32);
-            self.incr_rc()
-        }
-    }
-    pub fn incr_rc(&mut self) {
-        unsafe {
-            *(self.page.data as *mut u64) = (self.rc() + 1).to_le();
+            //std::ptr::write_bytes(self.page.data as *mut u8, 0, 32);
+            let ptr = (self.page.data as *mut u8).offset(FIRST_HEAD as isize) as *mut u16;
+            *(ptr as *mut u16) = NIL.to_le();
+            *((ptr as *mut u16).offset(1)) = NIL.to_le();
+            *((ptr as *mut u16).offset(2)) = NIL.to_le();
+            *((ptr as *mut u16).offset(3)) = NIL.to_le();
+            *((ptr as *mut u16).offset(4)) = NIL.to_le();
+            *((ptr as *mut u64).offset(2)) = 0;
         }
     }
 
@@ -495,8 +497,11 @@ impl MutPage {
         unsafe {
             self.alloc(off_ptr, size);
             let ptr = self.offset(off_ptr as isize) as *mut u8;
-            *(ptr as *mut u64) = 0;
-            *((ptr as *mut u64).offset(1)) = 0;
+            *(ptr as *mut u16) = NIL;
+            *((ptr as *mut u16).offset(1)) = NIL;
+            *((ptr as *mut u16).offset(2)) = NIL;
+            *((ptr as *mut u16).offset(3)) = NIL;
+            *((ptr as *mut u16).offset(4)) = NIL;
             *((ptr as *mut u16).offset(5)) = (key_len as u16).to_le();
             let target_key_ptr = match value {
                 UnsafeValue::S { p,len } => {
@@ -586,8 +591,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                          p.page.offset)
                     .unwrap();
             }
-            //let root = unsafe { u16::from_le(*(p.data() as *const u16).offset(8)) };
-            let root = 8;
+            let root = FIRST_HEAD;
             debug!("page root:{:?}", root);
             let mut h = Vec::new();
             let mut edges = Vec::new();
@@ -619,7 +623,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
             let ptr = p.offset(off as isize) as *const u32;
 
             let (key,value) = {
-                if off == 8 {
+                if off == FIRST_HEAD {
                     ("root","".to_string())
                 } else {
 
@@ -659,15 +663,14 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                              p.page.offset,
                              off,
                              next_page,
-                             8)
+                             FIRST_HEAD)
                         .unwrap();
                 };
-
                 nodes.insert(off);
                 for i in 0..5 {
                     let left = u16::from_le(*((ptr as *const u16).offset(i)));
                     //debug!("{:?}",((ptr as *const u16).offset(i)));
-                    if left>0 {
+                    if left != NIL {
                         writeln!(buf,
                                  "n_{}_{}->n_{}_{}[color=\"blue\", label=\"{}\"];",
                                  p.page.offset,
