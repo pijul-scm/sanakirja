@@ -30,8 +30,6 @@
 //!
 //! - dynamic loading of pages not in the map, especially on 32-bits platforms ('transaction.rs', half-easy)
 //!
-//! - deleting the last entry in a page.
-//!
 //! - merging pages (delete).
 //!
 //! - combined "CoW + delete".
@@ -39,10 +37,6 @@
 //! - making sure keys fit in cut pages, indication of available space (put). Then, documenting the format.
 //!
 //! - reference counting, and then clone (half-easy)
-//!
-//! - B-node compaction on copy, and efficient copy when deleting (move entries with current key to the end of the page).
-//!
-//! - decide whether to restrict the API to an iterator of &[u8], or keep concatenated mmaps (for very large values)
 //!
 //! # Example
 //!
