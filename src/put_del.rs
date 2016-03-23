@@ -287,6 +287,7 @@ struct Smallest {
     key_len:usize,
     // smallest of its values
     value:UnsafeValue,
+    free_page: u64,
     // root page of the B-tree from which the smallest element was taken (used to reinsert)
     reinsert_page:u64
 }
@@ -294,7 +295,7 @@ struct Smallest {
 
 // deletes one entry from a page and its children, as instructed by argument comp.
 // Returns:
-// - Some((Result::Ok,..)) with the position of the deleted element if the element was found.
+// - Some((Result::Ok,..)) with the position of the deleted element if the element was found. Field "position" is 1 if the deletion occurred in a different page (1 is an invalid index anyway, and whenever we test for equality to rebuild the list, it is different from "Nil", which is encoded by 0).
 // - Some((Result::Split,..)) if the replacement of a root during the deletion process, caused the page given as argument to split.
 // - None if the requested key wasn't found.
 unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C, current_off:u16, level:isize) -> Option<(Result,Option<Smallest>)> {
@@ -401,17 +402,37 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C, current_o
                             };
                             let next_next = u16::from_le(*(page.offset(next as isize) as *const u16));
                             *current = next_next.to_le();
-                            Some((Result::Ok { page: page, position:next, skip:false },
-                                  if comp.is_smallest() {
-                                      Some(Smallest {
-                                          key_ptr: key_ptr,
-                                          key_len: key_len,
-                                          value: value,
-                                          reinsert_page:0
-                                      })
-                                  } else {
-                                      None
-                                  }))
+                            if current_off == FIRST_HEAD && next_next == 0 {
+                                // This means we're deleting the last element on the page.
+                                // return position = 2: this was the last element.
+                                let page_offset = page.page_offset();
+                                Some((Result::Ok { page: page, position:2, skip:false },
+                                      if comp.is_smallest() {
+                                          Some(Smallest {
+                                              key_ptr: key_ptr,
+                                              key_len: key_len,
+                                              value: value,
+                                              free_page: page_offset,
+                                              reinsert_page:0
+                                          })
+                                      } else {
+                                          transaction::free(&mut txn.txn,page_offset);
+                                          None
+                                      }))
+                            } else {
+                                Some((Result::Ok { page: page, position:next, skip:false },
+                                      if comp.is_smallest() {
+                                          Some(Smallest {
+                                              key_ptr: key_ptr,
+                                              key_len: key_len,
+                                              value: value,
+                                              free_page: 0,
+                                              reinsert_page:0
+                                          })
+                                      } else {
+                                          None
+                                      }))
+                            }
                         } else {
                             let next_page = {
                                 let next_ptr = page.offset(next as isize);
@@ -419,15 +440,28 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, comp:C, current_o
                                 txn.load_cow_page(next_page)
                             };
                             match delete(rng,txn,next_page,C::Smallest, FIRST_HEAD, MAX_LEVEL) {
-                                Some((Result::Ok { page:next_page,.. }, Some(mut smallest))) => {
-
+                                Some((Result::Ok { page:next_page,position,.. }, Some(mut smallest))) => {
+                                    // Remark: here, either we're at
+                                    // the start of the page, or else
+                                    // we're not looking for the
+                                    // smallest element.
+                                    //
+                                    // If the page below becomes
+                                    // empty, we can just reinsert
+                                    // "smallest" in this page,
+                                    // deleting the current key.
                                     let (page,current_off) = cow_pinpointing(rng,txn,page,current_off);
                                     let current = page.offset(current_off as isize);
                                     let next = u16::from_le(*(current as *const u16));
                                     let next_next = u16::from_le(*(page.offset(next as isize) as *const u16));
                                     *(current as *mut u16) = next_next.to_le();
-                                    smallest.reinsert_page = next_page.page_offset();
-                                    Some((Result::Ok { page:page, position: next, skip:false },Some(smallest)))
+                                    if position == 2 {
+                                        // the next page vanished.
+                                        smallest.free_page = next_page.page_offset();
+                                    } else {
+                                        smallest.reinsert_page = next_page.page_offset();
+                                    }
+                                    Some((Result::Ok { page:page, position: next, skip:false }, Some(smallest)))
                                 }
                                 None => None,
                                 _ => unreachable!() // Deleting the smallest element involves no reinsertion, hence no split.
@@ -454,9 +488,14 @@ pub fn del<R:Rng>(rng:&mut R, txn:&mut MutTxn, db:Db, key:&[u8], value:Option<&[
                 let key = std::slice::from_raw_parts(reinsert.key_ptr,reinsert.key_len);
                 assert!(key.len() < MAX_KEY_SIZE);
                 match insert(rng, txn, Cow::from_mut_page(page), key, reinsert.value, reinsert.reinsert_page, FIRST_HEAD, MAX_LEVEL) {
-                    Result::Ok { page,.. } => Db { root:page.page_offset() },
+                    Result::Ok { page,.. } => {
+                        transaction::free(&mut txn.txn, reinsert.free_page);
+                        Db { root:page.page_offset() }
+                    },
                     x => {
-                        root_split(rng,txn,x)
+                        let x = root_split(rng,txn,x);
+                        transaction::free(&mut txn.txn, reinsert.free_page);
+                        x
                     }
                 }
             },
