@@ -202,201 +202,153 @@ impl<'env> Transaction for Txn<'env> {}
 impl<'env> Transaction for MutTxn<'env> {}
 
 
-#[test]
-fn basic_test() -> ()
-{
-    extern crate tempdir;
-    extern crate rand;
-    let mut rng = rand::thread_rng();
-    let dir = tempdir::TempDir::new("pijul").unwrap();
-    let env = Env::new(dir.path()).unwrap();
-    let mut txn = env.mut_txn_begin();
-    let mut root = txn.root_db();
-    root = txn.put(&mut rng, root,b"test key", b"test value");
-    txn.set_global_root(root);
-    txn.commit().unwrap();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let txn = env.txn_begin();
-    let root = txn.root_db();
-    assert!(txn.get(&root, b"test key",None).and_then(|mut x| x.next()) == Some(b"test value"))
-}
-
-
-#[test]
-fn multiple_db() -> ()
-{
-    extern crate tempdir;
-    extern crate rand;
-    let mut rng = rand::thread_rng();
-    let dir = tempdir::TempDir::new("pijul").unwrap();
-    let env = Env::new(dir.path()).unwrap();
-
-    let db_names = [b"great db".to_vec(), b"other db".to_vec(), b"blabla\0blibli".to_vec()];
-    let mut random = Vec::new();
+    #[test]
+    fn basic_test() -> ()
     {
-        let len = 32;
+        extern crate tempdir;
+        extern crate rand;
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path()).unwrap();
         let mut txn = env.mut_txn_begin();
         let mut root = txn.root_db();
-        for ref name in db_names.iter() {
-            let mut db = txn.open_db(&name[..]).unwrap_or(txn.create_db());
-            loop {
-                let k: String = rand::thread_rng()
-                    .gen_iter::<char>()
-                    .take(len)
-                    .collect();
-                let v: String = rand::thread_rng()
-                    .gen_iter::<char>()
-                    .take(len)
-                    .collect();
-                db = txn.put(&mut rng, db, k.as_bytes(), v.as_bytes());
-                random.push((name.clone(), k, v));
-                
-                let r:u8 = rng.gen();
-                if r > 200 { break }
-            }
-            root = txn.put_db(&mut rng, root, &name[..], db);
-        }
+        root = txn.put(&mut rng, root,b"test key", b"test value");
         txn.set_global_root(root);
         txn.commit().unwrap();
+
+        let txn = env.txn_begin();
+        let root = txn.root_db();
+        assert!(txn.get(&root, b"test key",None).and_then(|mut x| x.next()) == Some(b"test value"))
     }
 
-    let db_name = b"great db";
 
-
-    let txn = env.txn_begin();
-    let root = txn.root_db();
-    for &(ref db_name, ref k, ref v) in random.iter() {
-        let db = txn.open_db(&db_name[..]).unwrap();
-        assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| x.next()) == Some(v.as_bytes()));
-        assert!(txn.get(&db, k.as_bytes(), Some(v.as_bytes())).and_then(|mut x| x.next()) == Some(v.as_bytes()))
-    }
-}
-
-
-// #[test]
-pub fn consecutive_commits() -> ()
-{
-    extern crate tempdir;
-    extern crate rand;
-    use rand::SeedableRng;
-    //let mut rng = rand::StdRng::new().unwrap();
-    let mut rng = rand::thread_rng();
-    let dir = tempdir::TempDir::new("pijul").unwrap();
-    let env = Env::new(dir.path()).unwrap();
-
-    /*
-    let name = b"test db";
+    #[test]
+    fn multiple_db() -> ()
     {
-        let mut txn = env.mut_txn_begin();
-        let db = txn.create_db();
-        let mut root = txn.root_db();
-        root = txn.put_db(&mut rng, root, &name[..], db);
-        txn.set_global_root(root);
-        txn.commit().unwrap()
-    }
-     */
-    let mut random:Vec<(String,String)> = Vec::new();
-    {
-        let len = 500;
-        for i in 0..20 {
+        extern crate tempdir;
+        extern crate rand;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path()).unwrap();
+
+        let db_names = [b"great db".to_vec(), b"other db".to_vec(), b"blabla\0blibli".to_vec()];
+        let mut random = Vec::new();
+        {
+            let len = 32;
             let mut txn = env.mut_txn_begin();
-            
-            let mut db = txn.root_db();
-
-            for &(ref k, ref v) in random.iter() {
-                println!("{:?}", &k[0..20]); //;, txn.get(&db, k.as_bytes(), None));
-                //let db = txn.open_db(name).unwrap();
-                assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| x.next()) == Some(v.as_bytes()))
-                //assert!(txn.get(&db, k.as_bytes(), Some(v.as_bytes())).and_then(|mut x| x.next()) == Some(v.as_bytes()))
+            let mut root = txn.root_db();
+            for ref name in db_names.iter() {
+                let mut db = txn.open_db(&name[..]).unwrap_or(txn.create_db());
+                loop {
+                    let k: String = rand::thread_rng()
+                        .gen_iter::<char>()
+                        .take(len)
+                        .collect();
+                    let v: String = rand::thread_rng()
+                        .gen_iter::<char>()
+                        .take(len)
+                        .collect();
+                    db = txn.put(&mut rng, db, k.as_bytes(), v.as_bytes());
+                    random.push((name.clone(), k, v));
+                    
+                    let r:u8 = rng.gen();
+                    if r > 200 { break }
+                }
+                root = txn.put_db(&mut rng, root, &name[..], db);
             }
+            txn.set_global_root(root);
+            txn.commit().unwrap();
+        }
+
+        let db_name = b"great db";
 
 
-            //let mut db = txn.open_db(name).unwrap();
-            let k: String = rand::thread_rng()
-                .gen_ascii_chars()
-                .take(len)
-                .collect();
-            let v: String = rand::thread_rng()
-                .gen_ascii_chars()
-                .take(len)
-                .collect();
-            println!("putting {:?} {:?}", &k[0..20], &v[0..20]);
-            db = txn.put(&mut rng, db, k.as_bytes(), v.as_bytes());
-            txn.debug(&db,format!("/tmp/debug{}",i));
-
-            if true { // rng.gen() {
-                //db = txn.put_db(&mut rng, db, &name[..], db);
-                //println!("root = {:?}", root);
-                txn.set_global_root(db);
-                txn.commit().unwrap();
-                random.push((k, v));                
-            } else {
-                //root = txn.put_db(&mut rng, root, &name[..], db);
-                //txn.set_global_root(root);
-                //txn.abort()
-            }
+        let txn = env.txn_begin();
+        let root = txn.root_db();
+        for &(ref db_name, ref k, ref v) in random.iter() {
+            let db = txn.open_db(&db_name[..]).unwrap();
+            assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| x.next()) == Some(v.as_bytes()));
+            assert!(txn.get(&db, k.as_bytes(), Some(v.as_bytes())).and_then(|mut x| x.next()) == Some(v.as_bytes()))
         }
     }
-    let txn = env.txn_begin();
-    let db = txn.root_db();
 
 
-    for &(ref k, ref v) in random.iter() {
-        println!("{:?}", &k[0..20]); //;, txn.get(&db, k.as_bytes(), None));
-        //let db = txn.open_db(name).unwrap();
-        assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| x.next()) == Some(v.as_bytes()))
-        //assert!(txn.get(&db, k.as_bytes(), Some(v.as_bytes())).and_then(|mut x| x.next()) == Some(v.as_bytes()))
-    }
-    println!("final statistics: {:?}",env.statistics());
-}
-
-
-
-#[test]
-fn large_values() -> () {
-    extern crate tempdir;
-    extern crate rand;
-    let mut rng = rand::thread_rng();
-    let dir = tempdir::TempDir::new("pijul").unwrap();
-    let env = Env::new(dir.path()).unwrap();
-
-    let db_names = [b"great db".to_vec(), b"other db".to_vec(), b"blabla\0blibli".to_vec()];
-    let mut random = Vec::new();
+    fn consecutive_commits_(key_len:usize, value_len:usize) -> ()
     {
-        let len = 32;
-        let mut txn = env.mut_txn_begin();
-        let mut root = txn.root_db();
-        for ref name in db_names.iter() {
-            let mut db = txn.open_db(&name[..]).unwrap_or(txn.create_db());
-            loop {
+        extern crate tempdir;
+        extern crate rand;
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path()).unwrap();
+
+        let mut random:Vec<(String,String)> = Vec::new();
+        let mut buf = Vec::new();
+        {
+            for i in 0..20 {
+                let mut txn = env.mut_txn_begin();
+                
+                let mut db = txn.root_db();
+                {
+                    // Are all values inserted so far here?
+                    for &(ref k, ref v) in random.iter() {
+                        assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
+                            buf.clear();
+                            for i in x {
+                                buf.extend(i)
+                            }
+                            Some(&buf[..])
+                        }) == Some(v.as_bytes()))
+                    }
+                }
                 let k: String = rand::thread_rng()
-                    .gen_iter::<char>()
-                    .take(len)
+                    .gen_ascii_chars()
+                    .take(key_len)
                     .collect();
                 let v: String = rand::thread_rng()
-                    .gen_iter::<char>()
-                    .take(len)
+                    .gen_ascii_chars()
+                    .take(value_len)
                     .collect();
+
                 db = txn.put(&mut rng, db, k.as_bytes(), v.as_bytes());
-                random.push((name.clone(), k, v));
                 
-                let r:u8 = rng.gen();
-                if r > 200 { break }
+                if rng.gen() {
+                    txn.set_global_root(db);
+                    txn.commit().unwrap();
+                    random.push((k, v));                
+                } else {
+                    txn.set_global_root(db);
+                    // txn.abort()
+                }
             }
-            root = txn.put_db(&mut rng, root, &name[..], db);
         }
-        txn.set_global_root(root);
-        txn.commit().unwrap();
+        let txn = env.txn_begin();
+        let db = txn.root_db();
+        for &(ref k, ref v) in random.iter() {
+            assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
+                buf.clear();
+                for i in x {
+                    buf.extend(i)
+                }
+                Some(&buf[..])
+            }) == Some(v.as_bytes()))
+        }
     }
 
-    let db_name = b"great db";
+    #[test]
+    pub fn consecutive_commits() -> () {
+        consecutive_commits_(50,60);
+    }
 
 
-    let txn = env.txn_begin();
-    let root = txn.root_db();
-    for &(ref db_name, ref k, ref v) in random.iter() {
-        let db = txn.open_db(&db_name[..]).unwrap();
-        assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| x.next()) == Some(v.as_bytes()));
-        assert!(txn.get(&db, k.as_bytes(), Some(v.as_bytes())).and_then(|mut x| x.next()) == Some(v.as_bytes()))
+    #[test]
+    pub fn large_values() -> () {
+        consecutive_commits_(500,8000);
     }
 }

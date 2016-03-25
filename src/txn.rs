@@ -42,6 +42,7 @@ impl<'env> MutTxn<'env> {
     pub fn load_cow_page(&mut self, off: u64) -> Cow {
         Cow { cow: self.txn.load_cow_page(off) }
     }
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P) {
         debug(self, db, p)
@@ -49,6 +50,7 @@ impl<'env> MutTxn<'env> {
 }
 
 impl<'env> Txn<'env> {
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P) {
         debug(self, db, p)
@@ -89,18 +91,23 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
     fn next(&mut self)->Option<&'a [u8]> {
         match self.value {
             UnsafeValue::O { ref mut offset, ref mut len } => {
+                debug!("iterator: {:?}, {:?}", offset, len);
                 if *len == 0 {
                     None
                 } else {
                     unsafe {
                         let page = self.txn.load_page(*offset).offset(0);
-                        let first = u64::from_le(*(page as *const u64));
-                        *offset = first;
-                        if first != 0 {
-                            *len -= (PAGE_SIZE-8) as u32;
-                            Some(std::slice::from_raw_parts(page, PAGE_SIZE-8))
+                        // change the pointer of "current page" to the next page
+                        let next_offset = u64::from_le(*((page as *const u64).offset(1)));
+                        //
+                        if next_offset != 0 {
+                            *offset = u64::from_le(*((page as *const u64).offset(1)));
+                            *len -= (PAGE_SIZE-16) as u32;
+                            Some(std::slice::from_raw_parts(page.offset(16), PAGE_SIZE-16))
                         } else {
-                            Some(std::slice::from_raw_parts(page, *len as usize))
+                            let slice=std::slice::from_raw_parts(page.offset(16), *len as usize);
+                            *len = 0;
+                            Some(slice)
                         }
                     }
                 }
@@ -136,31 +143,34 @@ impl<'a,T> Value<'a,T> {
 }
 
 pub fn alloc_value(txn:&mut MutTxn, value: &[u8]) -> UnsafeValue {
+    debug!("alloc_value");
     let mut len = value.len();
-    let p_value = value.as_ptr();
+    let mut p_value = value.as_ptr();
     let mut ptr = std::ptr::null_mut();
     let mut first_page = 0;
     unsafe {
         while len > 0 {
             let page = txn.alloc_page();
             if !ptr.is_null() {
-                *(ptr as *mut u64) = page.page_offset()
+                *((ptr as *mut u64).offset(1)) = page.page_offset()
             } else {
                 first_page = page.page_offset();
             }
             ptr = page.data() as *mut u64;
             *(ptr as *mut u64) = 0;
-            if len > PAGE_SIZE-8 {
-                copy_nonoverlapping(p_value, (ptr as *mut u64).offset(1) as *mut u8, PAGE_SIZE-8);
-                len -= PAGE_SIZE - 8;
-                p_value.offset(PAGE_SIZE as isize-8);
+            *((ptr as *mut u64).offset(1)) = 0;
+            if len > PAGE_SIZE-16 {
+                copy_nonoverlapping(p_value, (ptr as *mut u64).offset(2) as *mut u8, PAGE_SIZE-16);
+                len -= PAGE_SIZE - 16;
+                p_value = p_value.offset(PAGE_SIZE as isize-16);
             } else {
-                copy_nonoverlapping(p_value, (ptr as *mut u64).offset(1) as *mut u8, len);
+                copy_nonoverlapping(p_value, (ptr as *mut u64).offset(2) as *mut u8, len);
                 len = 0;
             }
         }
     }
     debug_assert!(first_page > 0);
+    debug!("/alloc_value");
     UnsafeValue::O { offset: first_page, len: value.len() as u32 }
 }
 
@@ -523,14 +533,13 @@ impl MutPage {
                     copy_nonoverlapping(p,(ptr as *mut u8).offset(24), len as usize);
                     (ptr as *mut u8).offset(24 + len as isize)
                 },
-                _ => unimplemented!()
+                UnsafeValue::O { offset,len } => {
+                    *((ptr as *mut u32).offset(3)) = len.to_le();
+                    *((ptr as *mut u64).offset(3)) = offset.to_le();
+                    (ptr as *mut u8).offset(32)
+                }
             };
             copy_nonoverlapping(key_ptr, target_key_ptr, key_len);
-            /*
-            for i in 0..5 {
-                println!("alloc_key_value:{:?} {:?}", (ptr as *const u16).offset(i),
-                         *((ptr as *const u16).offset(i)))
-            }*/
         }
     }
 }
@@ -590,7 +599,7 @@ impl<'env> LoadPage for Txn<'env> {
     }
 }
 
-
+#[cfg(debug_assertions)]
 fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
     let page = t.load_page(db.root);
     let f = File::create(p.as_ref()).unwrap();
