@@ -354,4 +354,76 @@ mod tests {
     pub fn large_values() -> () {
         consecutive_commits_(500,8000);
     }
+
+    #[test]
+    pub fn large_values_collect() -> () {
+        extern crate tempdir;
+        extern crate rand;
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path()).unwrap();
+
+        let mut random:Vec<(String,String)> = Vec::new();
+        let mut buf = Vec::new();
+
+        let key_len = 50;
+        let long_len = 8000;
+        let short_len = 50;
+
+        // Long
+        let k0: String = rand::thread_rng()
+            .gen_ascii_chars()
+            .take(key_len)
+            .collect();
+        let v0: String = rand::thread_rng()
+            .gen_ascii_chars()
+            .take(long_len)
+            .collect();
+        println!("{:?}", &v0[..20]);
+        // Short
+        let k1: String = rand::thread_rng()
+            .gen_ascii_chars()
+            .take(key_len)
+            .collect();
+        let v1: String = rand::thread_rng()
+            .gen_ascii_chars()
+            .take(short_len)
+            .collect();
+        {
+            let mut txn = env.mut_txn_begin();
+            let mut db = txn.root_db();
+            db = txn.put(&mut rng, db, k0.as_bytes(), v0.as_bytes());
+            db = txn.put(&mut rng, db, k1.as_bytes(), v1.as_bytes());
+            txn.set_global_root(db);
+            txn.commit().unwrap();
+        }
+
+        {
+            let mut txn = env.mut_txn_begin();
+            let mut db = txn.root_db();
+            txn.debug(&db,"/tmp/before");
+            db = txn.del(&mut rng, db, k0.as_bytes(), Some(v0.as_bytes()));
+            txn.debug(&db,"/tmp/after");
+            txn.set_global_root(db);
+            txn.commit().unwrap();
+        }
+
+        let txn = env.txn_begin();
+        let db = txn.root_db();
+        for &(ref k, ref v) in random.iter() {
+            assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
+                buf.clear();
+                for i in x {
+                    buf.extend(i)
+                }
+                Some(&buf[..])
+            }) == Some(v.as_bytes()))
+        }
+    }
+
+
+
+
 }

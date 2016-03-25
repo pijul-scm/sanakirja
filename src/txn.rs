@@ -41,6 +41,18 @@ impl<'env> MutTxn<'env> {
     pub fn load_cow_page(&mut self, off: u64) -> Cow {
         Cow { cow: self.txn.load_cow_page(off) }
     }
+
+    pub fn free_value(&mut self, mut offset:u64, mut len:u32) {
+        unsafe {
+            while offset!=0 {
+                let off = offset;
+                let page = self.load_cow_page(off).data();
+                offset = u64::from_le(*((page as *const u64).offset(1)));
+                transaction::free(&mut self.txn, off)
+            }
+        }
+    }
+
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P) {
@@ -116,15 +128,25 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
                     None
                 } else {
                     let pp = *p;
-                    *p = std::ptr::null_mut();
-                    Some(unsafe {
-                        std::slice::from_raw_parts(pp,*len as usize)
-                    })
+                    unsafe {
+                        let l = if *len > PAGE_SIZE as u32 - 16 {
+                            *p = ((*p) as *mut u8).offset(PAGE_SIZE as isize - 16);
+                            *len -= (PAGE_SIZE - 16) as u32;
+                            PAGE_SIZE-16
+                        } else {
+                            *p = std::ptr::null_mut();
+                            let l = *len;
+                            *len = 0;
+                            l as usize
+                        };
+                        Some(std::slice::from_raw_parts(pp,l as usize))
+                    }
                 }
             }
         }
     }
 }
+
 
 
 impl UnsafeValue {

@@ -323,7 +323,7 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,
 
 // This function deals with the case where the main page split, either during insert, or during delete.
 fn root_split<R:Rng>(rng:&mut R, txn: &mut MutTxn, x:Result) -> Db {
-    println!("ROOT SPLIT");
+    debug!("ROOT SPLIT");
     if let Result::Split { left,right,key_ptr,key_len,value,free_page } = x {
         let mut page = txn.alloc_page();
         page.init();
@@ -401,12 +401,15 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
     let mut current = page.offset(current_off as isize) as *mut u16;
     let mut equal = 0; // The smallest known offset to an entry matching comp.
     let mut next_page = 0; // Next page to explore.
+    let (page,_) = cow_pinpointing(rng,txn,page,0);
+    let page = Cow::from_mut_page(page);
     loop {
         // advance in the list until there's nothing more to do.
         loop {
             let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
             if let C::KV { key,value } = comp {
                 if next == NIL {
+                    debug!("NIL level = {:?}, current_off = {:?}", level, current_off);
                     levels[level] = current_off;
                     break
                 } else {
@@ -414,17 +417,17 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
                     let (next_key,next_value) = read_key_value(next_ptr);
                     match key.cmp(next_key) {
                         Ordering::Less => break,
-                        Ordering::Equal =>
+                        Ordering::Equal => {
+                            debug!("keys equal, values? {:?}",
+                                     (Value{txn:txn,value:value}).cmp(Value{txn:txn,value:next_value}));
                             match (Value{txn:txn,value:value}).cmp(Value{txn:txn,value:next_value}) {
                                 Ordering::Less => break,
                                 Ordering::Equal => {
                                     if equal == 0 {
                                         equal = next;
-                                        let (page_, current_off_) = cow_pinpointing(rng, txn, page, current_off);
-                                        page = Cow::from_mut_page(page_);
-                                        current_off = current_off_;
                                         current = page.offset(current_off as isize) as *mut u16;
                                     }
+                                    debug!("EQ level = {:?}, current_off = {:?}", level, current_off);
                                     levels[level] = current_off;
                                     break
                                 },
@@ -432,7 +435,8 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
                                     current_off = next;
                                     current = page.offset(current_off as isize) as *mut u16;
                                 }
-                            },
+                            }
+                        },
                         Ordering::Greater => {
                             current_off = next;
                             current = page.offset(current_off as isize) as *mut u16;
@@ -466,6 +470,7 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
             // Delete the entries in all lists.
             for level in 0..(MAX_LEVEL+1) {
                 let &current_off = levels.get_unchecked(level);
+                debug!("level = {:?}, current_off = {:?}", level, current_off);
                 let current = page.offset(current_off as isize) as *mut u16;
                 let next_off = u16::from_le(*(current.offset(level as isize)));
                 let next = page.offset(next_off as isize) as *mut u16;
@@ -473,6 +478,10 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
                     let next_next_off = *(next.offset(level as isize));
                     if level == 0 {
                         let (key,value) = read_key_value(next as *const u8);
+                        if let UnsafeValue::O { offset, len } = value {
+                            txn.free_value(offset,len)
+                        }
+
                         let size = record_size(key.len(),value.len() as usize);
                         *(page.p_occupied()) = (page.occupied() - size).to_le();
                         if next_next_off == 0 && current_off == FIRST_HEAD {
@@ -527,6 +536,9 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
                 //next_page becomes empty. Delete current entry, and reinsert.
                 transaction::free(&mut txn.txn, next_page.page_offset());
                 let (key,value) = read_key_value(current as *const u8);
+                if let UnsafeValue::O { offset, len } = value {
+                    txn.free_value(offset,len)
+                }
                 // Delete current entry. Since we lost the list
                 // pointers, we need to search all lists and delete
                 // the entry we're interested in.
