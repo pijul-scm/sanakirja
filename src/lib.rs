@@ -403,9 +403,9 @@ mod tests {
         {
             let mut txn = env.mut_txn_begin();
             let mut db = txn.root_db();
-            txn.debug(&db,"/tmp/before");
+            //txn.debug(&db,"/tmp/before");
             db = txn.del(&mut rng, db, k0.as_bytes(), Some(v0.as_bytes()));
-            txn.debug(&db,"/tmp/after");
+            //txn.debug(&db,"/tmp/after");
             txn.set_global_root(db);
             txn.commit().unwrap();
         }
