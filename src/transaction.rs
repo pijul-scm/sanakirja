@@ -30,7 +30,7 @@ use std::cmp::max;
 // use std::marker::PhantomData;
 use std::ops::Shl;
 use fs2::FileExt;
-use std::fs::File;
+use std::fs::{File,OpenOptions};
 use std::path::Path;
 use memmap;
 
@@ -113,7 +113,14 @@ impl Env {
         let length = (1 as u64).shl(log_length);
         assert!(length >= PAGE_SIZE_64);
         let db_path = path.as_ref().join("db");
-        let file = try!(File::open(db_path));
+        let file = try!(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .create(true)
+                .open(db_path)
+        );
         try!(file.set_len(length));
         let mut mmap = try!(memmap::Mmap::open(&file, memmap::Protection::ReadWrite));
         let lock_file = try!(File::create(path.as_ref()
