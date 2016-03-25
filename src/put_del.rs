@@ -139,18 +139,28 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
                 Result::Ok { page:page, position: NIL }
             },
             Result::Split { key_ptr,key_len,value:value_,left,right,free_page } => {
-                // Veeeeeery suboptimal, especially if this
-                // pinpointing involves rewriting the page, what if we
-                // split just after this?
-                let (page, current_off) = cow_pinpointing(rng, txn, page, current_off);
-                let current = page.offset(current_off as isize);
-                *((current as *mut u64).offset(2)) = left.page_offset().to_le();
-                let key_ = std::slice::from_raw_parts(key_ptr,key_len);
 
-                // Then, reinsert (key_,value_) in the current page.
-                let result = insert(rng,txn,Cow::from_mut_page(page),key_, value_, right.page_offset());
-                transaction::free(&mut txn.txn, free_page);
-                result
+                let size = record_size(key_len, value_.len() as usize);
+                let off = page.can_alloc(size);
+                // If there's enough space here, just go on inserting.
+                if off > 0 {
+                    let (page, current_off) = cow_pinpointing(rng, txn, page, current_off);
+                    let current = page.offset(current_off as isize);
+                    *((current as *mut u64).offset(2)) = left.page_offset().to_le();
+                    let key_ = std::slice::from_raw_parts(key_ptr,key_len);
+                    // Then, reinsert (key_,value_) in the current page.
+                    let result = insert(rng,txn,Cow::from_mut_page(page),key_, value_, right.page_offset());
+                    transaction::free(&mut txn.txn, free_page);
+                    result
+                } else {
+                    // Else, split+translate first, then insert.
+                    let key_ = std::slice::from_raw_parts(key_ptr,key_len);
+                    let result = split_page(rng, txn, &page, size as usize,
+                                            key_, value_, right.page_offset(),
+                                            current_off, left.page_offset());
+                    transaction::free(&mut txn.txn, free_page);
+                    result
+                }
             }
         }
     } else {
@@ -182,12 +192,31 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
         } else {
             debug!("SPLIT");
             // Not enough space, split.
-            split_page(rng, txn, &page, size as usize, key, value, right_page)
+            split_page(rng, txn, &page, size as usize, key, value, right_page, 0, 0)
         }
     }
 }
 
-unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize, key:&[u8], value:UnsafeValue, right_page:u64)->Result {
+
+/// The arguments to split_page are non-trivial. This function splits a page, and then reinserts the new element. The middle element of the split is returned as a Result::Split { .. }.
+unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,
+                            // The record size (actually redundant with key and value),
+                            // key, value, right_page of the record to insert.
+                            size:usize, key:&[u8], value:UnsafeValue, right_page:u64,
+                            // Sometimes, a split propagates upwards:
+                            // more precisely, inserting the middle
+                            // element into the page upwards causes it
+                            // to split. If the page upwards was
+                            // non-mutable, we could not write the
+                            // page to the left of the middle element
+                            // before the split (without copying the
+                            // whole soon-to-be-freed page, of
+                            // course). translate_index and
+                            // translate_right_page are meant for this
+                            // purpose: the pointer to the page that
+                            // split is "translated" to a pointer to the
+                            // left page of the split.
+                            translate_index:u16, translate_right_page:u64)->Result {
 
     debug!("SPLIT");
     let mut left = txn.alloc_page();
@@ -209,6 +238,7 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize, ke
         };
         let current_size = record_size(key.len(), value.len() as usize);
         if left_bytes + current_size < (PAGE_SIZE as u16) / 2 {
+            let right_page = if current == translate_index { translate_right_page } else { right_page };
             match insert(rng, txn, cow_left, key, value, right_page) {
                 Result::Ok { page,.. } => cow_left = Cow::from_mut_page(page),
                 _ => unreachable!()
@@ -234,6 +264,7 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize, ke
         if current > FIRST_HEAD {
             let p = page.offset(current as isize);
             let right_page = u64::from_le(*((p as *const u64).offset(2)));
+            let right_page = if current == translate_index { translate_right_page } else { right_page };
             let (key,value) = {
                 let (key,value) = read_key_value(p);
                 (std::slice::from_raw_parts(key.as_ptr(), key.len()), value)
