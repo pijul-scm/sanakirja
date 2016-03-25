@@ -12,7 +12,7 @@
 //!
 //! - Support for referential transparency (interface still missing).
 //!
-//! - No locks, writers exclude each other, and only exclude readers during calls to ```commit()``` (readers still read the database as it was before the start of the writers/mutable transaction).
+//! - No read locks. The only three cases of locks are (1) on the first transaction of a thread, (2) when starting concurrent writers, or (3) when starting a writer in parallel with a reader started before the last commit on the file.
 //!
 //!
 //! This version is only capable of inserting and retrieving keys in
@@ -35,6 +35,8 @@
 //! - documenting the format.
 //!
 //! # For future versions
+//!
+//! - implement advertised lock model (right now, committing a writer excludes readers, there's no other lock).
 //!
 //! - merging pages to rebalance more (delete).
 //!
