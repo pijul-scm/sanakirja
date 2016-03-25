@@ -17,6 +17,8 @@ fs2="0.2"
 time="*"
 rand="*"
 
+tempdir="0.3"
+
 [build-dependencies]
 libc="0.2"
 

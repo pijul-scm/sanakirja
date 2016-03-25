@@ -33,18 +33,19 @@ fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -
                 let mut current = FIRST_HEAD;
                 debug!("PINPOINTING: {:?} {:?} {:?}", page, page.first_free(), page.occupied());
                 let mut cow = Cow::from_mut_page(page);
-                let mut pinpointed = 0;
+                let mut pinpointed = FIRST_HEAD;
                 while current != NIL {
                     let pp = p.offset(current as isize);
                     let right_page = u64::from_le(*((pp as *const u64).offset(2)));
                     if current > FIRST_HEAD {
                         let (key,value) = read_key_value(pp);
+                        debug!("PINPOINT: {:?}", std::str::from_utf8(key).unwrap());
                         match insert(rng, txn, cow, key, value, right_page) {
                             Result::Ok { page, position } => {
                                 if current == pinpoint {
                                     pinpointed = position
                                 }
-                                cow = Cow::from_mut_page(page) // not necessary.
+                                cow = Cow::from_mut_page(page)
                             },
                             _ => unreachable!()
                         }
@@ -53,6 +54,7 @@ fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -
                     }
                     current = u16::from_le(*((p.offset(current as isize) as *const u16)));
                 }
+                debug!("/PINPOINTING");
                 transaction::free(&mut txn.txn, page_offset);
                 (cow.unwrap_mut(),pinpointed)
             }
@@ -68,37 +70,24 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
 
     let mut next_page = 0; // Next page to explore.
 
+    let is_leaf = (*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2))) == 0;
     let size = record_size(key.len(), value.len() as usize);
-    {
-        let off = page.can_alloc(size);
-        debug!("INSERT, off = {:?}, {:?} {:?}", off, page, page.occupied());
-        if off > 0 {
-            // We'll need to mute something here anyway, whether or not we're a leaf.
-            // Several cases: either right_page>0, or we're a leaf, in which case we insert here.
-            // Or we need to mute the page.
-            let is_leaf = (*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2))) == 0;
-            if right_page>0 || is_leaf {
-                if off + size < PAGE_SIZE as u16 {
-                    // No need to compact.
-                    debug!("NO COMPACT");
-                    let (page_, _) = cow_pinpointing(rng, txn, page, 0);
-                    page = Cow::from_mut_page(page_)
-                } else {
-                    let page_off = page.page_offset();
-                    debug!("COMPACT");
-                    let (page_, _) = cow_pinpointing(rng, txn, page.as_nonmut(), 0);
-                    debug!("/COMPACT");
-                    //transaction::free(&mut txn.txn, page_off);
-                    page = Cow::from_mut_page(page_)
-                };
-            } else {
-                debug!("NOTALEAF");
-                let (page_, _) = cow_pinpointing(rng, txn, page, 0);
-                debug!("/NOTALEAF");
-                page = Cow::from_mut_page(page_)
-            }
+    let off = page.can_alloc(size);
+    debug!("INSERT, off = {:?}, {:?} {:?}, right_page={:?}, is_leaf={:?}", off, page, page.occupied(), right_page, is_leaf);
+    if off > 0 && (right_page>0 || is_leaf) {
+        if off + size < PAGE_SIZE as u16 {
+            // No need to compact.
+            //debug!("NO COMPACT");
+            let (page_, _) = cow_pinpointing(rng, txn, page, 0);
+            page = Cow::from_mut_page(page_)
+        } else {
+            debug!("COMPACT");
+            let (page_, _) = cow_pinpointing(rng, txn, page.as_nonmut(), 0);
+            debug!("/COMPACT");
+            page = Cow::from_mut_page(page_)
         }
     }
+    debug!("INSERT: {:?} {:?} {:?} {:?}",page,current_off, right_page, std::str::from_utf8(key).unwrap());
     let mut current = page.offset(current_off as isize) as *mut u16;
     loop {
         // advance in the list until there's nothing more to do.
@@ -139,25 +128,33 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
             level -= 1
         }
     }
-    if next_page > 0 {
+    if next_page > 0 && right_page == 0 {
         let next_page = txn.load_cow_page(next_page);
         match insert(rng, txn, next_page, key, value, right_page) {
             Result::Ok { page:next_page, .. } => {
                 let (page, current_off) = cow_pinpointing(rng, txn, page, current_off);
                 let current = page.offset(current_off as isize);
+                debug!("page={:?}, next = {:?}", page,next_page);
                 *((current as *mut u64).offset(2)) = next_page.page_offset().to_le();
                 Result::Ok { page:page, position: NIL }
             },
-            Result::Split { key_ptr,key_len,value,left,right,free_page } => {
-                *((current as *mut u64).offset(2)) = 0; //left.page_offset().to_le();
-                let key = std::slice::from_raw_parts(key_ptr,key_len);
-                let result = insert(rng,txn,page,key, value, right.page_offset());
+            Result::Split { key_ptr,key_len,value:value_,left,right,free_page } => {
+                // Veeeeeery suboptimal, especially if this
+                // pinpointing involves rewriting the page, what if we
+                // split just after this?
+                let (page, current_off) = cow_pinpointing(rng, txn, page, current_off);
+                let current = page.offset(current_off as isize);
                 *((current as *mut u64).offset(2)) = left.page_offset().to_le();
+                let key_ = std::slice::from_raw_parts(key_ptr,key_len);
+
+                // Then, reinsert (key_,value_) in the current page.
+                let result = insert(rng,txn,Cow::from_mut_page(page),key_, value_, right.page_offset());
                 transaction::free(&mut txn.txn, free_page);
                 result
             }
         }
     } else {
+        // next_page == 0 || right_page > 0, i.e. is_leaf || right_page>0
         let off = page.can_alloc(size);
         if off > 0 {
             // If there's enough space, copy the page and reinsert between current_off and next.
@@ -171,7 +168,7 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
 
             // Add to upper levels
             level = 1;
-            debug!("levels = {:?}", &levels[..]);
+            //debug!("levels = {:?}", &levels[..]);
             while level <= MAX_LEVEL && rng.gen() {
                 let ptr = page.offset(levels[level] as isize) as *mut u16;
                 let next = *(ptr.offset(level as isize));
@@ -185,41 +182,53 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
         } else {
             debug!("SPLIT");
             // Not enough space, split.
-            split_page(rng, txn, &page, size as usize)
+            split_page(rng, txn, &page, size as usize, key, value, right_page)
         }
     }
 }
 
-unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->Result {
+unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize, key:&[u8], value:UnsafeValue, right_page:u64)->Result {
+
+    debug!("SPLIT");
     let mut left = txn.alloc_page();
     left.init();
+    *((left.offset(FIRST_HEAD as isize) as *mut u64).offset(2))
+        = *((page.offset(FIRST_HEAD as isize) as *const u64).offset(2));
+
     let mut left_bytes = FIRST_HEAD;
     let mut current = FIRST_HEAD;
     let mut cow_left = Cow::from_mut_page(left);
-    while left_bytes + (size as u16) < (PAGE_SIZE as u16) && left_bytes < (PAGE_SIZE as u16)/2 && current != NIL {
-        if current > FIRST_HEAD {
-            let p = page.offset(current as isize);
-            let right_page = u64::from_le(*((p as *const u64).offset(2)));
-            let (key,value) = {
-                let (key,value) = read_key_value(p);
-                (std::slice::from_raw_parts(key.as_ptr(), key.len()), value)
-            };
-            let size = record_size(key.len(), value.len() as usize);
+
+    current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
+    loop {
+        let p = page.offset(current as isize);
+        let right_page = u64::from_le(*((p as *const u64).offset(2)));
+        let (key,value) = {
+            let (key,value) = read_key_value(p);
+            (std::slice::from_raw_parts(key.as_ptr(), key.len()), value)
+        };
+        let current_size = record_size(key.len(), value.len() as usize);
+        if left_bytes + current_size < (PAGE_SIZE as u16) / 2 {
             match insert(rng, txn, cow_left, key, value, right_page) {
                 Result::Ok { page,.. } => cow_left = Cow::from_mut_page(page),
                 _ => unreachable!()
             }
-            left_bytes += size as u16;
+            left_bytes += current_size as u16;
+        } else {
+            break
         }
         current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
     }
     let middle = current;
-    debug_assert!(middle>0);
+    debug_assert!(middle != NIL);
     // move on to next
     current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
+    //debug_assert!(current != NIL);
 
     let mut right = txn.alloc_page();
     right.init();
+    *((right.offset(FIRST_HEAD as isize) as *mut u64).offset(2))
+        = *((page.offset(middle as isize) as *const u64).offset(2));
     let mut cow_right = Cow::from_mut_page(right);
     while current != NIL {
         if current > FIRST_HEAD {
@@ -237,16 +246,45 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->R
         current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
     }
     let p = page.offset(middle as isize);
-    let (key_ptr,key_len,value) = {
+    let (key_ptr,key_len,value_) = {
         let (key,value) = read_key_value(p);
         (key.as_ptr(),key.len(),value)
     };
-    let left = cow_left.unwrap_mut();
-    let right = cow_right.unwrap_mut();
+
+
+    // We still need to reinsert key,value in one of the two pages.
+    let key_ = std::slice::from_raw_parts(key_ptr,key_len);
+    let (left,right) = match key.cmp(key_) {
+        Ordering::Less => {
+            match insert(rng,txn,cow_left,key, value, right_page) {
+                Result::Ok { page, .. } => (page, cow_right.unwrap_mut()),
+                _ => unreachable!()
+            }
+        },
+        Ordering::Equal =>
+            match (Value{txn:txn,value:value}).cmp(Value{txn:txn,value:value_}) {
+                Ordering::Less | Ordering::Equal =>
+                    match insert(rng,txn,cow_left,key, value, right_page) {
+                        Result::Ok { page, .. } => (page, cow_right.unwrap_mut()),
+                        _ => unreachable!()
+                    },
+                Ordering::Greater =>
+                    match insert(rng, txn, cow_right, key, value, right_page) {
+                        Result::Ok { page, .. } => (cow_left.unwrap_mut(), page),
+                        _ => unreachable!()
+                    },
+            },
+        Ordering::Greater =>
+            match insert(rng, txn, cow_right, key, value, right_page) {
+                Result::Ok { page, .. } => (cow_left.unwrap_mut(), page),
+                _ => unreachable!()
+            }
+    };
+    debug!("/SPLIT");
     Result::Split {
         key_ptr: key_ptr,
         key_len: key_len,
-        value: value,
+        value: value_,
         left: left,
         right: right,
         free_page: page.page_offset()
@@ -255,17 +293,18 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,size:usize)->R
 
 // This function deals with the case where the main page split, either during insert, or during delete.
 fn root_split<R:Rng>(rng:&mut R, txn: &mut MutTxn, x:Result) -> Db {
+    println!("ROOT SPLIT");
     if let Result::Split { left,right,key_ptr,key_len,value,free_page } = x {
         let mut page = txn.alloc_page();
         page.init();
         unsafe {
+            *((page.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left.page_offset().to_le();
             let key = std::slice::from_raw_parts(key_ptr,key_len);
             let right_offset = right.page_offset();
             let ins = insert(rng, txn, Cow::from_mut_page(page), key, value, right_offset);
             transaction::free(&mut txn.txn, free_page);
             match ins {
                 Result::Ok { page,.. } => {
-                    *((page.data() as *mut u64).offset(3)) = left.page_offset().to_le();
                     Db { root:page.page_offset() }
                 },
                 _ => unreachable!() // We just inserted a small enough value into a freshly allocated page, no split can possibly happen.

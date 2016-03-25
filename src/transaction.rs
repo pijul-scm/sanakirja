@@ -169,6 +169,7 @@ impl Env {
     pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env> {
         unsafe {
             let (last_page, current_list_page) = self.read_map_header();
+            debug!("map header = {:?}, {:?}", last_page ,current_list_page);
             let guard = self.mutable.lock().unwrap();
             self.mutable_file.lock_exclusive().unwrap();
             let current_list_page = Page {
@@ -268,6 +269,7 @@ pub unsafe fn free(txn: &mut MutTxn, offset: u64) {
 impl<'env> Txn<'env> {
     /// Find the appropriate map segment
     pub fn load_page(&self, off: u64) -> Page {
+        //println!("load_page: off={:?}, length = {:?}", off, self.env.length);
         assert!(off < self.env.length);
         unsafe {
             Page {
@@ -443,7 +445,6 @@ impl<'env> MutTxn<'env> {
                         debug!("commit: current is full, len={}", len);
                         // 8 more bytes wouldn't fit in this page, time to allocate a new one
                         let new_page = self.alloc_page().unwrap();
-
                         // Write a reference to the current page (which cannot be null).
                         *(new_page.data as *mut u64) = current_page_offset.to_le();
                         // Write the length of the new page (0).
@@ -469,19 +470,7 @@ impl<'env> MutTxn<'env> {
             {
                 *self.env.lock.write().unwrap();
                 self.env.lock_file.lock_exclusive().unwrap();
-                if last_freed_page == self.last_page - PAGE_SIZE as u64 {
-                    // If the last page was freed by the
-                    // transaction. Maybe other blocks just before it
-                    // were freed too, but they're not merged into the
-                    // blank space. Maybe they should, but since the
-                    // penultimate page might have been freed in a
-                    // previous transaction and not reused, this is
-                    // not very general either, so providing this
-                    // simple mechanism allows for shrinking.
-                    *(self.env.map as *mut u64) = last_freed_page.to_le();
-                } else {
-                    *(self.env.map as *mut u64) = self.last_page.to_le();
-                }
+                *(self.env.map as *mut u64) = self.last_page.to_le();
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
                 // debug!("commit: {:?}",extra);
                 copy_nonoverlapping(extra.as_ptr(),
@@ -518,53 +507,3 @@ impl Drop for Env {
         }
     }
 }
-
-
-
-
-// pub fn glue_mut_pages<'a>(env:&Env,pages:&'a[MutPage])->Result<MutPages<'a>,Error> {
-// unsafe {
-// glue_pages(env,std::mem::transmute(pages)).and_then(|x| Ok(MutPages {pages:x}))
-// }
-// }
-// pub fn glue_pages<'a>(env:&Env,pages:&'a[Page])->Result<Pages<'a>,Error> {
-// let mut memory=std::ptr::null_mut();
-// let mut p0=std::ptr::null_mut();
-// let mut l=0;
-// for p in pages {
-// unsafe {
-// if memory.is_null() {
-// memory=libc::mmap(memory as *mut c_void,
-// PAGE_SIZE as size_t,
-// PROT_READ|PROT_WRITE,
-// MAP_SHARED,
-// env.fd,
-// p.offset as off_t
-// ) as *mut u8;
-// } else {
-// memory=libc::mmap(memory.offset(PAGE_SIZE as isize) as *mut c_void,
-// PAGE_SIZE as size_t,
-// PROT_READ|PROT_WRITE,
-// MAP_SHARED | MAP_FIXED,
-// env.fd,
-// p.offset as off_t
-// ) as *mut u8;
-// }
-// if memory as *mut c_void == libc::MAP_FAILED {
-// let err=std::io::Error::last_os_error();
-// {
-// the Drop trait unmaps the memory.
-// Pages {map:p0,len:l,pages:PhantomData };
-// }
-// return Err(Error::IO(err));
-// } else {
-// if p0.is_null() {
-// p0=memory
-// }
-// l += PAGE_SIZE
-// }
-// }
-// }
-// Ok(Pages {map:p0,len:l,pages:PhantomData})
-// }
-//

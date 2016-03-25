@@ -475,7 +475,7 @@ impl MutPage {
     pub fn init(&mut self) {
         debug!("mut page init: {:?}",self);
         unsafe {
-            //std::ptr::write_bytes(self.page.data as *mut u8, 0, 32);
+            std::ptr::write_bytes(self.page.data as *mut u8, 0, FIRST_HEAD as usize);
             let ptr = (self.page.data as *mut u8).offset(FIRST_HEAD as isize) as *mut u16;
             *(ptr as *mut u16) = NIL.to_le();
             *((ptr as *mut u16).offset(1)) = NIL.to_le();
@@ -516,6 +516,7 @@ impl MutPage {
             *((ptr as *mut u16).offset(3)) = NIL;
             *((ptr as *mut u16).offset(4)) = NIL;
             *((ptr as *mut u16).offset(5)) = (key_len as u16).to_le();
+            *((ptr as *mut u64).offset(2)) = 0;
             let target_key_ptr = match value {
                 UnsafeValue::S { p,len } => {
                     *((ptr as *mut u32).offset(3)) = len.to_le();
@@ -613,7 +614,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                     .unwrap();
             }
             let root = FIRST_HEAD;
-            debug!("page root:{:?}", root);
+            //debug!("print_page: page {:?}", p.page.offset);
             let mut h = Vec::new();
             let mut edges = Vec::new();
             let mut hh = HashSet::new();
@@ -640,7 +641,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                                p: &Page,
                                off: u16) {
         unsafe {
-            //debug!("print tree:{:?}",off);
+            //debug!("print tree:{:?}, off={:?}",p, off);
             let ptr = p.offset(off as isize) as *const u32;
 
             let (key,value) = {
@@ -650,7 +651,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
 
                     let (key, value) = read_key_value(ptr as *const u8);
                     //println!("key,value = ({:?},{:?})", key.as_ptr(), value.len());
-                    let key = std::str::from_utf8_unchecked(key);
+                    let key = std::str::from_utf8_unchecked(&key[0..(std::cmp::min(20,key.len()))]);
                     let mut value_ = Vec::new();
                     let mut value = Value { txn:txn,value:value };
                     let value = if value.len() > 20 {
@@ -676,16 +677,15 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                 .unwrap();
             if !nodes.contains(&off) {
                 let next_page = u64::from_le(*((ptr as *const u64).offset(2)));
-                //println!("next_page = {:?} {:?}: {:?}", ptr, (ptr as *const u64).offset(2), next_page);
                 if next_page>0 {
+                    //debug!("print_tree, next_page = {:?}", next_page);
                     pages.push(txn.load_page(next_page));
-                    writeln!(buf,
+                    edges.push(format!(
                              "n_{}_{}->n_{}_{}[color=\"red\"];",
                              p.page.offset,
                              off,
                              next_page,
-                             FIRST_HEAD)
-                        .unwrap();
+                             FIRST_HEAD))
                 };
                 nodes.insert(off);
                 for i in 0..5 {
@@ -699,10 +699,12 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                                  p.page.offset,
                                  left,i)
                             .unwrap();
+                        //debug!("print_tree: recursive call");
                         print_tree(txn,nodes,buf,edges,pages,p,left)
                     }
                 }
             }
+            //debug!("/print tree:{:?}",p);
         }
     }
     print_page(t, &mut h, &mut buf, &page, true /* print children */);
