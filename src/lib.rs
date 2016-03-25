@@ -66,16 +66,19 @@
 //! ```
 //!
 
+
 extern crate libc;
 extern crate rand;
 
 #[macro_use]
 extern crate log;
 extern crate fs2;
+extern crate memmap;
+
 use rand::Rng;
 use std::path::Path;
 
-mod memmap;
+#[allow(mutable_transmutes)]
 mod transaction;
 
 pub use transaction::Statistics;

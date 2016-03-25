@@ -1,7 +1,6 @@
 use super::transaction;
 use std;
 use std::path::Path;
-use libc::c_int;
 use super::transaction::{PAGE_SIZE};
 use std::fs::File;
 use std::io::BufWriter;
@@ -223,7 +222,6 @@ pub enum Iterate {
     Finished
 }
 pub trait LoadPage:Sized {
-    fn fd(&self) -> c_int;
     fn length(&self) -> u64;
     fn root_db_(&self) -> Db;
     fn open_db_<'a>(&'a self, key: &[u8]) -> Option<Db> {
@@ -394,13 +392,11 @@ pub trait P:std::fmt::Debug {
 
     /// 0 if cannot alloc, valid offset else (offset in bytes from the start of the page)
     fn can_alloc(&self, size: u16) -> u16 {
-        unsafe {
-            assert!(size & 7 == 0); // 64 bits aligned.
-            if self.occupied() + size < PAGE_SIZE as u16 {
-                self.first_free()
-            } else {
-                0
-            }
+        assert!(size & 7 == 0); // 64 bits aligned.
+        if self.occupied() + size < PAGE_SIZE as u16 {
+            self.first_free()
+        } else {
+            0
         }
     }
 
@@ -577,9 +573,6 @@ impl<'env> LoadPage for MutTxn<'env> {
     fn root_db_(&self) -> Db {
         Db { root: self.btree_root }
     }
-    fn fd(&self) -> c_int {
-        self.txn.env.fd
-    }
     fn load_page(&self, off: u64) -> Page {
         Page { page: self.txn.load_page(off) }
     }
@@ -590,9 +583,6 @@ impl<'env> LoadPage for Txn<'env> {
     }
     fn root_db_(&self) -> Db {
         Db { root: self.btree_root }
-    }
-    fn fd(&self) -> c_int {
-        self.txn.env.fd
     }
     fn load_page(&self, off: u64) -> Page {
         Page { page: self.txn.load_page(off) }

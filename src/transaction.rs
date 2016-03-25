@@ -4,10 +4,10 @@
 
 
 // TODO:
-// - get rid of initial length, grow file as needed. See fallocate, ftruncate. Equivalents on windows?
-// - Windows
-// - 32 bits mmap64
+// - get rid of initial length, grow file as needed. In other words, write lock + unmap + set_len + mmap.
 
+// X 32 bits mmap64 -> delegated to memmap crate.
+// X Windows -> delegated to memmap crate.
 // X SPARC (8kB pages) -> Allocate two consecutive pages instead of one. The BTree won't see the difference anyway.
 // X 32 bits compatibility. mmap has 64 bits offsets.
 // X process and thread mutex for mutable transactions.
@@ -22,11 +22,7 @@
 
 // LMDB takes care of zombie readers, at the cost of checking a file of size linear in the number of PIDs at the beginning of every transaction. Also, doesn't work on USB sticks. More details: mdb.c, line 2606: PID locks.
 
-use libc;
-use libc::{c_void, size_t, MS_SYNC, off_t, munmap, c_int, O_CREAT, O_RDWR};
 use std;
-
-use std::ffi::CString;
 use std::sync::{RwLock, RwLockReadGuard, Mutex, MutexGuard};
 use std::ptr::copy_nonoverlapping;
 use std::collections::HashSet;
@@ -36,8 +32,7 @@ use std::ops::Shl;
 use fs2::FileExt;
 use std::fs::File;
 use std::path::Path;
-
-use memmap::mmap;
+use memmap;
 
 // We need a fixed page size for compatibility reasons. Most systems will have half of this, but some (SPARC) don't...
 pub const PAGE_SIZE: usize = 4096;
@@ -66,8 +61,8 @@ pub struct Env {
     pub length: u64,
     lock_file: File,
     mutable_file: File,
+    mmap: memmap::Mmap,
     map: *mut u8,
-    pub fd: c_int,
     lock: RwLock<()>, // Ensure all reads are done when sync starts.
     mutable: Mutex<()>, // Ensure only one mutable transaction can be started.
 }
@@ -114,40 +109,30 @@ pub struct Statistics {
 
 impl Env {
     /// Initialize environment. log_length must be at least log(PAGE_SIZE)
-    pub fn new<P: AsRef<Path>>(file: P, log_length: usize) -> Result<Env, Error> {
-        unsafe {
-            let length: u64 = (1 as u64).shl(log_length);
-            assert!(length >= PAGE_SIZE_64);
-            let path = file.as_ref().join("db");
-            let name = CString::new(path.to_str().unwrap()).unwrap();
-            let fd = libc::open(name.as_ptr(), O_CREAT | O_RDWR, 0o777);
-            let ftrunc = libc::ftruncate(fd, length as off_t);
-            if ftrunc < 0 {
-                Err(Error::IO(std::io::Error::last_os_error()))
-            } else {
-                let memory = mmap(fd, None, 0, length);
-                if memory.is_null() {
-                    Err(Error::IO(std::io::Error::last_os_error()))
-                } else {
-                    let lock_file = try!(File::create(file.as_ref()
-                                                          .join("db")
-                                                          .with_extension(".lock")));
-                    let mutable_file = try!(File::create(file.as_ref()
-                                                             .join("db")
-                                                             .with_extension(".mut")));
-                    let env = Env {
-                        length: length,
-                        map: memory as *mut u8,
-                        lock_file: lock_file,
-                        mutable_file: mutable_file,
-                        fd: fd,
-                        lock: RwLock::new(()),
-                        mutable: Mutex::new(()),
-                    };
-                    Ok(env)
-                }
-            }
-        }
+    pub fn new<P: AsRef<Path>>(path: P, log_length: usize) -> Result<Env, Error> {
+        let length = (1 as u64).shl(log_length);
+        assert!(length >= PAGE_SIZE_64);
+        let db_path = path.as_ref().join("db");
+        let file = try!(File::open(db_path));
+        try!(file.set_len(length));
+        let mut mmap = try!(memmap::Mmap::open(&file, memmap::Protection::ReadWrite));
+        let lock_file = try!(File::create(path.as_ref()
+                                          .join("db")
+                                          .with_extension(".lock")));
+        let mutable_file = try!(File::create(path.as_ref()
+                                             .join("db")
+                                             .with_extension(".mut")));
+        let map = mmap.mut_ptr();
+        let env = Env {
+            length: length,
+            mmap: mmap,
+            map: map,
+            lock_file: lock_file,
+            mutable_file: mutable_file,
+            lock: RwLock::new(()),
+            mutable: Mutex::new(()),
+        };
+        Ok(env)
     }
     /// Start a read-only transaction.
     pub fn txn_begin<'env>(&'env self) -> Txn<'env> {
@@ -477,18 +462,9 @@ impl<'env> MutTxn<'env> {
                                     self.env.map.offset(ZERO_HEADER) as *mut T,
                                     extra.len());
                 // synchronize all maps
-                let ok = libc::msync(self.env.map.offset(PAGE_SIZE as isize) as *mut c_void,
-                                     (self.env.length as u64 - PAGE_SIZE as u64) as size_t,
-                                     MS_SYNC);
-                if ok != 0 {
-                    return Err(Error::IO(std::io::Error::last_os_error()));
-                }
-
-                let ok = libc::msync(self.env.map as *mut c_void, PAGE_SIZE as size_t, MS_SYNC);
-                if ok != 0 {
-                    return Err(Error::IO(std::io::Error::last_os_error()));
-                }
-
+                let mmap:&mut memmap::Mmap = std::mem::transmute(&(self.env.mmap));
+                try!(mmap.flush_range(PAGE_SIZE, (self.env.length - PAGE_SIZE_64) as usize));
+                try!(mmap.flush_range(0, PAGE_SIZE));
                 *self.mutable; // This is actually just unit (prevents dead code warnings)
                 Ok(())
             }
@@ -497,13 +473,4 @@ impl<'env> MutTxn<'env> {
     // Abort the transaction. This is actually a no-op, just as a machine crash aborts a transaction. Letting the transaction go out of scope would have the same effect.
     // pub fn abort(self){
     // }
-}
-
-impl Drop for Env {
-    fn drop(&mut self) {
-        unsafe {
-            munmap(self.map as *mut c_void, self.length as size_t);
-            libc::close(self.fd);
-        }
-    }
 }

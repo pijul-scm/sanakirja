@@ -14,9 +14,8 @@ libc="0.2"
 log="0.3"
 env_logger="0.3"
 fs2="0.2"
-time="*"
-rand="*"
-
+rand="0.3"
+memmap = "0.2"
 tempdir="0.3"
 
 [build-dependencies]

@@ -155,7 +155,7 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
                 } else {
                     // Else, split+translate first, then insert.
                     let key_ = std::slice::from_raw_parts(key_ptr,key_len);
-                    let result = split_page(rng, txn, &page, size as usize,
+                    let result = split_page(rng, txn, &page,
                                             key_, value_, right.page_offset(),
                                             current_off, left.page_offset());
                     transaction::free(&mut txn.txn, free_page);
@@ -192,7 +192,7 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
         } else {
             debug!("SPLIT");
             // Not enough space, split.
-            split_page(rng, txn, &page, size as usize, key, value, right_page, 0, 0)
+            split_page(rng, txn, &page, key, value, right_page, 0, 0)
         }
     }
 }
@@ -200,9 +200,8 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
 
 /// The arguments to split_page are non-trivial. This function splits a page, and then reinserts the new element. The middle element of the split is returned as a Result::Split { .. }.
 unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,
-                            // The record size (actually redundant with key and value),
-                            // key, value, right_page of the record to insert.
-                            size:usize, key:&[u8], value:UnsafeValue, right_page:u64,
+                            // (key, value, right_page) of the record to insert.
+                            key:&[u8], value:UnsafeValue, right_page:u64,
                             // Sometimes, a split propagates upwards:
                             // more precisely, inserting the middle
                             // element into the page upwards causes it
