@@ -74,9 +74,10 @@ pub struct Txn<'env> {
     guard: RwLockReadGuard<'env, ()>,
 }
 
-pub struct MutTxn<'env> {
+pub struct MutTxn<'env,T> {
     pub env: &'env Env,
-    mutable: MutexGuard<'env, ()>,
+    mutable: Option<MutexGuard<'env, ()>>,
+    parent:T,
     last_page: u64,
     current_list_page: Page, // current page storing the list of free pages.
     current_list_length: u64, // length of the current page of free pages.
@@ -84,6 +85,7 @@ pub struct MutTxn<'env> {
     occupied_clean_pages: HashSet<u64>, /* Offsets of pages that were allocated by this transaction, and have not been freed since. */
     free_clean_pages: Vec<u64>, /* Offsets of pages that were allocated by this transaction, and then freed. */
     free_pages: Vec<u64>, /* Offsets of old pages freed by this transaction. These were *not* allocated by this transaction. */
+    pub extra:u64
 }
 
 impl<'env> Drop for Txn<'env> {
@@ -92,7 +94,7 @@ impl<'env> Drop for Txn<'env> {
         *self.guard;
     }
 }
-impl<'env> Drop for MutTxn<'env> {
+impl<'env,T> Drop for MutTxn<'env,T> {
     fn drop(&mut self) {
         self.env.mutable_file.unlock().unwrap();
     }
@@ -158,7 +160,7 @@ impl Env {
         }
     }
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
-    pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env> {
+    pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env,()> {
         unsafe {
             let (last_page, current_list_page) = self.read_map_header();
             debug!("map header = {:?}, {:?}", last_page ,current_list_page);
@@ -175,7 +177,8 @@ impl Env {
             };
             MutTxn {
                 env: self,
-                mutable: guard,
+                mutable: Some(guard),
+                parent:(),
                 last_page: if last_page == 0 {
                     PAGE_SIZE as u64
                 } else {
@@ -187,6 +190,7 @@ impl Env {
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
+                extra:0
             }
         }
     }
@@ -249,7 +253,7 @@ impl MutPage {
     }
 }
 
-pub unsafe fn free(txn: &mut MutTxn, offset: u64) {
+pub unsafe fn free<T>(txn: &mut MutTxn<T>, offset: u64) {
     if txn.occupied_clean_pages.remove(&offset) {
         txn.free_clean_pages.push(offset);
     } else {
@@ -278,7 +282,27 @@ pub enum Cow {
     MutPage(MutPage),
 }
 
-impl<'env> MutTxn<'env> {
+impl<'env,T> MutTxn<'env,T> {
+    pub fn mut_txn_begin<'txn>(&'txn mut self) -> MutTxn<'env,&'txn mut MutTxn<'env,T>> {
+        unsafe {
+            let mut txn = MutTxn {
+                env: self.env,
+                mutable: None,
+                parent: std::mem::uninitialized(),
+                last_page: self.last_page,
+                current_list_page: Page { data:self.current_list_page.data,
+                                          offset: self.current_list_page.offset },
+                current_list_length: self.current_list_length,
+                current_list_position: self.current_list_length, /* position of the word immediately after the top. */
+                occupied_clean_pages: HashSet::new(),
+                free_clean_pages: Vec::new(),
+                free_pages: Vec::new(),
+                extra:self.extra
+            };
+            txn.parent = self;
+            txn
+        }
+    }
     pub fn load_page(&self, off: u64) -> Page {
         assert!(off < self.env.length);
         unsafe {
@@ -385,9 +409,31 @@ impl<'env> MutTxn<'env> {
             }
         }
     }
+}
 
+pub trait Commit {
+    fn commit(mut self)->Result<(),Error>;
+}
+
+impl<'a,'env,T> Commit for MutTxn<'env,&'a mut MutTxn<'env,T>> {
+    fn commit(mut self)->Result<(),Error> {
+
+        self.parent.last_page = self.last_page;
+        self.parent.current_list_page = Page { offset:self.current_list_page.offset,
+                                               data:self.current_list_page.data };
+        self.parent.current_list_length = self.current_list_length;
+        self.parent.current_list_position = self.current_list_length;
+        self.parent.occupied_clean_pages.extend(self.occupied_clean_pages.iter());
+        self.parent.free_clean_pages.extend(self.free_clean_pages.iter());
+        self.parent.free_pages.extend(self.free_pages.iter());
+        self.parent.extra = self.extra;
+        Ok(())
+    }
+}
+
+impl<'env> Commit for MutTxn<'env,()> {
     /// Commit a transaction. This is guaranteed to be atomic: either the commit succeeds, and all the changes made during the transaction are written to disk. Or the commit doesn't succeed, and we're back to the state just before starting the transaction.
-    pub fn commit<T>(mut self, extra: &[T]) -> Result<(), Error> {
+    fn commit(mut self) -> Result<(), Error> {
         // Tasks:
         // - allocate new pages (copy-on-write) to write the new list of free pages, including edited "stack pages".
         //
@@ -465,14 +511,13 @@ impl<'env> MutTxn<'env> {
                 *(self.env.map as *mut u64) = self.last_page.to_le();
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
                 // debug!("commit: {:?}",extra);
-                copy_nonoverlapping(extra.as_ptr(),
-                                    self.env.map.offset(ZERO_HEADER) as *mut T,
-                                    extra.len());
+                *(self.env.map.offset(ZERO_HEADER) as *mut u64) = self.extra.to_le();
+
                 // synchronize all maps
                 let mmap:&mut memmap::Mmap = std::mem::transmute(&(self.env.mmap));
                 try!(mmap.flush_range(PAGE_SIZE, (self.env.length - PAGE_SIZE_64) as usize));
                 try!(mmap.flush_range(0, PAGE_SIZE));
-                *self.mutable; // This is actually just unit (prevents dead code warnings)
+                //*self.mutable; // This is actually just unit (prevents dead code warnings)
                 Ok(())
             }
         }

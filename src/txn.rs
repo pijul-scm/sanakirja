@@ -22,8 +22,8 @@ pub struct Db {
 }
 
 /// Mutable transaction
-pub struct MutTxn<'env> {
-    pub txn: transaction::MutTxn<'env>,
+pub struct MutTxn<'env,T> {
+    pub txn: transaction::MutTxn<'env,T>,
     pub btree_root: u64,
 }
 
@@ -33,7 +33,7 @@ pub struct Txn<'env> {
     pub btree_root: u64,
 }
 
-impl<'env> MutTxn<'env> {
+impl<'env,T> MutTxn<'env,T> {
     pub fn alloc_page(&mut self) -> MutPage {
         let page = self.txn.alloc_page().unwrap();
         MutPage { page: page }
@@ -163,7 +163,7 @@ impl<'a,T> Value<'a,T> {
     }
 }
 
-pub fn alloc_value(txn:&mut MutTxn, value: &[u8]) -> UnsafeValue {
+pub fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> UnsafeValue {
     debug!("alloc_value");
     let mut len = value.len();
     let mut p_value = value.as_ptr();
@@ -588,7 +588,7 @@ impl Cow {
     }
 }
 
-impl<'env> LoadPage for MutTxn<'env> {
+impl<'env,T> LoadPage for MutTxn<'env,T> {
     fn length(&self) -> u64 {
         self.txn.env.length
     }

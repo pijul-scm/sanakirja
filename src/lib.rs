@@ -83,8 +83,8 @@ use std::path::Path;
 #[allow(mutable_transmutes)]
 mod transaction;
 
-pub use transaction::Statistics;
-
+pub use transaction::{Statistics};
+use transaction::Commit;
 mod txn;
 pub use txn::{MutTxn, Txn, Value, Db};
 use txn::{P, LoadPage};
@@ -120,7 +120,8 @@ impl Env {
     }
 
     /// Start a mutable transaction.
-    pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env> {
+
+    pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env,()> {
         unsafe {
             let mut txn = self.env.mut_txn_begin();
             let p_extra = self.env.extra() as *const u64;
@@ -146,10 +147,26 @@ impl Env {
 // When searching the tree, note whether at least one page had RC >= 2. If so, reallocate + copy all pages on the path.
 
 
-impl<'env> MutTxn<'env> {
-    pub fn commit(self) -> Result<(), transaction::Error> {
-        let extra = self.btree_root.to_le();
-        self.txn.commit(&[extra])
+impl<'env> MutTxn<'env,()> {
+    pub fn commit(mut self) -> Result<(), transaction::Error> {
+        self.txn.extra = self.btree_root;
+        self.txn.commit()
+    }
+}
+
+impl<'env,'txn,T> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
+    pub fn commit(mut self) -> Result<(), transaction::Error> {
+        self.txn.extra = self.btree_root;
+        self.txn.commit()
+    }
+}
+
+impl<'env,T> MutTxn<'env,T> {
+    pub fn mut_txn_begin<'txn>(&'txn mut self) -> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
+        MutTxn {
+            btree_root: self.btree_root,
+            txn: self.txn.mut_txn_begin()
+        }
     }
     pub fn create_db(&mut self) -> Db {
         let mut db = self.alloc_page();
@@ -204,7 +221,7 @@ pub trait Transaction:LoadPage {
 }
 
 impl<'env> Transaction for Txn<'env> {}
-impl<'env> Transaction for MutTxn<'env> {}
+impl<'env,T> Transaction for MutTxn<'env,T> {}
 
 
 #[cfg(test)]

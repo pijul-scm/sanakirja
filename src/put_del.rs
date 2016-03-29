@@ -22,7 +22,7 @@ enum Result {
 }
 
 // Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zore offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
-fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -> (MutPage,u16) {
+fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, pinpoint:u16) -> (MutPage,u16) {
     unsafe {
         match page.cow {
             transaction::Cow::Page(p) => {
@@ -63,7 +63,7 @@ fn cow_pinpointing<R:Rng>(rng:&mut R, txn:&mut MutTxn, page:Cow, pinpoint:u16) -
     }
 }
 
-unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],value:UnsafeValue,right_page:u64) -> Result {
+unsafe fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, key:&[u8],value:UnsafeValue,right_page:u64) -> Result {
     let mut levels:[u16;MAX_LEVEL+1] = [0;MAX_LEVEL+1];
     let mut level = MAX_LEVEL;
     let mut current_off = FIRST_HEAD;
@@ -199,7 +199,7 @@ unsafe fn insert<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, key:&[u8],val
 
 
 /// The arguments to split_page are non-trivial. This function splits a page, and then reinserts the new element. The middle element of the split is returned as a Result::Split { .. }.
-unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,
+unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                             // (key, value, right_page) of the record to insert.
                             key:&[u8], value:UnsafeValue, right_page:u64,
                             // Sometimes, a split propagates upwards:
@@ -322,7 +322,7 @@ unsafe fn split_page<R:Rng>(rng:&mut R, txn:&mut MutTxn,page:&Cow,
 }
 
 // This function deals with the case where the main page split, either during insert, or during delete.
-fn root_split<R:Rng>(rng:&mut R, txn: &mut MutTxn, x:Result) -> Db {
+fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Result) -> Db {
     debug!("ROOT SPLIT");
     if let Result::Split { left,right,key_ptr,key_len,value,free_page } = x {
         let mut page = txn.alloc_page();
@@ -345,7 +345,7 @@ fn root_split<R:Rng>(rng:&mut R, txn: &mut MutTxn, x:Result) -> Db {
     }
 }
 
-pub fn put<R:Rng>(rng:&mut R, txn: &mut MutTxn, db: Db, key: &[u8], value: &[u8]) -> Db {
+pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: Db, key: &[u8], value: &[u8]) -> Db {
     assert!(key.len() < MAX_KEY_SIZE);
     unsafe {
         let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
@@ -393,7 +393,7 @@ struct Smallest {
 }
 
 
-unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Option<(Result,Option<Smallest>)> {
+unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) -> Option<(Result,Option<Smallest>)> {
     debug!("delete, page: {:?}", page);
     let mut levels:[u16;MAX_LEVEL+1] = [FIRST_HEAD;MAX_LEVEL+1];
     let mut level = MAX_LEVEL;
@@ -594,7 +594,7 @@ unsafe fn delete<R:Rng>(rng:&mut R, txn:&mut MutTxn, mut page:Cow, comp:C) -> Op
 }
 
 
-pub fn del<R:Rng>(rng:&mut R, txn:&mut MutTxn, db:Db, key:&[u8], value:Option<&[u8]>) -> Db {
+pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:Db, key:&[u8], value:Option<&[u8]>) -> Db {
     assert!(key.len() < MAX_KEY_SIZE);
     let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
     let value = value.unwrap();
