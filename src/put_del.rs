@@ -345,7 +345,7 @@ fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Result) -> Db {
     }
 }
 
-pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: Db, key: &[u8], value: &[u8]) -> Db {
+pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], value: &[u8]) {
     assert!(key.len() < MAX_KEY_SIZE);
     unsafe {
         let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
@@ -356,9 +356,9 @@ pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: Db, key: &[u8], value: 
         };
         debug!("value = {:?}", Value { txn:txn,value:value });
         match insert(rng, txn, root_page, key, value, 0) {
-            Result::Ok { page,.. } => Db { root:page.page_offset() },
+            Result::Ok { page,.. } => db.root = page.page_offset(),
             x => {
-                root_split(rng,txn,x)
+                db.root = root_split(rng,txn,x).root
             }
         }
     }
@@ -594,7 +594,7 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) 
 }
 
 
-pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:Db, key:&[u8], value:Option<&[u8]>) -> Db {
+pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value:Option<&[u8]>) {
     assert!(key.len() < MAX_KEY_SIZE);
     let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
     let value = value.unwrap();
@@ -607,12 +607,12 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:Db, key:&[u8], value:Opti
                 match insert(rng, txn, Cow::from_mut_page(page), key, reinsert.value, reinsert.reinsert_page) {
                     Result::Ok { page,.. } => {
                         transaction::free(&mut txn.txn, reinsert.free_page);
-                        Db { root:page.page_offset() }
+                        db.root = page.page_offset()
                     },
                     x => {
                         let x = root_split(rng,txn,x);
                         transaction::free(&mut txn.txn, reinsert.free_page);
-                        x
+                        db.root = x.root
                     }
                 }
             },
@@ -620,15 +620,15 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:Db, key:&[u8], value:Opti
                 if position == 1 {
                     let next_page = u64::from_le(*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
                     transaction::free(&mut txn.txn, page.page_offset());
-                    Db { root:next_page }
+                    db.root = next_page
                 } else {
-                    Db { root:page.page_offset() }
+                    db.root = page.page_offset()
                 }
             },
             Some((x,_)) => {
-                root_split(rng,txn,x)
+                db.root = root_split(rng,txn,x).root
             },
-            None => db
+            None => {}
         }
     }
 }

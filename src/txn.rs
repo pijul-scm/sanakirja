@@ -24,13 +24,11 @@ pub struct Db {
 /// Mutable transaction
 pub struct MutTxn<'env,T> {
     pub txn: transaction::MutTxn<'env,T>,
-    pub btree_root: u64,
 }
 
 /// Immutable transaction
 pub struct Txn<'env> {
     pub txn: transaction::Txn<'env>,
-    pub btree_root: u64,
 }
 
 impl<'env,T> MutTxn<'env,T> {
@@ -245,17 +243,19 @@ pub enum Iterate {
 }
 pub trait LoadPage:Sized {
     fn length(&self) -> u64;
-    fn root_db_(&self) -> Db;
+    fn root_db_(&self) -> Option<Db>;
     fn open_db_<'a>(&'a self, key: &[u8]) -> Option<Db> {
-        let page = self.load_page(self.root_db_().root);
-        unsafe {
-            let db = self.get_(page, key, None);
-            if let Some(UnsafeValue::S{p,..}) = db {
-                Some(Db { root: u64::from_le(*(p as *const u64)) })
-            } else {
-                None
+        self.root_db_().and_then(|root| {
+            let page = self.load_page(root.root);
+            unsafe {
+                let db = self.get_(page, key, None);
+                if let Some(UnsafeValue::S{p,..}) = db {
+                    Some(Db { root: u64::from_le(*(p as *const u64)) })
+                } else {
+                    None
+                }
             }
-        }
+        })
     }
 
     fn load_page(&self, off: u64) -> Page;
@@ -592,8 +592,13 @@ impl<'env,T> LoadPage for MutTxn<'env,T> {
     fn length(&self) -> u64 {
         self.txn.env.length
     }
-    fn root_db_(&self) -> Db {
-        Db { root: self.btree_root }
+    fn root_db_(&self) -> Option<Db> {
+        let root = self.txn.root();
+        if root == 0 {
+            None
+        } else {
+            Some(Db { root: self.txn.root() })
+        }
     }
     fn load_page(&self, off: u64) -> Page {
         Page { page: self.txn.load_page(off) }
@@ -603,8 +608,13 @@ impl<'env> LoadPage for Txn<'env> {
     fn length(&self) -> u64 {
         self.txn.env.length
     }
-    fn root_db_(&self) -> Db {
-        Db { root: self.btree_root }
+    fn root_db_(&self) -> Option<Db> {
+        let root = self.txn.root();
+        if root == 0 {
+            None
+        } else {
+            Some(Db { root: self.txn.root() })
+        }
     }
     fn load_page(&self, off: u64) -> Page {
         Page { page: self.txn.load_page(off) }

@@ -25,7 +25,7 @@
 use std;
 use std::sync::{RwLock, RwLockReadGuard, Mutex, MutexGuard};
 use std::ptr::copy_nonoverlapping;
-use std::collections::HashSet;
+use std::collections::{HashSet,HashMap};
 use std::cmp::max;
 // use std::marker::PhantomData;
 use std::ops::Shl;
@@ -39,6 +39,7 @@ pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SIZE_64: u64 = 4096;
 
 pub const ZERO_HEADER: isize = 16; // size of the header on page 0, in bytes.
+pub const ZERO_HEADER_64: isize = 2; // size of the header on page 0, in bytes.
 
 #[derive(Debug)]
 pub enum Error {
@@ -85,7 +86,7 @@ pub struct MutTxn<'env,T> {
     occupied_clean_pages: HashSet<u64>, /* Offsets of pages that were allocated by this transaction, and have not been freed since. */
     free_clean_pages: Vec<u64>, /* Offsets of pages that were allocated by this transaction, and then freed. */
     free_pages: Vec<u64>, /* Offsets of old pages freed by this transaction. These were *not* allocated by this transaction. */
-    pub extra:u64
+    pub root:u64
 }
 
 impl<'env> Drop for Txn<'env> {
@@ -190,13 +191,9 @@ impl Env {
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
-                extra:0
+                root: u64::from_le(*(self.map.offset(ZERO_HEADER) as *const u64))
             }
         }
-    }
-
-    pub fn extra(&self) -> *mut u8 {
-        unsafe { self.map.offset(ZERO_HEADER) }
     }
 
     /// Compute statistics about pages. This is a potentially costlty operation, as we need to go through all bookkeeping pages.
@@ -274,6 +271,11 @@ impl<'env> Txn<'env> {
             }
         }
     }
+    pub fn root(&self) -> u64 {
+        unsafe {
+            u64::from_le(*(self.env.map.offset(ZERO_HEADER) as *const u64))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -297,7 +299,7 @@ impl<'env,T> MutTxn<'env,T> {
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
-                extra:self.extra
+                root:self.root
             };
             txn.parent = self;
             txn
@@ -311,6 +313,12 @@ impl<'env,T> MutTxn<'env,T> {
                 offset: off,
             }
         }
+    }
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+    pub fn set_root(&mut self, value:u64) {
+        self.root = value;
     }
     pub fn load_cow_page(&mut self, off: u64) -> Cow {
         debug!("transaction::load_mut_page: {:?} {:?}",
@@ -426,7 +434,7 @@ impl<'a,'env,T> Commit for MutTxn<'env,&'a mut MutTxn<'env,T>> {
         self.parent.occupied_clean_pages.extend(self.occupied_clean_pages.iter());
         self.parent.free_clean_pages.extend(self.free_clean_pages.iter());
         self.parent.free_pages.extend(self.free_pages.iter());
-        self.parent.extra = self.extra;
+        self.parent.root = self.root;
         Ok(())
     }
 }
@@ -510,8 +518,7 @@ impl<'env> Commit for MutTxn<'env,()> {
                 self.env.lock_file.lock_exclusive().unwrap();
                 *(self.env.map as *mut u64) = self.last_page.to_le();
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
-                // debug!("commit: {:?}",extra);
-                *(self.env.map.offset(ZERO_HEADER) as *mut u64) = self.extra.to_le();
+                *(self.env.map.offset(ZERO_HEADER) as *mut u64) = self.root.to_le();
 
                 // synchronize all maps
                 let mmap:&mut memmap::Mmap = std::mem::transmute(&(self.env.mmap));
