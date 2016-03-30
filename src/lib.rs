@@ -28,11 +28,7 @@
 //!
 //! - improve error handling
 //!
-//! - reference counting, and then clone (half-easy)
-//!
 //! - dynamic loading of pages not in the map, especially on 32-bits platforms ('transaction.rs', half-easy)
-//!
-//! - documenting the format.
 //!
 //! # For future versions
 //!
@@ -153,12 +149,15 @@ impl<'env,T> MutTxn<'env,T> {
         db.init();
         Db { root: db.page_offset() }
     }
+    pub fn fork_db<R:Rng>(&mut self, rng:&mut R, db:&Db) -> Db {
+        Db { root: put_del::fork_db(rng, self, db.root) }
+    }
     pub fn put_db<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: &[u8], value: Db) {
         let mut val: [u8; 8] = [0; 8];
         unsafe {
             *(val.as_mut_ptr() as *mut u64) = value.root.to_le();
         }
-        self.put(rng, db, key, &val);
+        self.replace(rng, db, key, &val);
         self.txn.set_root(db.root)
     }
     pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64) {
@@ -170,6 +169,15 @@ impl<'env,T> MutTxn<'env,T> {
         }
         self.put(rng, db, &k, &v);
     }
+    pub fn del_u64<R:Rng>(&mut self, rng:&mut R, db:&mut Db, key:u64) {
+        let mut k: [u8; 8] = [0; 8];
+        unsafe {
+            *(k.as_mut_ptr() as *mut u64) = key.to_le();
+        }
+        self.del(rng, db, &k, None);
+    }
+
+
     pub fn replace_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64) {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];

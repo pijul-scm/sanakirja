@@ -222,7 +222,27 @@ pub trait LoadPage:Sized {
 
     fn load_page(&self, off: u64) -> Page;
 
-    unsafe fn get_<'a>(&'a self, page:Page, key: &[u8], value:Option<UnsafeValue>) -> Option<UnsafeValue> {
+    fn get_u64(&self, db: &Db, key: u64) -> Option<u64> {
+        let page = self.load_page(db.root);
+        self.get_u64_(page, key)
+    }
+
+    fn get_u64_(&self, page:Page, key: u64) -> Option<u64> {
+        unsafe {
+            let mut key_:[u8;8] = [0;8];
+            *(key_.as_mut_ptr() as *mut u64) = key.to_le();
+            self.get_(page, &key_[..], None).and_then(
+                |x| {
+                    if let UnsafeValue::S { p,.. } = x {
+                        Some(u64::from_le(*(p as *const u64)))
+                    } else {
+                        None
+                    }
+                })
+        }
+    }
+
+    unsafe fn get_(&self, page:Page, key: &[u8], value:Option<UnsafeValue>) -> Option<UnsafeValue> {
         let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
         let mut level = MAX_LEVEL;
