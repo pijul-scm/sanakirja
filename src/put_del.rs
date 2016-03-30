@@ -21,6 +21,85 @@ enum Result {
     },
 }
 
+
+// TODO: sometimes we're just copying this page, so we don't need to decrease the RC of children.
+fn free<T>(txn:&mut MutTxn<T>, off:u64) {
+    unsafe {
+        /*
+        let page = txn.load_cow_page(off);
+        // decrease rc of referenced pages.
+        let mut current = FIRST_HEAD;
+        while current != NIL {
+            let pp = page.offset(current as isize);
+            if current > FIRST_HEAD {
+                let (_,value) = read_key_value(pp);
+                if let Value::O { offset,.. } = value {
+                    free_value(txn,offset)
+                }
+            }
+            let right_page = u64::from_le(*((pp as *const u64).offset(2)));
+            if right_page > 0 {
+                free(txn,right_page);
+            }
+            current = u16::from_le(*((page.offset(current as isize) as *const u16)));
+        }
+         */
+        // Then really free this one
+        transaction::free(&mut txn.txn, off)
+    }
+}
+const VALUE_HEADER_LEN:usize = 8;
+fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> UnsafeValue {
+    debug!("alloc_value");
+    let mut len = value.len();
+    let mut p_value = value.as_ptr();
+    let mut ptr = std::ptr::null_mut();
+    let mut first_page = 0;
+    unsafe {
+        while len > 0 {
+            let page = txn.alloc_page();
+            if !ptr.is_null() {
+                *((ptr as *mut u64).offset(1)) = page.page_offset()
+            } else {
+                first_page = page.page_offset();
+                *(page.data() as *mut u64) = 1u64.to_le() // Reference count
+            }
+            ptr = page.data() as *mut u64;
+            *(ptr as *mut u64) = 0;
+            if len > PAGE_SIZE - VALUE_HEADER_LEN {
+                std::ptr::copy_nonoverlapping(p_value, (ptr as *mut u64).offset(2) as *mut u8, PAGE_SIZE - VALUE_HEADER_LEN);
+                len -= PAGE_SIZE - VALUE_HEADER_LEN;
+                p_value = p_value.offset(PAGE_SIZE as isize-16);
+            } else {
+                std::ptr::copy_nonoverlapping(p_value, (ptr as *mut u64).offset(2) as *mut u8, len);
+                len = 0;
+            }
+        }
+    }
+    debug_assert!(first_page > 0);
+    debug!("/alloc_value");
+    UnsafeValue::O { offset: first_page, len: value.len() as u32 }
+}
+
+
+
+fn free_value<T>(txn:&mut MutTxn<T>, mut offset:u64) {
+    unsafe {
+        let page = txn.load_cow_page(offset).data() as *mut u64;
+        let rc = u64::from_le(*page);
+        if rc <= 1 {
+            while offset!=0 {
+                let off = offset;
+                let page = txn.load_cow_page(off).data();
+                offset = u64::from_le(*((page as *const u64).offset(1)));
+                transaction::free(&mut txn.txn, off)
+            }
+        } else {
+            *page = (rc-1).to_le()
+        }
+    }
+}
+
 // Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zore offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
 fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, pinpoint:u16) -> (MutPage,u16) {
     unsafe {
@@ -38,7 +117,18 @@ fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, pinpoint:u
                     let pp = p.offset(current as isize);
                     let right_page = u64::from_le(*((pp as *const u64).offset(2)));
                     if current > FIRST_HEAD {
+                        // Increase count of right_page
+                        if right_page > 0 {
+                            //incr_page_rc(txn,offset)
+                            unimplemented!()
+                        }
+                        // Increase count of value
                         let (key,value) = read_key_value(pp);
+                        if let UnsafeValue::O { offset,.. } = value {
+                            //incr_value_rc(txn,offset)
+                            unimplemented!()
+                        }
+                        //
                         debug!("PINPOINT: {:?}", std::str::from_utf8(key).unwrap());
                         match insert(rng, txn, cow, key, value, right_page) {
                             Result::Ok { page, position } => {
@@ -55,7 +145,7 @@ fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, pinpoint:u
                     current = u16::from_le(*((p.offset(current as isize) as *const u16)));
                 }
                 debug!("/PINPOINTING");
-                transaction::free(&mut txn.txn, page_offset);
+                free(txn, page_offset);
                 (cow.unwrap_mut(),pinpointed)
             }
             transaction::Cow::MutPage(p) => (MutPage { page:p }, pinpoint)
@@ -150,7 +240,7 @@ unsafe fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, key:&[u8
                     let key_ = std::slice::from_raw_parts(key_ptr,key_len);
                     // Then, reinsert (key_,value_) in the current page.
                     let result = insert(rng,txn,Cow::from_mut_page(page),key_, value_, right.page_offset());
-                    transaction::free(&mut txn.txn, free_page);
+                    free(txn, free_page);
                     result
                 } else {
                     // Else, split+translate first, then insert.
@@ -158,7 +248,7 @@ unsafe fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, key:&[u8
                     let result = split_page(rng, txn, &page,
                                             key_, value_, right.page_offset(),
                                             current_off, left.page_offset());
-                    transaction::free(&mut txn.txn, free_page);
+                    free(txn, free_page);
                     result
                 }
             }
@@ -332,7 +422,7 @@ fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Result) -> Db {
             let key = std::slice::from_raw_parts(key_ptr,key_len);
             let right_offset = right.page_offset();
             let ins = insert(rng, txn, Cow::from_mut_page(page), key, value, right_offset);
-            transaction::free(&mut txn.txn, free_page);
+            free(txn, free_page);
             match ins {
                 Result::Ok { page,.. } => {
                     Db { root:page.page_offset() }
@@ -344,6 +434,7 @@ fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Result) -> Db {
         unreachable!()
     }
 }
+
 
 pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], value: &[u8]) {
     assert!(key.len() < MAX_KEY_SIZE);
@@ -369,6 +460,7 @@ pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], va
 #[derive(Copy,Clone,Debug)]
 enum C<'a> {
     KV { key:&'a [u8], value:UnsafeValue }, // delete by comparing the key and value.
+    K { key:&'a[u8] }, // delete the smallest binding of that key.
     Smallest // delete the smallest element of a B-tree (used to replace the root of a B-tree).
 }
 impl<'a> C<'a> {
@@ -393,7 +485,7 @@ struct Smallest {
 }
 
 
-unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) -> Option<(Result,Option<Smallest>)> {
+unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Option<(Result,Option<Smallest>)> {
     debug!("delete, page: {:?}", page);
     let mut levels:[u16;MAX_LEVEL+1] = [FIRST_HEAD;MAX_LEVEL+1];
     let mut level = MAX_LEVEL;
@@ -407,7 +499,12 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) 
         // advance in the list until there's nothing more to do.
         loop {
             let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
-            if let C::KV { key,value } = comp {
+            let comp_key = match comp {
+                C::KV { key,.. } => Some(key),
+                C::K { key } => Some(key),
+                _ => None
+            };
+            if let Some(key) = comp_key {
                 if next == NIL {
                     debug!("NIL level = {:?}, current_off = {:?}", level, current_off);
                     levels[level] = current_off;
@@ -418,23 +515,34 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) 
                     match key.cmp(next_key) {
                         Ordering::Less => break,
                         Ordering::Equal => {
-                            debug!("keys equal, values? {:?}",
-                                     (Value{txn:txn,value:value}).cmp(Value{txn:txn,value:next_value}));
-                            match (Value{txn:txn,value:value}).cmp(Value{txn:txn,value:next_value}) {
-                                Ordering::Less => break,
-                                Ordering::Equal => {
-                                    if equal == 0 {
-                                        equal = next;
+                            if let C::KV { value,.. } = comp {
+                                debug!("keys equal, values? {:?}",
+                                       (Value{txn:txn,value:value}).cmp(Value{txn:txn,value:next_value}));
+                                match (Value{txn:txn,value:value}).cmp(Value{txn:txn,value:next_value}) {
+                                    Ordering::Less => break,
+                                    Ordering::Equal => {
+                                        if equal == 0 {
+                                            equal = next;
+                                            current = page.offset(current_off as isize) as *mut u16;
+                                        }
+                                        debug!("EQ level = {:?}, current_off = {:?}", level, current_off);
+                                        levels[level] = current_off;
+                                        break
+                                    },
+                                    Ordering::Greater => {
+                                        current_off = next;
                                         current = page.offset(current_off as isize) as *mut u16;
                                     }
-                                    debug!("EQ level = {:?}, current_off = {:?}", level, current_off);
-                                    levels[level] = current_off;
-                                    break
-                                },
-                                Ordering::Greater => {
-                                    current_off = next;
+                                }
+                            } else {
+                                // We're in case C::K.
+                                if equal == 0 {
+                                    equal = next;
                                     current = page.offset(current_off as isize) as *mut u16;
                                 }
+                                debug!("EQ level = {:?}, current_off = {:?}", level, current_off);
+                                levels[level] = current_off;
+                                break
                             }
                         },
                         Ordering::Greater => {
@@ -478,8 +586,8 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) 
                     let next_next_off = *(next.offset(level as isize));
                     if level == 0 {
                         let (key,value) = read_key_value(next as *const u8);
-                        if let UnsafeValue::O { offset, len } = value {
-                            txn.free_value(offset,len)
+                        if let UnsafeValue::O { offset, .. } = value {
+                            free_value(txn,offset)
                         }
 
                         let size = record_size(key.len(),value.len() as usize);
@@ -534,10 +642,10 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) 
         Some((Result::Ok { page:next_page, position }, _)) => {
             if position == 1 {
                 //next_page becomes empty. Delete current entry, and reinsert.
-                transaction::free(&mut txn.txn, next_page.page_offset());
+                free(txn, next_page.page_offset());
                 let (key,value) = read_key_value(current as *const u8);
-                if let UnsafeValue::O { offset, len } = value {
-                    txn.free_value(offset,len)
+                if let UnsafeValue::O { offset, .. } = value {
+                    free_value(txn,offset)
                 }
                 // Delete current entry. Since we lost the list
                 // pointers, we need to search all lists and delete
@@ -570,7 +678,7 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) 
                     debug_assert!(next_page > 0);
                     let next_page = txn.load_cow_page(next_page);
                     let ins = insert(rng, txn, next_page, key, value, 0);
-                    transaction::free(&mut txn.txn, page.page_offset());
+                    free(txn, page.page_offset());
                     Some((ins,None))
                 } else {
                     Some((Result::Ok {
@@ -587,7 +695,7 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) 
             *((current as *mut u64).offset(2)) = left.page_offset().to_le();
             let key = std::slice::from_raw_parts(key_ptr,key_len);
             let result = Some((insert(rng,txn,page,key, value, right.page_offset()), None));
-            transaction::free(&mut txn.txn, free_page);
+            free(txn, free_page);
             result
         }
     }
@@ -597,21 +705,27 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, comp:C) 
 pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value:Option<&[u8]>) {
     assert!(key.len() < MAX_KEY_SIZE);
     let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
-    let value = value.unwrap();
-    let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
+
+    let comp = if let Some(value) = value {
+        C::KV { key: key,
+                value: UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 } }
+    } else {
+        C::K { key:key }
+    };
+
     unsafe {
-        match delete(rng,txn, root_page, C::KV { key:key, value:value }) {
+        match delete(rng,txn, root_page, comp) {
             Some((Result::Ok { page, .. },Some(reinsert))) => {
                 let key = std::slice::from_raw_parts(reinsert.key_ptr,reinsert.key_len);
                 assert!(key.len() < MAX_KEY_SIZE);
                 match insert(rng, txn, Cow::from_mut_page(page), key, reinsert.value, reinsert.reinsert_page) {
                     Result::Ok { page,.. } => {
-                        transaction::free(&mut txn.txn, reinsert.free_page);
+                        free(txn, reinsert.free_page);
                         db.root = page.page_offset()
                     },
                     x => {
                         let x = root_split(rng,txn,x);
-                        transaction::free(&mut txn.txn, reinsert.free_page);
+                        free(txn, reinsert.free_page);
                         db.root = x.root
                     }
                 }
@@ -619,7 +733,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
             Some((Result::Ok { page, position },None)) => {
                 if position == 1 {
                     let next_page = u64::from_le(*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
-                    transaction::free(&mut txn.txn, page.page_offset());
+                    free(txn, page.page_offset());
                     db.root = next_page
                 } else {
                     db.root = page.page_offset()
@@ -632,3 +746,10 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
         }
     }
 }
+
+
+pub fn replace<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], value: &[u8]) {
+    del(rng,txn,db,key,None);
+    put(rng,txn,db,key,value);
+}
+

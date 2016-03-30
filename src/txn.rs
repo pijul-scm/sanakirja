@@ -10,10 +10,12 @@ use std::io::Write;
 use std::fmt;
 use std::cmp::Ordering;
 
+use rustc_serialize::hex::ToHex;
+
 pub const MAX_KEY_SIZE: usize = PAGE_SIZE >> 2;
 pub const VALUE_SIZE_THRESHOLD: usize = PAGE_SIZE >> 2;
-pub const NIL:u16 = 0;
-pub const FIRST_HEAD:u16 = 8;
+pub const NIL:u16 = 0xffff;
+pub const FIRST_HEAD:u16 = 0;
 pub const MAX_LEVEL:usize = 4;
 
 #[derive(Debug)]
@@ -34,35 +36,36 @@ pub struct Txn<'env> {
 impl<'env,T> MutTxn<'env,T> {
     pub fn alloc_page(&mut self) -> MutPage {
         let page = self.txn.alloc_page().unwrap();
+        unsafe { *(page.data as *mut u64) = 1u64.to_le() }
         MutPage { page: page }
     }
     pub fn load_cow_page(&mut self, off: u64) -> Cow {
         Cow { cow: self.txn.load_cow_page(off) }
     }
-
-    pub fn free_value(&mut self, mut offset:u64, mut len:u32) {
-        unsafe {
-            while offset!=0 {
-                let off = offset;
-                let page = self.load_cow_page(off).data();
-                offset = u64::from_le(*((page as *const u64).offset(1)));
-                transaction::free(&mut self.txn, off)
-            }
+    pub fn rc(&self) -> Option<Db> {
+        if self.txn.reference_counts == 0 {
+            None
+        } else {
+            Some(Db { root: self.txn.reference_counts })
         }
     }
+    pub fn set_rc(&mut self, db:Db) {
+        self.txn.reference_counts = db.root
+    }
+
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
-    pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P) {
-        debug(self, db, p)
+    pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P, keys_hex:bool, values_hex:bool) {
+        debug(self, db, p, keys_hex, values_hex)
     }
 }
 
 impl<'env> Txn<'env> {
     #[cfg(debug_assertions)]
     #[doc(hidden)]
-    pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P) {
-        debug(self, db, p)
+    pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P, keys_hex:bool, values_hex:bool) {
+        debug(self, db, p, keys_hex, values_hex)
     }
 }
 
@@ -160,47 +163,6 @@ impl<'a,T> Value<'a,T> {
         self.value.len()
     }
 }
-
-pub fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> UnsafeValue {
-    debug!("alloc_value");
-    let mut len = value.len();
-    let mut p_value = value.as_ptr();
-    let mut ptr = std::ptr::null_mut();
-    let mut first_page = 0;
-    unsafe {
-        while len > 0 {
-            let page = txn.alloc_page();
-            if !ptr.is_null() {
-                *((ptr as *mut u64).offset(1)) = page.page_offset()
-            } else {
-                first_page = page.page_offset();
-            }
-            ptr = page.data() as *mut u64;
-            *(ptr as *mut u64) = 0;
-            *((ptr as *mut u64).offset(1)) = 0;
-            if len > PAGE_SIZE-16 {
-                copy_nonoverlapping(p_value, (ptr as *mut u64).offset(2) as *mut u8, PAGE_SIZE-16);
-                len -= PAGE_SIZE - 16;
-                p_value = p_value.offset(PAGE_SIZE as isize-16);
-            } else {
-                copy_nonoverlapping(p_value, (ptr as *mut u64).offset(2) as *mut u8, len);
-                len = 0;
-            }
-        }
-    }
-    debug_assert!(first_page > 0);
-    debug!("/alloc_value");
-    UnsafeValue::O { offset: first_page, len: value.len() as u32 }
-}
-
-
-
-
-
-
-
-
-
 
 
 // Difference between mutpage and mutpages: mutpages might also contain just one page, but it is unmapped whenever it goes out of scope, whereas P belongs to the main map. Useful for 32-bits platforms.
@@ -622,13 +584,14 @@ impl<'env> LoadPage for Txn<'env> {
 }
 
 #[cfg(debug_assertions)]
-fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
+fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, values_hex:bool) {
     let page = t.load_page(db.root);
     let f = File::create(p.as_ref()).unwrap();
     let mut buf = BufWriter::new(f);
     writeln!(&mut buf, "digraph{{").unwrap();
     let mut h = HashSet::new();
     fn print_page<T: LoadPage>(txn: &T,
+                               keys_hex:bool,values_hex:bool,
                                pages: &mut HashSet<u64>,
                                buf: &mut BufWriter<File>,
                                p: &Page,
@@ -649,7 +612,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
             let mut h = Vec::new();
             let mut edges = Vec::new();
             let mut hh = HashSet::new();
-            print_tree(txn, &mut hh, buf, &mut edges, &mut h, p, root);
+            print_tree(txn, keys_hex, values_hex, &mut hh, buf, &mut edges, &mut h, p, root);
             if print_children {
                 writeln!(buf, "}}").unwrap();
             }
@@ -658,13 +621,14 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
             }
             if print_children {
                 for p in h.iter() {
-                    print_page(txn, pages, buf, p, true)
+                    print_page(txn, keys_hex, values_hex, pages, buf, p, true)
                 }
             }
         }
     }
 
     fn print_tree<T: LoadPage>(txn: &T,
+                               keys_hex:bool,values_hex:bool,
                                nodes: &mut HashSet<u16>,
                                buf: &mut BufWriter<File>,
                                edges: &mut Vec<String>,
@@ -674,27 +638,41 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
         unsafe {
             //debug!("print tree:{:?}, off={:?}",p, off);
             let ptr = p.offset(off as isize) as *const u32;
-
+            let mut key_hex = String::new();
             let (key,value) = {
                 if off == FIRST_HEAD {
-                    ("root","".to_string())
+                    ("root".to_string(),"".to_string())
                 } else {
-
                     let (key, value) = read_key_value(ptr as *const u8);
                     //println!("key,value = ({:?},{:?})", key.as_ptr(), value.len());
-                    let key = std::str::from_utf8_unchecked(&key[0..(std::cmp::min(20,key.len()))]);
-                    let mut value_ = Vec::new();
-                    let mut value = Value { txn:txn,value:value };
-                    let value = if value.len() > 20 {
-                        let contents = value.next().unwrap();
-                        value_.extend(&contents[0..20]);
-                        value_.extend(b"...");
-                        &value_[..]
-                    } else {
-                        value.next().unwrap()
+                    let key =
+                        if keys_hex {
+                            key.to_hex()
+                        } else {
+                            let key = std::str::from_utf8_unchecked(&key[0..(std::cmp::min(20,key.len()))]);
+                            key.to_string()
+                        };
+                    let value = {
+                        let mut value_ = Vec::new();
+                        let mut value = Value { txn:txn,value:value };
+                        if values_hex {
+                            for i in value {
+                                value_.extend(i)
+                            }
+                            value_.to_hex()
+                        } else {
+                            let value = if value.len() > 20 {
+                                let contents = value.next().unwrap();
+                                value_.extend(&contents[0..20]);
+                                value_.extend(b"...");
+                                &value_[..]
+                            } else {
+                                value.next().unwrap()
+                            };
+                            std::str::from_utf8_unchecked(value).to_string()
+                        }
                     };
-                    let value = std::str::from_utf8_unchecked(value);
-                    (key,value.to_string())
+                    (key,value)
                 }
             };
             //debug!("key,value={:?},{:?}",key,value);
@@ -731,14 +709,14 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P) {
                                  left,i)
                             .unwrap();
                         //debug!("print_tree: recursive call");
-                        print_tree(txn,nodes,buf,edges,pages,p,left)
+                        print_tree(txn,keys_hex, values_hex, nodes,buf,edges,pages,p,left)
                     }
                 }
             }
             //debug!("/print tree:{:?}",p);
         }
     }
-    print_page(t, &mut h, &mut buf, &page, true /* print children */);
+    print_page(t, keys_hex, values_hex, &mut h, &mut buf, &page, true /* print children */);
     writeln!(&mut buf, "}}").unwrap();
 }
 

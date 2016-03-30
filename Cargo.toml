@@ -18,6 +18,8 @@ rand="0.3"
 memmap = "0.2"
 tempdir="0.3"
 
+rustc-serialize = "*"
+
 [build-dependencies]
 libc="0.2"
 

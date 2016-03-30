@@ -25,7 +25,7 @@
 use std;
 use std::sync::{RwLock, RwLockReadGuard, Mutex, MutexGuard};
 use std::ptr::copy_nonoverlapping;
-use std::collections::{HashSet,HashMap};
+use std::collections::{HashSet};
 use std::cmp::max;
 // use std::marker::PhantomData;
 use std::ops::Shl;
@@ -39,7 +39,6 @@ pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SIZE_64: u64 = 4096;
 
 pub const ZERO_HEADER: isize = 16; // size of the header on page 0, in bytes.
-pub const ZERO_HEADER_64: isize = 2; // size of the header on page 0, in bytes.
 
 #[derive(Debug)]
 pub enum Error {
@@ -86,7 +85,8 @@ pub struct MutTxn<'env,T> {
     occupied_clean_pages: HashSet<u64>, /* Offsets of pages that were allocated by this transaction, and have not been freed since. */
     free_clean_pages: Vec<u64>, /* Offsets of pages that were allocated by this transaction, and then freed. */
     free_pages: Vec<u64>, /* Offsets of old pages freed by this transaction. These were *not* allocated by this transaction. */
-    pub root:u64
+    pub root:u64,
+    pub reference_counts:u64
 }
 
 impl<'env> Drop for Txn<'env> {
@@ -191,7 +191,8 @@ impl Env {
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
-                root: u64::from_le(*(self.map.offset(ZERO_HEADER) as *const u64))
+                root: u64::from_le(*(self.map.offset(ZERO_HEADER) as *const u64)),
+                reference_counts: u64::from_le(*(self.map.offset(ZERO_HEADER + 8) as *const u64))
             }
         }
     }
@@ -299,7 +300,8 @@ impl<'env,T> MutTxn<'env,T> {
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
-                root:self.root
+                root:self.root,
+                reference_counts:self.reference_counts
             };
             txn.parent = self;
             txn
@@ -519,12 +521,13 @@ impl<'env> Commit for MutTxn<'env,()> {
                 *(self.env.map as *mut u64) = self.last_page.to_le();
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
                 *(self.env.map.offset(ZERO_HEADER) as *mut u64) = self.root.to_le();
+                *(self.env.map.offset(ZERO_HEADER + 8) as *mut u64) = self.reference_counts.to_le();
 
                 // synchronize all maps
                 let mmap:&mut memmap::Mmap = std::mem::transmute(&(self.env.mmap));
                 try!(mmap.flush_range(PAGE_SIZE, (self.env.length - PAGE_SIZE_64) as usize));
                 try!(mmap.flush_range(0, PAGE_SIZE));
-                //*self.mutable; // This is actually just unit (prevents dead code warnings)
+                self.env.lock_file.unlock().unwrap();
                 Ok(())
             }
         }

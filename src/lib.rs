@@ -70,6 +70,7 @@
 
 extern crate libc;
 extern crate rand;
+extern crate rustc_serialize;
 
 #[macro_use]
 extern crate log;
@@ -160,11 +161,32 @@ impl<'env,T> MutTxn<'env,T> {
         self.put(rng, db, key, &val);
         self.txn.set_root(db.root)
     }
+    pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64) {
+        let mut k: [u8; 8] = [0; 8];
+        let mut v: [u8; 8] = [0; 8];
+        unsafe {
+            *(k.as_mut_ptr() as *mut u64) = key.to_le();
+            *(v.as_mut_ptr() as *mut u64) = value.to_le();
+        }
+        self.put(rng, db, &k, &v);
+    }
+    pub fn replace_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64) {
+        let mut k: [u8; 8] = [0; 8];
+        let mut v: [u8; 8] = [0; 8];
+        unsafe {
+            *(k.as_mut_ptr() as *mut u64) = key.to_le();
+            *(v.as_mut_ptr() as *mut u64) = value.to_le();
+        }
+        self.replace(rng, db, &k, &v);
+    }
     pub fn set_root(&mut self, db:Db) {
         self.txn.set_root(db.root)
     }
     pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8]) {
         put_del::put(r, self, db, key, value)
+    }
+    pub fn replace<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8]) {
+        put_del::replace(r, self, db, key, value)
     }
     pub fn del<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: Option<&[u8]>) {
         put_del::del(r, self, db, key, value)
