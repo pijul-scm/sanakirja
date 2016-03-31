@@ -25,7 +25,7 @@
 use std;
 use std::sync::{RwLock, RwLockReadGuard, Mutex, MutexGuard};
 use std::ptr::copy_nonoverlapping;
-use std::collections::{HashSet};
+use std::collections::{HashSet,HashMap};
 use std::cmp::max;
 // use std::marker::PhantomData;
 use std::ops::Shl;
@@ -104,9 +104,10 @@ impl<'env,T> Drop for MutTxn<'env,T> {
 
 #[derive(Debug)]
 pub struct Statistics {
-    free_pages: HashSet<u64>,
-    bookkeeping_pages: Vec<u64>,
-    total_pages: u64,
+    pub free_pages: HashSet<u64>,
+    pub bookkeeping_pages: Vec<u64>,
+    pub total_pages: u64,
+    pub reference_counts: HashMap<u64,u64>
 }
 
 
@@ -224,10 +225,12 @@ impl Env {
                 }
                 cur = prev
             }
+            let refcounts = HashMap::new();
             Statistics {
                 total_pages: (total_pages / PAGE_SIZE) as u64,
                 free_pages: free_pages,
                 bookkeeping_pages: bookkeeping_pages,
+                reference_counts: refcounts
             }
         }
     }

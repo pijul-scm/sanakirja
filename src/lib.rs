@@ -75,6 +75,7 @@ extern crate memmap;
 
 use rand::Rng;
 use std::path::Path;
+use std::collections::HashMap;
 
 #[allow(mutable_transmutes)]
 mod transaction;
@@ -116,7 +117,19 @@ impl Env {
     }
     /// Returns statistics about pages.
     pub fn statistics(&self) -> Statistics {
-        self.env.statistics()
+        let mut stats = self.env.statistics();
+        let txn = self.mut_txn_begin();
+        if let Some(db) = txn.rc() {
+            txn.iterate(&db, &[], None, |key,mut value| {
+                unsafe {
+                    let key = u64::from_le(*(key.as_ptr() as *const u64));
+                    let value = u64::from_le(*(value.next().unwrap().as_ptr() as *const u64));
+                    stats.reference_counts.insert(key,value);
+                }
+                true
+            })
+        }
+        stats
     }
 
 }
@@ -236,15 +249,15 @@ pub trait Transaction:LoadPage {
     }
 
     /// Iterate a function, starting from the `key` and `value` arguments, until the function returns `false`.
-    fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
-                                                            db: &Db,
-                                                            key: &[u8],
-                                                            value: Option<&[u8]>,
-                                                            f: F) {
+    fn iterate<'a, F: FnMut(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
+                                                               db: &Db,
+                                                               key: &[u8],
+                                                               value: Option<&[u8]>,
+                                                               mut f: F) {
         unsafe {
             let page = self.load_page(db.root);
             let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
-            self.iterate_(txn::Iterate::NotStarted,page,key,value,&f);
+            self.iterate_(txn::Iterate::NotStarted,page,key,value,&mut f);
         }
     }
 }
@@ -255,12 +268,14 @@ impl<'env,T> Transaction for MutTxn<'env,T> {}
 
 
 impl<'env> MutTxn<'env,()> {
+    /// Commit the transaction to the file (consuming it).
     pub fn commit(mut self) -> Result<(), transaction::Error> {
         self.txn.commit()
     }
 }
 
 impl<'env,'txn,T> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
+    /// Commit the child transaction to its parent (consuming it).
     pub fn commit(mut self) -> Result<(), transaction::Error> {
         self.txn.commit()
     }

@@ -304,12 +304,12 @@ pub trait LoadPage:Sized {
         }
     }
 
-    unsafe fn iterate_<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
+    unsafe fn iterate_<'a, F: FnMut(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
                                                                     mut state: Iterate,
                                                                     page: Page,
                                                                     key: &[u8],
                                                                     value: Option<UnsafeValue>,
-                                                                    f: &F) -> Iterate {
+                                                                    f: &mut F) -> Iterate {
         let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
         let mut level = MAX_LEVEL;
@@ -371,7 +371,8 @@ pub trait LoadPage:Sized {
             state = Iterate::Started;
             // On the first time, the "current" entry must not be included.
             let (key,value) = read_key_value(current as *const u8);
-            if ! f(key,Value{ txn:self, value:value }) {
+            let continue_ = f(key,Value{ txn:self, value:value });
+            if ! continue_ {
                 state = Iterate::Finished;
                 break
             }

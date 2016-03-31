@@ -84,14 +84,14 @@ fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) {
                 let right_page = u64::from_le(*((pp as *const u64).offset(2)));
                 if current > FIRST_HEAD {
                     let (key,value) = read_key_value(pp);
-                    // Decrease count of right_page
-                    if right_page > 0 {
-                        free(rng, txn, right_page)
-                    }
                     // Decrease count of value
                     if let UnsafeValue::O { offset,.. } = value {
                         free_value(rng, txn, offset)
                     }
+                }
+                // Decrease count of right_page
+                if right_page > 0 {
+                    free(rng, txn, right_page)
                 }
                 current = u16::from_le(*((p.offset(current as isize) as *const u16)));
             }
@@ -182,12 +182,12 @@ fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, pinpoint:u
                 while current != NIL {
                     let pp = p.offset(current as isize);
                     let right_page = u64::from_le(*((pp as *const u64).offset(2)));
+                    // Increase count of right_page
+                    if right_page > 0 {
+                        incr_rc(rng, txn, right_page)
+                    }
                     if current > FIRST_HEAD {
                         let (key,value) = read_key_value(pp);
-                        // Increase count of right_page
-                        if right_page > 0 {
-                            incr_rc(rng, txn, right_page)
-                        }
                         // Increase count of value
                         if let UnsafeValue::O { offset,.. } = value {
                             incr_rc(rng, txn, offset)
