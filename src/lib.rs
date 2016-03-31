@@ -86,7 +86,7 @@ pub use txn::{MutTxn, Txn, Value, Db};
 use txn::{P, LoadPage};
 mod put_del;
 
-/// Environment, containing in particular a pointer to the memory-mapped file.
+/// Environment, essentially containing locks and mmaps.
 pub struct Env {
     env: transaction::Env,
 }
@@ -97,11 +97,6 @@ impl Env {
     /// Creates an environment.
     pub fn new<P: AsRef<Path>>(file: P) -> Result<Env, Error> {
         transaction::Env::new(file, 13 + 10).and_then(|env| Ok(Env { env: env }))
-    }
-
-    /// Returns statistics about pages.
-    pub fn statistics(&self) -> Statistics {
-        self.env.statistics()
     }
 
     /// Start an immutable transaction.
@@ -119,39 +114,40 @@ impl Env {
             txn: txn,
         }
     }
-}
-
-
-// Insert must return the new root.
-// When searching the tree, note whether at least one page had RC >= 2. If so, reallocate + copy all pages on the path.
-
-
-impl<'env> MutTxn<'env,()> {
-    pub fn commit(mut self) -> Result<(), transaction::Error> {
-        self.txn.commit()
+    /// Returns statistics about pages.
+    pub fn statistics(&self) -> Statistics {
+        self.env.statistics()
     }
-}
 
-impl<'env,'txn,T> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
-    pub fn commit(mut self) -> Result<(), transaction::Error> {
-        self.txn.commit()
-    }
 }
 
 impl<'env,T> MutTxn<'env,T> {
-    pub fn mut_txn_begin<'txn>(&'txn mut self) -> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
-        MutTxn {
-            txn: self.txn.mut_txn_begin()
-        }
-    }
+    /// Creates a new database. Use
+    ///
+    /// ```
+    /// txn.open_db(b"name").unwrap_or_else(|| txn.create_db())
+    /// ```
+    ///
+    /// To open a database called "name" from the root database, and create it if it doesn't exist.
     pub fn create_db(&mut self) -> Db {
         let mut db = self.alloc_page();
         db.init();
         Db { root: db.page_offset() }
     }
+
+    /// Produce an independent fork of a database. This method copies at most one block, and uses reference-counting on child blocks. The two databases share their bindings at the time of the fork, and can safely be considered separate databases after the fork.
+    /// A typical way to fork a database and add it under a different name is:
+    ///
+    /// ```
+    /// let fork = txn.fork_db(&mut rng, &original);
+    /// txn.put_db(&mut rng, &mut root, b"name of the forked db", fork);
+    /// 
+    /// ```
     pub fn fork_db<R:Rng>(&mut self, rng:&mut R, db:&Db) -> Db {
         Db { root: put_del::fork_db(rng, self, db.root) }
     }
+
+    /// Specialized version of ```put``` to register the name of a database. Argument ```db``` can be the root database (as in LMDB) or any other database.
     pub fn put_db<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: &[u8], value: Db) {
         let mut val: [u8; 8] = [0; 8];
         unsafe {
@@ -160,6 +156,23 @@ impl<'env,T> MutTxn<'env,T> {
         self.replace(rng, db, key, &val);
         self.txn.set_root(db.root)
     }
+
+    /// Add a binding to a B tree.
+    pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8]) {
+        put_del::put(r, self, db, key, value)
+    }
+
+    /// Replace the binding for a key. This is actually no more than `del` and `put` in a row: if there are more than one binding for that key, replace the smallest one, in lexicographical order.
+    pub fn replace<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8]) {
+        put_del::replace(r, self, db, key, value)
+    }
+
+    /// Delete the smallest binding (in lexicographical order) from the map matching the key and value. When the `value` argument is `None`, delete the smallest binding for that key.
+    pub fn del<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: Option<&[u8]>) {
+        put_del::del(r, self, db, key, value)
+    }
+
+    /// Specialized version of ```put`` for the case where both the key and value are 64-bits integers.
     pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64) {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
@@ -169,6 +182,7 @@ impl<'env,T> MutTxn<'env,T> {
         }
         self.put(rng, db, &k, &v);
     }
+    /// Specialized version of ```del`` for the case where the key is a 64-bits integer, and the value is None.
     pub fn del_u64<R:Rng>(&mut self, rng:&mut R, db:&mut Db, key:u64) {
         let mut k: [u8; 8] = [0; 8];
         unsafe {
@@ -177,7 +191,7 @@ impl<'env,T> MutTxn<'env,T> {
         self.del(rng, db, &k, None);
     }
 
-
+    /// Specialized version of ```replace`` for the case where the key is a 64-bits integer.
     pub fn replace_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64) {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
@@ -187,24 +201,28 @@ impl<'env,T> MutTxn<'env,T> {
         }
         self.replace(rng, db, &k, &v);
     }
+
+    /// Set the root database, consuming it.
     pub fn set_root(&mut self, db:Db) {
         self.txn.set_root(db.root)
     }
-    pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8]) {
-        put_del::put(r, self, db, key, value)
+
+    /// Create a child transaction, which can be either committed to its parent (but not to the file), or aborted independently from its parent.
+    pub fn mut_txn_begin<'txn>(&'txn mut self) -> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
+        MutTxn {
+            txn: self.txn.mut_txn_begin()
+        }
     }
-    pub fn replace<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8]) {
-        put_del::replace(r, self, db, key, value)
-    }
-    pub fn del<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: Option<&[u8]>) {
-        put_del::del(r, self, db, key, value)
-    }
+
 }
 
+
 pub trait Transaction:LoadPage {
+    /// Load the root database, if there's one.
     fn root(&self) -> Option<Db> {
         self.root_db_()
     }
+    /// get the smallest value corresponding to a key (or to a key and a value).
     fn get<'a>(&'a self, db: &Db, key: &[u8], value:Option<&[u8]>) -> Option<Value<'a,Self>> {
         unsafe {
             let page = self.load_page(db.root);
@@ -212,10 +230,12 @@ pub trait Transaction:LoadPage {
             self.get_(page, key, value).map(|x| Value { txn:self, value:x })
         }
     }
+    /// Open an existing database from the root database.
     fn open_db<'a>(&'a self, key: &[u8]) -> Option<Db> {
         self.open_db_(key)
     }
 
+    /// Iterate a function, starting from the `key` and `value` arguments, until the function returns `false`.
     fn iterate<'a, F: Fn(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
                                                             db: &Db,
                                                             key: &[u8],
@@ -231,6 +251,20 @@ pub trait Transaction:LoadPage {
 
 impl<'env> Transaction for Txn<'env> {}
 impl<'env,T> Transaction for MutTxn<'env,T> {}
+
+
+
+impl<'env> MutTxn<'env,()> {
+    pub fn commit(mut self) -> Result<(), transaction::Error> {
+        self.txn.commit()
+    }
+}
+
+impl<'env,'txn,T> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
+    pub fn commit(mut self) -> Result<(), transaction::Error> {
+        self.txn.commit()
+    }
+}
 
 
 #[cfg(test)]

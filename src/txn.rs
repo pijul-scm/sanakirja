@@ -19,12 +19,14 @@ pub const FIRST_HEAD:u16 = 0;
 pub const MAX_LEVEL:usize = 4;
 
 #[derive(Debug)]
+/// A database identifier. The `root` field is the offset in the file, of the root of a B tree.
 pub struct Db {
     pub root: u64,
 }
 
 /// Mutable transaction
 pub struct MutTxn<'env,T> {
+    #[doc(hidden)]
     pub txn: transaction::MutTxn<'env,T>,
 }
 
@@ -34,14 +36,17 @@ pub struct Txn<'env> {
 }
 
 impl<'env,T> MutTxn<'env,T> {
+    #[doc(hidden)]
     pub fn alloc_page(&mut self) -> MutPage {
         let page = self.txn.alloc_page().unwrap();
         unsafe { *(page.data as *mut u64) = 1u64.to_le() }
         MutPage { page: page }
     }
+    #[doc(hidden)]
     pub fn load_cow_page(&mut self, off: u64) -> Cow {
         Cow { cow: self.txn.load_cow_page(off) }
     }
+    #[doc(hidden)]
     pub fn rc(&self) -> Option<Db> {
         if self.txn.reference_counts == 0 {
             None
@@ -49,6 +54,7 @@ impl<'env,T> MutTxn<'env,T> {
             Some(Db { root: self.txn.reference_counts })
         }
     }
+    #[doc(hidden)]
     pub fn set_rc(&mut self, db:Db) {
         self.txn.reference_counts = db.root
     }
