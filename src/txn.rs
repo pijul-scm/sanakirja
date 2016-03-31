@@ -83,8 +83,11 @@ pub enum UnsafeValue {
         len: u32 }
 }
 
+/// Iterator over parts of a value. On values of size at most 1024 bytes, the iterator will run exactly once. On larger values, it returns all parts of the value, in order.
 pub struct Value<'a,T:'a> {
+    #[doc(hidden)]
     pub txn:&'a T,
+    #[doc(hidden)]
     pub value:UnsafeValue
 }
 impl <'a,T:LoadPage>fmt::Debug for Value<'a,T> {

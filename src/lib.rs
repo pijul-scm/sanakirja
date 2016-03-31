@@ -6,13 +6,16 @@
 //!
 //! # Features
 //!
-//! - ACID semantics, using a separable transactions module, reusable for other structure.
+//! - ACID semantics.
 //!
-//! - B-trees with copy-on-write.
+//! - B trees with copy-on-write.
 //!
-//! - Support for referential transparency (interface still missing).
+//! - Support for referential transparency: databases can be cloned in time O(1).
 //!
-//! - No read locks. The only three cases of locks are (1) on the first transaction of a thread, (2) when starting concurrent writers, or (3) when starting a writer in parallel with a reader started before the last commit on the file.
+//! - Ultimately, we'd like to have no locks. Right now, there is a
+//! cross-process read write lock, that only ```commit``` takes
+//! exclusively (other parts of a mutable transaction need just a read
+//! access).
 //!
 //!
 //! This version is only capable of inserting and retrieving keys in
@@ -80,7 +83,7 @@ use std::collections::HashMap;
 #[allow(mutable_transmutes)]
 mod transaction;
 
-pub use transaction::{Statistics};
+pub use transaction::{Statistics,Error};
 use transaction::Commit;
 mod txn;
 pub use txn::{MutTxn, Txn, Value, Db};
@@ -92,12 +95,11 @@ pub struct Env {
     env: transaction::Env,
 }
 
-pub type Error = transaction::Error;
 
 impl Env {
     /// Creates an environment.
     pub fn new<P: AsRef<Path>>(file: P) -> Result<Env, Error> {
-        transaction::Env::new(file, 13 + 10).and_then(|env| Ok(Env { env: env }))
+        transaction::Env::new(file, 12).and_then(|env| Ok(Env { env: env }))
     }
 
     /// Start an immutable transaction.
@@ -235,7 +237,7 @@ pub trait Transaction:LoadPage {
     fn root(&self) -> Option<Db> {
         self.root_db_()
     }
-    /// get the smallest value corresponding to a key (or to a key and a value).
+    /// get the smallest value corresponding to a key (or to a key and a value). The return type is an iterator outputting byte slices.
     fn get<'a>(&'a self, db: &Db, key: &[u8], value:Option<&[u8]>) -> Option<Value<'a,Self>> {
         unsafe {
             let page = self.load_page(db.root);
