@@ -122,7 +122,7 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
                         let page = self.txn.load_page(*offset).offset(0);
                         // change the pointer of "current page" to the next page
                         let next_offset = u64::from_le(*(page as *const u64));
-                        println!("current={:?}, next_offset:{:?}", *offset, next_offset);
+                        //println!("current={:?}, next_offset:{:?}", *offset, next_offset);
                         //
                         if next_offset != 0 {
                             *offset = next_offset;

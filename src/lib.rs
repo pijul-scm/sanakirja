@@ -414,7 +414,7 @@ mod tests {
         let mut buf = Vec::new();
         {
             for i in 0..20 {
-                println!(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+                //println!(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
                 let mut txn = env.mut_txn_begin();
                 let mut db = txn.root().unwrap_or_else(|| {
                     println!("create db");
@@ -453,7 +453,7 @@ mod tests {
                     .collect();
 
                 txn.put(&mut rng, &mut db, k.as_bytes(), v.as_bytes()).unwrap();
-                println!("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
+                //println!("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
                 
                 if rng.gen() {
                     txn.set_root(db);
@@ -462,7 +462,7 @@ mod tests {
                     random.push((k, v));
                 } else {
                     txn.set_root(db);
-                    println!("abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! ");
+                    //println!("abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! ");
                     // txn.abort()
                 }
             }

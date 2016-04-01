@@ -255,7 +255,7 @@ impl MutPage {
 }
 
 pub unsafe fn free<T>(txn: &mut MutTxn<T>, offset: u64) {
-    println!("free page: {:?}", offset);
+    debug!("free page: {:?}", offset);
     if txn.occupied_clean_pages.remove(&offset) {
         txn.free_clean_pages.push(offset);
     } else {
@@ -352,7 +352,7 @@ impl<'env,T> MutTxn<'env,T> {
     /// Pop a free page from the list of free pages.
     fn free_pages_pop(&mut self) -> Option<u64> {
         unsafe {
-            println!("free_pages_pop, current_list_position:{}",
+            debug!("free_pages_pop, current_list_position:{}",
                    self.current_list_position);
             if self.current_list_page.offset == 0 {
                 None
@@ -400,7 +400,7 @@ impl<'env,T> MutTxn<'env,T> {
         } else {
             // Else, if there are free pages, take one.
             if let Some(page) = self.free_pages_pop() {
-                println!("using an old free page: {}", page);
+                debug!("using an old free page: {}", page);
                 self.occupied_clean_pages.insert(page);
                 Ok(MutPage {
                     data: unsafe { self.env.map.offset(page as isize) },
@@ -409,7 +409,7 @@ impl<'env,T> MutTxn<'env,T> {
             } else {
                 // Else, allocate in the free space.
                 let last = self.last_page;
-                println!("eating the free space: {}", last);
+                debug!("eating the free space: {}", last);
                 if self.last_page + PAGE_SIZE_64 < self.env.length {
                     self.last_page += PAGE_SIZE_64;
                     self.occupied_clean_pages.insert(last);
