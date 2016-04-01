@@ -52,10 +52,10 @@
 //! fn main() {
 //!    let mut rng = rand::thread_rng();
 //!    let dir = tempdir::TempDir::new("pijul").unwrap();
-//!    let env = sanakirja::Env::new(dir.path()).unwrap();
+//!    let env = sanakirja::Env::new(dir.path(),100).unwrap();
 //!    let mut txn = env.mut_txn_begin();
-//!    let mut root = txn.root().unwrap_or_else(|| txn.create_db());
-//!    txn.put(&mut rng, &mut root, b"test key", b"test value");
+//!    let mut root = txn.root().unwrap_or_else(|| txn.create_db().unwrap());
+//!    txn.put(&mut rng, &mut root, b"test key", b"test value").unwrap();
 //!    txn.set_root(root);
 //!    txn.commit().unwrap();
 //!
@@ -98,8 +98,8 @@ pub struct Env {
 
 impl Env {
     /// Creates an environment.
-    pub fn new<P: AsRef<Path>>(file: P) -> Result<Env, Error> {
-        transaction::Env::new(file, 12).and_then(|env| Ok(Env { env: env }))
+    pub fn new<P: AsRef<Path>>(file: P, size:u64) -> Result<Env, Error> {
+        transaction::Env::new(file, size*(1<<12)).and_then(|env| Ok(Env { env: env }))
     }
 
     /// Start an immutable transaction.
@@ -140,50 +140,51 @@ impl<'env,T> MutTxn<'env,T> {
     /// Creates a new database. Use
     ///
     /// ```
-    /// txn.open_db(b"name").unwrap_or_else(|| txn.create_db())
+    /// // txn.open_db(b"name").unwrap_or_else(|| txn.create_db())
     /// ```
     ///
     /// To open a database called "name" from the root database, and create it if it doesn't exist.
-    pub fn create_db(&mut self) -> Db {
-        let mut db = self.alloc_page();
+    pub fn create_db(&mut self) -> Result<Db,Error> {
+        let mut db = try!(self.alloc_page());
         db.init();
-        Db { root: db.page_offset() }
+        Ok(Db { root: db.page_offset() })
     }
 
     /// Produce an independent fork of a database. This method copies at most one block, and uses reference-counting on child blocks. The two databases share their bindings at the time of the fork, and can safely be considered separate databases after the fork.
     /// A typical way to fork a database and add it under a different name is:
     ///
     /// ```
-    /// let fork = txn.fork_db(&mut rng, &original);
-    /// txn.put_db(&mut rng, &mut root, b"name of the forked db", fork);
+    /// // let fork = txn.fork_db(&mut rng, &original);
+    /// // txn.put_db(&mut rng, &mut root, b"name of the forked db", fork);
     /// 
     /// ```
-    pub fn fork_db<R:Rng>(&mut self, rng:&mut R, db:&Db) -> Db {
-        Db { root: put_del::fork_db(rng, self, db.root) }
+    pub fn fork_db<R:Rng>(&mut self, rng:&mut R, db:&Db) -> Result<Db,Error> {
+        Ok(Db { root: try!(put_del::fork_db(rng, self, db.root)) })
     }
 
     /// Specialized version of ```put``` to register the name of a database. Argument ```db``` can be the root database (as in LMDB) or any other database.
-    pub fn put_db<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: &[u8], value: Db) {
+    pub fn put_db<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: &[u8], value: Db)->Result<(),Error> {
         let mut val: [u8; 8] = [0; 8];
         unsafe {
             *(val.as_mut_ptr() as *mut u64) = value.root.to_le();
         }
-        self.replace(rng, db, key, &val);
-        self.txn.set_root(db.root)
+        try!(self.replace(rng, db, key, &val));
+        self.txn.set_root(db.root);
+        Ok(())
     }
 
     /// Add a binding to a B tree.
-    pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8]) {
+    pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8])->Result<(),Error> {
         put_del::put(r, self, db, key, value)
     }
 
     /// Replace the binding for a key. This is actually no more than `del` and `put` in a row: if there are more than one binding for that key, replace the smallest one, in lexicographical order.
-    pub fn replace<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8]) {
+    pub fn replace<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8])->Result<(),Error> {
         put_del::replace(r, self, db, key, value)
     }
 
     /// Delete the smallest binding (in lexicographical order) from the map matching the key and value. When the `value` argument is `None`, delete the smallest binding for that key.
-    pub fn del<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: Option<&[u8]>) {
+    pub fn del<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: Option<&[u8]>)->Result<(),Error> {
         put_del::del(r, self, db, key, value)
     }
 
@@ -207,14 +208,14 @@ impl<'env,T> MutTxn<'env,T> {
     }
 
     /// Specialized version of ```replace`` for the case where the key is a 64-bits integer.
-    pub fn replace_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64) {
+    pub fn replace_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64)->Result<(),Error> {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
         unsafe {
             *(k.as_mut_ptr() as *mut u64) = key.to_le();
             *(v.as_mut_ptr() as *mut u64) = value.to_le();
         }
-        self.replace(rng, db, &k, &v);
+        self.replace(rng, db, &k, &v)
     }
 
     /// Set the root database, consuming it.
@@ -295,10 +296,10 @@ mod tests {
         extern crate rand;
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path()).unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
         let mut txn = env.mut_txn_begin();
-        let mut root = txn.root().unwrap_or_else(|| txn.create_db());
-        txn.put(&mut rng, &mut root, b"test key", b"test value");
+        let mut root = txn.root().unwrap_or_else(|| txn.create_db().unwrap());
+        txn.put(&mut rng, &mut root, b"test key", b"test value").unwrap();
         txn.set_root(root);
         txn.commit().unwrap();
 
@@ -314,26 +315,26 @@ mod tests {
         extern crate rand;
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path()).unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
         let mut txn = env.mut_txn_begin();
         {
             let mut child_txn = txn.mut_txn_begin();
-            let mut root = child_txn.root().unwrap_or_else(|| child_txn.create_db());
-            child_txn.put(&mut rng, &mut root, b"A", b"Value for A");
+            let mut root = child_txn.root().unwrap_or_else(|| child_txn.create_db().unwrap());
+            child_txn.put(&mut rng, &mut root, b"A", b"Value for A").unwrap();
             child_txn.set_root(root);
             child_txn.commit();
         }
         {
             let mut child_txn = txn.mut_txn_begin();
             let mut root = child_txn.root().unwrap();
-            child_txn.put(&mut rng, &mut root, b"B", b"Value for B");
+            child_txn.put(&mut rng, &mut root, b"B", b"Value for B").unwrap();
             child_txn.set_root(root);
             //child_txn.abort();
         }
         {
             let mut child_txn = txn.mut_txn_begin();
-            let mut root = child_txn.root().unwrap_or_else(|| child_txn.create_db());
-            child_txn.put(&mut rng, &mut root, b"C", b"Value for C");
+            let mut root = child_txn.root().unwrap_or_else(|| child_txn.create_db().unwrap());
+            child_txn.put(&mut rng, &mut root, b"C", b"Value for C").unwrap();
             child_txn.set_root(root);
             child_txn.commit();
         }
@@ -354,16 +355,16 @@ mod tests {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path()).unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
 
         let db_names = [b"great db".to_vec(), b"other db".to_vec(), b"blabla\0blibli".to_vec()];
         let mut random = Vec::new();
         {
             let len = 32;
             let mut txn = env.mut_txn_begin();
-            let mut root = txn.root().unwrap_or_else(|| txn.create_db());
+            let mut root = txn.root().unwrap_or_else(|| txn.create_db().unwrap());
             for ref name in db_names.iter() {
-                let mut db = txn.open_db(&name[..]).unwrap_or(txn.create_db());
+                let mut db = txn.open_db(&name[..]).unwrap_or(txn.create_db().unwrap());
                 loop {
                     let k: String = rand::thread_rng()
                         .gen_iter::<char>()
@@ -403,27 +404,43 @@ mod tests {
         extern crate tempdir;
         extern crate rand;
         use rand::Rng;
+        use std;
         use rand::SeedableRng;
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path()).unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
 
         let mut random:Vec<(String,String)> = Vec::new();
         let mut buf = Vec::new();
         {
             for i in 0..20 {
+                println!(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
                 let mut txn = env.mut_txn_begin();
-                let mut db = txn.root().unwrap_or_else(|| txn.create_db());
+                let mut db = txn.root().unwrap_or_else(|| {
+                    println!("create db");
+                    txn.create_db().unwrap()
+                });
                 {
                     // Are all values inserted so far here?
+                    //println!("find");
                     for &(ref k, ref v) in random.iter() {
-                        assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
+                        //println!("found");
+                        let got = txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
                             buf.clear();
                             for i in x {
                                 buf.extend(i)
                             }
                             Some(&buf[..])
-                        }) == Some(v.as_bytes()))
+                        });
+                        if got != Some(v.as_bytes()) {
+                            unsafe {
+                                println!("{}\n{}",
+                                         std::str::from_utf8_unchecked(got.unwrap()),
+                                         std::str::from_utf8_unchecked(v.as_bytes())
+                                );
+                            }
+                        }
+                        assert!(got == Some(v.as_bytes()))
                     }
                 }
                 let k: String = rand::thread_rng()
@@ -435,14 +452,17 @@ mod tests {
                     .take(value_len)
                     .collect();
 
-                txn.put(&mut rng, &mut db, k.as_bytes(), v.as_bytes());
+                txn.put(&mut rng, &mut db, k.as_bytes(), v.as_bytes()).unwrap();
+                println!("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
                 
                 if rng.gen() {
                     txn.set_root(db);
                     txn.commit().unwrap();
-                    random.push((k, v));                
+                    println!("statistics: {:?}", env.statistics());
+                    random.push((k, v));
                 } else {
                     txn.set_root(db);
+                    println!("abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! ");
                     // txn.abort()
                 }
             }
@@ -479,7 +499,7 @@ mod tests {
         use rand::SeedableRng;
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path()).unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
 
         let mut random:Vec<(String,String)> = Vec::new();
         let mut buf = Vec::new();
@@ -509,7 +529,7 @@ mod tests {
             .collect();
         {
             let mut txn = env.mut_txn_begin();
-            let mut db = txn.root().unwrap_or_else(|| txn.create_db());
+            let mut db = txn.root().unwrap_or_else(|| txn.create_db().unwrap());
             txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes());
             txn.put(&mut rng, &mut db, k1.as_bytes(), v1.as_bytes());
             txn.set_root(db);
@@ -518,9 +538,9 @@ mod tests {
 
         {
             let mut txn = env.mut_txn_begin();
-            let mut db = txn.root().unwrap_or_else(|| txn.create_db());
+            let mut db = txn.root().unwrap_or_else(|| txn.create_db().unwrap());
             //txn.debug(&db,"/tmp/before");
-            txn.del(&mut rng, &mut db, k0.as_bytes(), Some(v0.as_bytes()));
+            txn.del(&mut rng, &mut db, k0.as_bytes(), Some(v0.as_bytes())).unwrap();
             //txn.debug(&db,"/tmp/after");
             txn.set_root(db);
             txn.commit().unwrap();

@@ -17,6 +17,7 @@ pub const VALUE_SIZE_THRESHOLD: usize = PAGE_SIZE >> 2;
 pub const NIL:u16 = 0xffff;
 pub const FIRST_HEAD:u16 = 0;
 pub const MAX_LEVEL:usize = 4;
+pub const VALUE_HEADER_LEN:usize = 8;
 
 #[derive(Debug)]
 /// A database identifier. The `root` field is the offset in the file, of the root of a B tree.
@@ -35,12 +36,13 @@ pub struct Txn<'env> {
     pub txn: transaction::Txn<'env>,
 }
 
+type Error = transaction::Error;
+
 impl<'env,T> MutTxn<'env,T> {
     #[doc(hidden)]
-    pub fn alloc_page(&mut self) -> MutPage {
-        let page = self.txn.alloc_page().unwrap();
-        unsafe { *(page.data as *mut u64) = 1u64.to_le() }
-        MutPage { page: page }
+    pub fn alloc_page(&mut self) -> Result<MutPage,transaction::Error> {
+        let page = try!(self.txn.alloc_page());
+        Ok(MutPage { page: page })
     }
     #[doc(hidden)]
     pub fn load_cow_page(&mut self, off: u64) -> Cow {
@@ -119,14 +121,15 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
                     unsafe {
                         let page = self.txn.load_page(*offset).offset(0);
                         // change the pointer of "current page" to the next page
-                        let next_offset = u64::from_le(*((page as *const u64).offset(1)));
+                        let next_offset = u64::from_le(*(page as *const u64));
+                        println!("current={:?}, next_offset:{:?}", *offset, next_offset);
                         //
                         if next_offset != 0 {
-                            *offset = u64::from_le(*((page as *const u64).offset(1)));
-                            *len -= (PAGE_SIZE-16) as u32;
-                            Some(std::slice::from_raw_parts(page.offset(16), PAGE_SIZE-16))
+                            *offset = next_offset;
+                            *len -= (PAGE_SIZE-VALUE_HEADER_LEN) as u32;
+                            Some(std::slice::from_raw_parts(page.offset(VALUE_HEADER_LEN as isize), PAGE_SIZE-VALUE_HEADER_LEN))
                         } else {
-                            let slice=std::slice::from_raw_parts(page.offset(16), *len as usize);
+                            let slice=std::slice::from_raw_parts(page.offset(VALUE_HEADER_LEN as isize), *len as usize);
                             *len = 0;
                             Some(slice)
                         }
@@ -139,10 +142,10 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
                 } else {
                     let pp = *p;
                     unsafe {
-                        let l = if *len > PAGE_SIZE as u32 - 16 {
-                            *p = ((*p) as *mut u8).offset(PAGE_SIZE as isize - 16);
-                            *len -= (PAGE_SIZE - 16) as u32;
-                            PAGE_SIZE-16
+                        let l = if *len > PAGE_SIZE as u32 - VALUE_HEADER_LEN as u32 {
+                            *p = ((*p) as *mut u8).offset(PAGE_SIZE as isize - VALUE_HEADER_LEN as isize);
+                            *len -= (PAGE_SIZE - VALUE_HEADER_LEN) as u32;
+                            PAGE_SIZE-VALUE_HEADER_LEN
                         } else {
                             *p = std::ptr::null_mut();
                             let l = *len;

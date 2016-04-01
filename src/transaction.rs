@@ -43,6 +43,7 @@ pub const ZERO_HEADER: isize = 16; // size of the header on page 0, in bytes.
 #[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
+    NotEnoughSpace
 }
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Error {
@@ -113,9 +114,8 @@ pub struct Statistics {
 
 impl Env {
     /// Initialize environment. log_length must be at least log(PAGE_SIZE)
-    pub fn new<P: AsRef<Path>>(path: P, log_length: usize) -> Result<Env, Error> {
-        let length = (1 as u64).shl(log_length);
-        assert!(length >= PAGE_SIZE_64);
+    pub fn new<P: AsRef<Path>>(path: P, length: u64) -> Result<Env, Error> {
+        //let length = (1 as u64).shl(log_length);
         let db_path = path.as_ref().join("db");
         let file = try!(
             OpenOptions::new()
@@ -217,7 +217,7 @@ impl Env {
                     while i < len {
                         let free_page = u64::from_le(*p);
                         if !free_pages.insert(free_page) {
-                            panic!("free page counted twice")
+                            panic!("free page counted twice: {:?}",free_page)
                         }
                         p = p.offset(1);
                         i += 1
@@ -255,6 +255,7 @@ impl MutPage {
 }
 
 pub unsafe fn free<T>(txn: &mut MutTxn<T>, offset: u64) {
+    println!("free page: {:?}", offset);
     if txn.occupied_clean_pages.remove(&offset) {
         txn.free_clean_pages.push(offset);
     } else {
@@ -299,7 +300,7 @@ impl<'env,T> MutTxn<'env,T> {
                 current_list_page: Page { data:self.current_list_page.data,
                                           offset: self.current_list_page.offset },
                 current_list_length: self.current_list_length,
-                current_list_position: self.current_list_length, /* position of the word immediately after the top. */
+                current_list_position: self.current_list_length,
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
@@ -351,7 +352,7 @@ impl<'env,T> MutTxn<'env,T> {
     /// Pop a free page from the list of free pages.
     fn free_pages_pop(&mut self) -> Option<u64> {
         unsafe {
-            debug!("free_pages_pop, current_list_position:{}",
+            println!("free_pages_pop, current_list_position:{}",
                    self.current_list_position);
             if self.current_list_page.offset == 0 {
                 None
@@ -362,62 +363,62 @@ impl<'env,T> MutTxn<'env,T> {
                     if previous_page == 0 {
                         None
                     } else {
-                        // free page, move to previous one and call recursively.
+                        // free page (i.e. push to the list of old
+                        // free pages), move to previous bookkeeping
+                        // pages, and call recursively.
                         self.free_pages.push(self.current_list_page.offset);
-                        self.current_list_length =
-                            u64::from_le(*((self.current_list_page.data as *const u64).offset(1)));
                         self.current_list_page = Page {
                             data: self.env.map.offset(previous_page as isize),
                             offset: previous_page,
                         };
-
+                        self.current_list_length =
+                            u64::from_le(*((self.current_list_page.data as *const u64).offset(1)));
+                        self.current_list_position = self.current_list_length;
                         self.free_pages_pop()
                     }
                 } else {
                     let pos = self.current_list_position;
                     // find the page at the top.
                     self.current_list_position -= 1;
-                    debug!("free_pages_pop, new position:{}",
-                           self.current_list_position);
-                    Some(u64::from_le(*((self.current_list_page.data as *mut u64)
-                                            .offset(1 + pos as isize))))
+                    debug!("free_pages_pop, new position:{}", self.current_list_position);
+                    Some(u64::from_le(*((self.current_list_page.data as *mut u64).offset(1 + pos as isize))))
                 }
             }
         }
     }
     /// Allocate a single page.
-    pub fn alloc_page(&mut self) -> Option<MutPage> {
+    pub fn alloc_page(&mut self) -> Result<MutPage,Error> {
         debug!("alloc page");
         // If we have allocated and freed a page in this transaction, use it first.
         if let Some(page) = self.free_clean_pages.pop() {
             debug!("clean page reuse:{}", page);
             self.occupied_clean_pages.insert(page);
-            Some(MutPage {
+            Ok(MutPage {
                 data: unsafe { self.env.map.offset(page as isize) },
                 offset: page,
             })
         } else {
             // Else, if there are free pages, take one.
             if let Some(page) = self.free_pages_pop() {
-                debug!("using an old free page: {}", page);
+                println!("using an old free page: {}", page);
                 self.occupied_clean_pages.insert(page);
-                Some(MutPage {
+                Ok(MutPage {
                     data: unsafe { self.env.map.offset(page as isize) },
                     offset: page,
                 })
             } else {
                 // Else, allocate in the free space.
                 let last = self.last_page;
-                debug!("eating the free space: {}", last);
+                println!("eating the free space: {}", last);
                 if self.last_page + PAGE_SIZE_64 < self.env.length {
                     self.last_page += PAGE_SIZE_64;
                     self.occupied_clean_pages.insert(last);
-                    Some(MutPage {
+                    Ok(MutPage {
                         data: unsafe { self.env.map.offset(last as isize) },
                         offset: last,
                     })
                 } else {
-                    None
+                    Err(Error::NotEnoughSpace)
                 }
             }
         }
