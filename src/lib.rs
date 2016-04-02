@@ -414,10 +414,10 @@ mod tests {
         let mut buf = Vec::new();
         {
             for i in 0..20 {
-                //println!(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+                //println!("");
                 let mut txn = env.mut_txn_begin();
                 let mut db = txn.root().unwrap_or_else(|| {
-                    println!("create db");
+                    //println!("create db");
                     txn.create_db().unwrap()
                 });
                 {
@@ -425,6 +425,7 @@ mod tests {
                     //println!("find");
                     for &(ref k, ref v) in random.iter() {
                         //println!("found");
+                        //println!("getting {:?}", k);
                         let got = txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
                             buf.clear();
                             for i in x {
@@ -434,8 +435,8 @@ mod tests {
                         });
                         if got != Some(v.as_bytes()) {
                             unsafe {
-                                println!("{}\n{}",
-                                         std::str::from_utf8_unchecked(got.unwrap()),
+                                println!("{:?}\n{}",
+                                         got.map(|x| std::str::from_utf8_unchecked(x)),
                                          std::str::from_utf8_unchecked(v.as_bytes())
                                 );
                             }
@@ -452,17 +453,19 @@ mod tests {
                     .take(value_len)
                     .collect();
 
+                //println!("Putting {:?}, {:?}", k,v);
                 txn.put(&mut rng, &mut db, k.as_bytes(), v.as_bytes()).unwrap();
-                //println!("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
                 
                 if rng.gen() {
+                    //txn.debug(&db,format!("/tmp/debug_{}",i),false,false);
                     txn.set_root(db);
                     txn.commit().unwrap();
-                    println!("statistics: {:?}", env.statistics());
+                    let stats = env.statistics();
+                    //println!("statistics: {:?}", stats);
                     random.push((k, v));
                 } else {
                     txn.set_root(db);
-                    //println!("abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! abort ! ");
+                    // println!("abort !");
                     // txn.abort()
                 }
             }
@@ -486,7 +489,6 @@ mod tests {
     }
 
 
-    #[test]
     pub fn large_values() -> () {
         consecutive_commits_(500,8000);
     }

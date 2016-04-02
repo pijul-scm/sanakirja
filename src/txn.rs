@@ -255,6 +255,7 @@ pub trait LoadPage:Sized {
     }
 
     unsafe fn get_(&self, page:Page, key: &[u8], value:Option<UnsafeValue>) -> Option<UnsafeValue> {
+        //println!("get from page {:?}", page);
         let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
         let mut level = MAX_LEVEL;
@@ -269,6 +270,9 @@ pub trait LoadPage:Sized {
                 } else {
                     let next_ptr = page.offset(next as isize);
                     let (next_key,next_value) = read_key_value(next_ptr);
+                    /*println!("cmp {:?} {:?}",
+                             std::str::from_utf8_unchecked(key),
+                             std::str::from_utf8_unchecked(next_key));*/
                     match key.cmp(next_key) {
                         Ordering::Less => break,
                         Ordering::Equal =>
