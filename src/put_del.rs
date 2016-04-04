@@ -911,15 +911,11 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C, mut 
                     Some((Res::Split { key_ptr,key_len,value,left,right,free_page }, smallest)) => {
                         // Splits can happen, for instance if the page below was merged, and this resulted in a split.
 
-                        // In this case, we must reinsert smallest
-                        // into the left page (unimplemented), and
-                        // then update everything (implemented).
-                        unimplemented!();
-
+                        // In this case, we must reinsert the key and value in the current page, and then forward smallest upwards for reinsertion.
                         // Update
                         *((current as *mut u64).offset(2)) = left.page_offset().to_le();
                         let key = std::slice::from_raw_parts(key_ptr,key_len);
-                        let result = Some((try!(insert(rng,txn,page,key, value, right.page_offset(), false)), None));
+                        let result = Some((try!(insert(rng,txn,page,key, value, right.page_offset(), false)), smallest));
                         // After reinserting, we can free the page containing the middle element.
                         try!(free(rng, txn, free_page));
                         Ok(result)
