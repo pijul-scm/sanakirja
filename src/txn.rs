@@ -679,7 +679,6 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
         unsafe {
             //debug!("print tree:{:?}, off={:?}",p, off);
             let ptr = p.offset(off as isize) as *const u32;
-            let mut key_hex = String::new();
             let (key,value) = {
                 if off == FIRST_HEAD {
                     ("root".to_string(),"".to_string())

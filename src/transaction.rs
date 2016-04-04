@@ -28,7 +28,6 @@ use std::ptr::copy_nonoverlapping;
 use std::collections::{HashSet,HashMap};
 use std::cmp::max;
 // use std::marker::PhantomData;
-use std::ops::Shl;
 use fs2::FileExt;
 use std::fs::{File,OpenOptions};
 use std::path::Path;
@@ -531,6 +530,9 @@ impl<'env> Commit for MutTxn<'env,()> {
                 try!(self.env.mmap.flush_range(PAGE_SIZE, (self.env.length - PAGE_SIZE_64) as usize));
                 try!(self.env.mmap.flush_range(0, PAGE_SIZE));
                 self.env.lock_file.unlock().unwrap();
+                if let Some(ref guard) = self.mutable {
+                    **guard // just unit, prevents warnings.
+                }
                 Ok(())
             }
         }

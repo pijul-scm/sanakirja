@@ -78,7 +78,6 @@ extern crate memmap;
 
 use rand::Rng;
 use std::path::Path;
-use std::collections::HashMap;
 
 #[allow(mutable_transmutes)]
 mod transaction;
@@ -112,7 +111,7 @@ impl Env {
     /// Start a mutable transaction.
 
     pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env,()> {
-        let mut txn = self.env.mut_txn_begin();
+        let txn = self.env.mut_txn_begin();
         MutTxn {
             txn: txn,
         }
@@ -189,22 +188,22 @@ impl<'env,T> MutTxn<'env,T> {
     }
 
     /// Specialized version of ```put`` for the case where both the key and value are 64-bits integers.
-    pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64) {
+    pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64)->Result<(),Error> {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
         unsafe {
             *(k.as_mut_ptr() as *mut u64) = key.to_le();
             *(v.as_mut_ptr() as *mut u64) = value.to_le();
         }
-        self.put(rng, db, &k, &v);
+        self.put(rng, db, &k, &v)
     }
     /// Specialized version of ```del`` for the case where the key is a 64-bits integer, and the value is None.
-    pub fn del_u64<R:Rng>(&mut self, rng:&mut R, db:&mut Db, key:u64) {
+    pub fn del_u64<R:Rng>(&mut self, rng:&mut R, db:&mut Db, key:u64)->Result<(),Error> {
         let mut k: [u8; 8] = [0; 8];
         unsafe {
             *(k.as_mut_ptr() as *mut u64) = key.to_le();
         }
-        self.del(rng, db, &k, None);
+        self.del(rng, db, &k, None)
     }
 
     /// Specialized version of ```replace`` for the case where the key is a 64-bits integer.
@@ -272,14 +271,14 @@ impl<'env,T> Transaction for MutTxn<'env,T> {}
 
 impl<'env> MutTxn<'env,()> {
     /// Commit the transaction to the file (consuming it).
-    pub fn commit(mut self) -> Result<(), transaction::Error> {
+    pub fn commit(self) -> Result<(), transaction::Error> {
         self.txn.commit()
     }
 }
 
 impl<'env,'txn,T> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
     /// Commit the child transaction to its parent (consuming it).
-    pub fn commit(mut self) -> Result<(), transaction::Error> {
+    pub fn commit(self) -> Result<(), transaction::Error> {
         self.txn.commit()
     }
 }
