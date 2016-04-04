@@ -92,8 +92,8 @@ fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Error> {
                 if current > FIRST_HEAD {
                     let (_,value) = read_key_value(pp);
                     // Decrease count of value
-                    if let UnsafeValue::O { .. } = value {
-                        //free_value(rng, txn, offset)
+                    if let UnsafeValue::O { offset, .. } = value {
+                        try!(free_value(rng, txn, offset))
                     }
                 }
                 // Decrease count of right_page
@@ -350,7 +350,7 @@ unsafe fn insert<R:Rng,T>(
                     // Then, reinsert (key_,value_) in the current page.
                     let result = insert(rng,txn,Cow::from_mut_page(page),key_, value_, right.page_offset(), needs_copying);
                     debug!("free split 1: {:?}", free_page);
-                    free(rng, txn, free_page);
+                    try!(free(rng, txn, free_page));
                     result
                 } else {
                     // Else, split+translate first, then insert.
@@ -400,7 +400,10 @@ unsafe fn insert<R:Rng,T>(
 }
 
 
-/// The arguments to split_page are non-trivial. This function takes a page and an element to insert, to large to fit in the page. It splits the page, inserts the new element, and returns the middle element of the split as a Res::Split { .. }.
+/// The arguments to split_page are non-trivial. This function takes a
+/// page and an element to insert, to large to fit in the page. It
+/// splits the page, inserts the new element, and returns the middle
+/// element of the split as a Res::Split { .. }.
 unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                             // (key, value, right_page) of the record to insert.
                             key:&[u8], value:UnsafeValue, right_page:u64,
@@ -484,7 +487,7 @@ unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
     };
 
 
-    // We still need to reinsert key,value in one of the two pages.
+    // We still need to reinsert the (key,value) given in argument, in one of the two pages.
     let key_ = std::slice::from_raw_parts(key_ptr,key_len);
     let (left,right) = match key.cmp(key_) {
         Ordering::Less => {
@@ -535,7 +538,7 @@ fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Res) -> Result<Db,Erro
             let right_offset = right.page_offset();
             let ins = try!(insert(rng, txn, Cow::from_mut_page(page), key, value, right_offset, false));
             debug!("free root_split: {:?}", free_page);
-            free(rng, txn, free_page);
+            try!(free(rng, txn, free_page));
             match ins {
                 Res::Ok { page,.. } => {
                     Ok(Db { root:page.page_offset() })
@@ -710,7 +713,9 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:MutPage, off: u16
         Res::Split { key_ptr,key_len,value,left,right,free_page } => {
             *(page.offset((off+16) as isize) as *mut u64) = left.page_offset().to_le();
             let key = std::slice::from_raw_parts(key_ptr,key_len);
-            insert(rng, txn, Cow::from_mut_page(page), key, value, right.page_offset(), false)
+            let result = try!(insert(rng, txn, Cow::from_mut_page(page), key, value, right.page_offset(), false));
+            try!(free(rng, txn, free_page));
+            Ok(result)
         }
     }
 }
@@ -1096,7 +1101,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                     let next_page = u64::from_le(*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
                     if next_page != 0 {
                         debug!("free del none: {:?}", page.page_offset());
-                        free(rng, txn, page.page_offset());
+                        try!(free(rng, txn, page.page_offset()));
                         db.root = next_page
                     } else {
                         db.root = page.page_offset()
