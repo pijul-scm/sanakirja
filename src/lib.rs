@@ -33,11 +33,11 @@
 //!
 //! - dynamic loading of pages not in the map, especially on 32-bits platforms ('transaction.rs', half-easy)
 //!
+//! - Check freeing.
+//!
 //! # For future versions
 //!
 //! - implement advertised lock model (right now, committing a writer excludes readers, there's no other lock).
-//!
-//! - merging pages to rebalance more (delete).
 //!
 //! - combined "CoW + delete".
 //!
