@@ -528,9 +528,8 @@ impl<'env> Commit for MutTxn<'env,()> {
                 *(self.env.map.offset(ZERO_HEADER + 8) as *mut u64) = self.reference_counts.to_le();
 
                 // synchronize all maps
-                let mmap:&mut memmap::Mmap = std::mem::transmute(&(self.env.mmap));
-                try!(mmap.flush_range(PAGE_SIZE, (self.env.length - PAGE_SIZE_64) as usize));
-                try!(mmap.flush_range(0, PAGE_SIZE));
+                try!(self.env.mmap.flush_range(PAGE_SIZE, (self.env.length - PAGE_SIZE_64) as usize));
+                try!(self.env.mmap.flush_range(0, PAGE_SIZE));
                 self.env.lock_file.unlock().unwrap();
                 Ok(())
             }
