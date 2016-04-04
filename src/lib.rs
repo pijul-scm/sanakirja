@@ -309,6 +309,47 @@ mod tests {
     }
 
     #[test]
+    fn deletions() -> ()
+    {
+        extern crate tempdir;
+        extern crate rand;
+        use rand::{Rng};
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
+        let mut txn = env.mut_txn_begin();
+        let mut root = txn.root().unwrap_or_else(|| txn.create_db().unwrap());
+
+        let mut bindings = Vec::new();
+        for i in 0..30 {
+            let k: String = rng
+                .gen_ascii_chars()
+                .take(200)
+                .collect();
+            let v: String = rng
+                .gen_ascii_chars()
+                .take(200)
+                .collect();
+            txn.put(&mut rng, &mut root, k.as_bytes(), v.as_bytes());
+            bindings.push((k,v));
+        }
+
+        bindings.sort();
+        let mut i = 0;
+        for &(ref k,ref v) in bindings.iter() {
+            txn.debug(&root, format!("/tmp/debug_{}",i), false, false);
+            //println!(">>>>>>>>>>>>>>>>>> {} deleting {:?}\nv = {:?}", i, k, v);
+            txn.del(&mut rng, &mut root, k.as_bytes(), Some(v.as_bytes())).unwrap();
+            i+=1;
+        }        
+        txn.debug(&root, format!("/tmp/debug_{}",i), false, false);
+        //println!("{:?}",bindings.len());
+        txn.set_root(root);
+        txn.commit().unwrap();
+    }
+
+    
+    #[test]
     fn nested() -> ()
     {
         extern crate tempdir;
@@ -490,7 +531,7 @@ mod tests {
 
 
     pub fn large_values() -> () {
-        consecutive_commits_(500,8000);
+        consecutive_commits_(400,8000);
     }
 
     #[test]
