@@ -96,7 +96,7 @@ pub struct Env {
 
 
 impl Env {
-    /// Creates an environment.
+    /// Creates an environment. Size is a number of blocks.
     pub fn new<P: AsRef<Path>>(file: P, size:u64) -> Result<Env, Error> {
         transaction::Env::new(file, size*(1<<12)).and_then(|env| Ok(Env { env: env }))
     }

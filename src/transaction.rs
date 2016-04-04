@@ -526,9 +526,11 @@ impl<'env> Commit for MutTxn<'env,()> {
                 *(self.env.map.offset(ZERO_HEADER) as *mut u64) = self.root.to_le();
                 *(self.env.map.offset(ZERO_HEADER + 8) as *mut u64) = self.reference_counts.to_le();
 
-                // synchronize all maps
-                try!(self.env.mmap.flush_range(PAGE_SIZE, (self.env.length - PAGE_SIZE_64) as usize));
-                try!(self.env.mmap.flush_range(0, PAGE_SIZE));
+                // synchronize all maps. Since PAGE_SIZE is not always
+                // an actual page size, we flush the first two pages
+                // last, instead of just the last one.
+                try!(self.env.mmap.flush_range(2*PAGE_SIZE, (self.env.length - 2*PAGE_SIZE_64) as usize));
+                try!(self.env.mmap.flush_range(0, 2*PAGE_SIZE));
                 self.env.lock_file.unlock().unwrap();
                 if let Some(ref guard) = self.mutable {
                     **guard // just unit, prevents warnings.
