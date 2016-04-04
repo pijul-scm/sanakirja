@@ -611,8 +611,6 @@ struct Smallest {
     // smallest of its values
     value:UnsafeValue,
     free_page: u64,
-    // root page of the B-tree from which the smallest element was taken (used to reinsert)
-    reinsert_page:u64
 }
 
 
@@ -957,12 +955,6 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C, mut 
                                   // whether this page is referenced
                                   // in strictly more than one tree.
                                   free_page: if needs_copying { 0 } else { page_offset },
-
-                                  // If this is the smallest element,
-                                  // we're necessarily at a leaf,
-                                  // hence there's no page to the
-                                  // right of this element.
-                                  reinsert_page:0
                               })))
                     )
                 } else {
@@ -1081,7 +1073,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
             Some((Res::Ok { page, .. },Some(reinsert))) => {
                 let key = std::slice::from_raw_parts(reinsert.key_ptr,reinsert.key_len);
                 assert!(key.len() < MAX_KEY_SIZE);
-                match try!(insert(rng, txn, Cow::from_mut_page(page), key, reinsert.value, reinsert.reinsert_page, false)) {
+                match try!(insert(rng, txn, Cow::from_mut_page(page), key, reinsert.value, 0, false)) {
                     Res::Ok { page,.. } => {
                         try!(free(rng, txn, reinsert.free_page));
                         db.root = page.page_offset()
