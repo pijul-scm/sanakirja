@@ -1,7 +1,7 @@
 [package]
 name = "sanakirja"
 description = "A key-value dictionary, using copy-on-write and B trees."
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Pierre-Étienne Meunier"]
 license = "MPL-2.0"
 documentation = "http://pijul.org/sanakirja/doc/sanakirja"
