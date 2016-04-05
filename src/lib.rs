@@ -27,13 +27,8 @@
 //!
 //! # Todo-list
 //!
-//! - check that all dereferences are converted to/from little-endian. (easy)
-//!
-//! - improve error handling
-//!
-//! - dynamic loading of pages not in the map, especially on 32-bits platforms ('transaction.rs', half-easy)
-//!
-//! - Check freeing.
+//! - dynamic loading of pages not in the map, which is especially
+//! useful on 32-bits platforms.
 //!
 //! # For future versions
 //!
@@ -453,7 +448,7 @@ mod tests {
         let mut random:Vec<(String,String)> = Vec::new();
         let mut buf = Vec::new();
         {
-            for i in 0..20 {
+            for i in 0..200 {
                 //println!("");
                 let mut txn = env.mut_txn_begin();
                 let mut db = txn.root().unwrap_or_else(|| {
