@@ -193,8 +193,12 @@ fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, pinpoint:u
                 page.init();
                 let mut current = FIRST_HEAD;
                 debug!("PINPOINTING: {:?} {:?} {:?}", page, page.first_free(), page.occupied());
-                let mut cow = Cow::from_mut_page(page);
                 let mut pinpointed = FIRST_HEAD;
+                let mut n = 0;
+                let mut levels:[*mut u16;MAX_LEVEL+1] = [std::ptr::null_mut();MAX_LEVEL+1];
+                for level in 0..(MAX_LEVEL+1) {
+                    levels[level] = (page.offset(FIRST_HEAD as isize) as *mut u16).offset(level as isize)
+                }
                 while current != NIL {
                     let pp = p.offset(current as isize);
                     let right_page = u64::from_le(*((pp as *const u64).offset(2)));
@@ -211,18 +215,27 @@ fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, pinpoint:u
                             }
                         }
                         debug!("PINPOINT: {:?}", std::str::from_utf8(key).unwrap());
-                        match try!(insert(rng, txn, cow, key, value, right_page, false)) {
-                            Res::Ok { page, position } => {
-                                if current == pinpoint {
-                                    pinpointed = position
-                                }
-                                cow = Cow::from_mut_page(page)
-                            },
-                            _ => unreachable!()
+                        let size = record_size(key.len(), value.len() as usize);
+                        let off = page.can_alloc(size);
+                        page.alloc_key_value(off, size, key.as_ptr(), key.len(), value);
+                        *((page.offset(off as isize) as *mut u64).offset(2)) = right_page;
+
+                        if pinpoint == current {
+                            pinpointed = off
+                        }
+
+                        let ptr = page.offset(off as isize) as *mut u16;
+                        for level in 0..(MAX_LEVEL+1) {
+                            *(ptr.offset(level as isize)) = NIL;
+                            if n & ((1 << level)-1) == 0 {
+                                *(levels[level]) = off.to_le();
+                                levels[level] = ptr.offset(level as isize)
+                            }
                         }
                     } else {
-                        *((cow.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_page
+                        *((page.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_page.to_le()
                     }
+                    n+=1;
                     current = u16::from_le(*((p.offset(current as isize) as *const u16)));
                 }
                 debug!("/PINPOINTING");
@@ -235,7 +248,7 @@ fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, pinpoint:u
                     }
                     transaction::free(&mut(txn.txn),page_offset)
                 }
-                Ok((cow.unwrap_mut(),pinpointed))
+                Ok((page,pinpointed))
             }
             transaction::Cow::MutPage(p) => Ok((MutPage { page:p }, pinpoint))
         }
