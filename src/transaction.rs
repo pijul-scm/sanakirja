@@ -85,8 +85,7 @@ pub struct MutTxn<'env,T> {
     occupied_clean_pages: HashSet<u64>, /* Offsets of pages that were allocated by this transaction, and have not been freed since. */
     free_clean_pages: Vec<u64>, /* Offsets of pages that were allocated by this transaction, and then freed. */
     free_pages: Vec<u64>, /* Offsets of old pages freed by this transaction. These were *not* allocated by this transaction. */
-    pub root:u64,
-    pub reference_counts:u64
+    pub roots:HashMap<usize,u64>,
 }
 
 impl<'env> Drop for Txn<'env> {
@@ -191,8 +190,8 @@ impl Env {
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
-                root: u64::from_le(*(self.map.offset(ZERO_HEADER) as *const u64)),
-                reference_counts: u64::from_le(*(self.map.offset(ZERO_HEADER + 8) as *const u64))
+                roots: HashMap::new(), // u64::from_le(*(self.map.offset(ZERO_HEADER) as *const u64)),
+                //reference_counts: u64::from_le(*(self.map.offset(ZERO_HEADER + 8) as *const u64))
             }
         }
     }
@@ -303,8 +302,8 @@ impl<'env,T> MutTxn<'env,T> {
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
-                root:self.root,
-                reference_counts:self.reference_counts
+                roots:self.roots.clone(),
+                //reference_counts:self.reference_counts
             };
             txn.parent = self;
             txn
@@ -319,11 +318,18 @@ impl<'env,T> MutTxn<'env,T> {
             }
         }
     }
-    pub fn root(&self) -> u64 {
-        self.root
+    pub fn root(&self, num:usize) -> u64 {
+        if let Some(root) = self.roots.get(&num) {
+            *root
+        } else {
+            assert!(ZERO_HEADER as usize + ((num+1)<<3) < PAGE_SIZE);
+            unsafe {
+                u64::from_le(*((self.env.map.offset(ZERO_HEADER) as *const u64).offset(num as isize)))
+            }
+        }
     }
-    pub fn set_root(&mut self, value:u64) {
-        self.root = value;
+    pub fn set_root(&mut self, num:usize, value:u64) {
+        self.roots.insert(num,value);
     }
     pub fn load_cow_page(&mut self, off: u64) -> Cow {
         debug!("transaction::load_mut_page: {:?} {:?}",
@@ -439,7 +445,9 @@ impl<'a,'env,T> Commit for MutTxn<'env,&'a mut MutTxn<'env,T>> {
         self.parent.occupied_clean_pages.extend(self.occupied_clean_pages.iter());
         self.parent.free_clean_pages.extend(self.free_clean_pages.iter());
         self.parent.free_pages.extend(self.free_pages.iter());
-        self.parent.root = self.root;
+        for (u,v) in self.roots.iter() {
+            self.parent.roots.insert(*u,*v);
+        }
         Ok(())
     }
 }
@@ -523,8 +531,9 @@ impl<'env> Commit for MutTxn<'env,()> {
                 self.env.lock_file.lock_exclusive().unwrap();
                 *(self.env.map as *mut u64) = self.last_page.to_le();
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
-                *(self.env.map.offset(ZERO_HEADER) as *mut u64) = self.root.to_le();
-                *(self.env.map.offset(ZERO_HEADER + 8) as *mut u64) = self.reference_counts.to_le();
+                for (u, v) in self.roots.iter() {
+                    *((self.env.map.offset(ZERO_HEADER) as *mut u64).offset(*u as isize)) = (*v).to_le();
+                }
 
                 // synchronize all maps. Since PAGE_SIZE is not always
                 // an actual page size, we flush the first two pages

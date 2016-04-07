@@ -163,7 +163,7 @@ impl<'env,T> MutTxn<'env,T> {
             *(val.as_mut_ptr() as *mut u64) = value.root.to_le();
         }
         try!(self.replace(rng, db, key, &val));
-        self.txn.set_root(db.root);
+        self.txn.set_root(0, db.root);
         Ok(())
     }
 
@@ -214,7 +214,7 @@ impl<'env,T> MutTxn<'env,T> {
 
     /// Set the root database, consuming it.
     pub fn set_root(&mut self, db:Db) {
-        self.txn.set_root(db.root)
+        self.txn.set_root(0, db.root)
     }
 
     /// Create a child transaction, which can be either committed to its parent (but not to the file), or aborted independently from its parent.

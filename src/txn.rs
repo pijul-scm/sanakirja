@@ -24,8 +24,9 @@ pub const MAX_LEVEL:usize = 4;
 pub const VALUE_HEADER_LEN:usize = 8;
 
 #[derive(Debug)]
-/// A database identifier. The `root` field is the offset in the file, of the root of a B tree.
+/// A database identifier. A `Db` can be reused in any number of transactions belonging to the same environment.
 pub struct Db {
+    #[doc(hidden)]
     pub root: u64,
 }
 
@@ -42,6 +43,9 @@ pub struct Txn<'env> {
 
 type Error = transaction::Error;
 
+const MAIN_ROOT:usize = 0;
+const REFERENCE_COUNTS:usize = 1;
+
 impl<'env,T> MutTxn<'env,T> {
     #[doc(hidden)]
     pub fn alloc_page(&mut self) -> Result<MutPage,transaction::Error> {
@@ -54,15 +58,16 @@ impl<'env,T> MutTxn<'env,T> {
     }
     #[doc(hidden)]
     pub fn rc(&self) -> Option<Db> {
-        if self.txn.reference_counts == 0 {
+        let rc = self.txn.root(REFERENCE_COUNTS);
+        if rc == 0 {
             None
         } else {
-            Some(Db { root: self.txn.reference_counts })
+            Some(Db { root: rc })
         }
     }
     #[doc(hidden)]
     pub fn set_rc(&mut self, db:Db) {
-        self.txn.reference_counts = db.root
+        self.txn.set_root(REFERENCE_COUNTS, db.root)
     }
 
 
@@ -596,11 +601,11 @@ impl<'env,T> LoadPage for MutTxn<'env,T> {
         self.txn.env.length
     }
     fn root_db_(&self) -> Option<Db> {
-        let root = self.txn.root();
+        let root = self.txn.root(MAIN_ROOT);
         if root == 0 {
             None
         } else {
-            Some(Db { root: self.txn.root() })
+            Some(Db { root: self.txn.root(MAIN_ROOT) })
         }
     }
     fn load_page(&self, off: u64) -> Page {
