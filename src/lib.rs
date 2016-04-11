@@ -257,6 +257,22 @@ pub trait Transaction:LoadPage {
             self.iterate_(txn::Iterate::NotStarted,page,key,value,&mut f);
         }
     }
+
+
+    /// Return an iterator on a database, starting with the given key and value.
+    fn iter<'a, 'b>(&'a self,
+                    db: &Db,
+                    key: &[u8],
+                    value: Option<&[u8]>,
+                    workspace: &'b mut Vec<(u64,u16)>)->txn::Iter<'a,'b,Self> {
+        unsafe {
+            let page = self.load_page(db.root);
+            let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
+            self.iter_(workspace, &page, key,value)
+        }
+    }
+
+
 }
 
 impl<'env> Transaction for Txn<'env> {}

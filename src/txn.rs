@@ -398,9 +398,124 @@ pub trait LoadPage:Sized {
         }
         state
     }
+
+
+    unsafe fn iter_<'a,'b>(&'a self,
+                           page_stack: &'b mut Vec<(u64,u16)>,
+                           initial_page: &Page,
+                           key:&[u8],
+                           value:Option<UnsafeValue>) -> Iter<'a, 'b, Self> {
+
+        page_stack.clear();
+        page_stack.push((initial_page.page_offset(), FIRST_HEAD));
+        loop {
+            let mut next_page = 0;
+            {
+                let &mut (page_offset, ref mut current_off) = page_stack.last_mut().unwrap();
+                let page = self.load_page(page_offset);
+                let mut current = page.offset(*current_off as isize) as *const u16;
+                let mut level = MAX_LEVEL;
+                next_page = u64::from_le(*((current as *const u64).offset(2)));
+                
+                // First mission: find first element.
+                loop {
+                    // advance in the list until there's nothing more to do.
+                    loop {
+                        let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
+                        if next == NIL {
+                            break
+                        } else {
+                            let next_ptr = page.offset(next as isize);
+                            let (next_key,next_value) = read_key_value(next_ptr);
+                            match key.cmp(next_key) {
+                                Ordering::Less => break,
+                                Ordering::Equal =>
+                                    if let Some(value) = value {
+                                        match (Value{txn:self,value:value}).cmp(Value{txn:self,value:next_value}) {
+                                            Ordering::Less => break,
+                                            Ordering::Equal => break,
+                                            Ordering::Greater => {
+                                                *current_off = next;
+                                                current = page.offset(*current_off as isize) as *const u16;
+                                            }
+                                        }
+                                    } else {
+                                        break
+                                    },
+                                Ordering::Greater => {
+                                    *current_off = next;
+                                    current = page.offset(*current_off as isize) as *const u16;
+                                }
+                            }
+                        }
+                    }
+                    if level == 0 {
+                        break
+                    } else {
+                        level -= 1
+                    }
+                }
+            }
+            if next_page == 0 {
+                break
+            } else {
+                page_stack.push((next_page, FIRST_HEAD));
+            }
+        }
+        Iter { txn:self,page_stack:page_stack }
+    }
+    
 }
 
+pub struct Iter<'a, 'b, T:'a> {
+    txn:&'a T, page_stack:&'b mut Vec<(u64, u16)>
+}
 
+impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a,'b,T> {
+    type Item = (&'a[u8], Value<'a,T>);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.page_stack.len() == 0 {
+            None
+        } else {
+            unsafe {
+                let &(page_off, current_off) = self.page_stack.last().unwrap();
+
+                // the binding at current_off is the next one to be sent.
+                let page = self.txn.load_page(page_off);
+                let current = page.offset(current_off as isize) as *const u16;
+                if current_off == NIL {
+                    self.page_stack.pop();
+                    self.next()
+                } else {
+                    // We set the page stack to the next binding, and return the current one.
+                    
+                    // Move the top of the stack to the next binding.
+                    {
+                        let &mut (_, ref mut current_off) = self.page_stack.last_mut().unwrap();
+                        *current_off = u16::from_le(*(current as *const u16));
+                    }
+                    // If there's a page below, push it: the next element is there.
+                    let mut next_page = u64::from_le(*((current as *const u64).offset(2)));
+                    if next_page != 0 {
+                        self.page_stack.push((next_page,FIRST_HEAD));
+                    }
+
+                    // Now, return the current element. If we're inside the page, there's an element to return.
+                    if current_off > FIRST_HEAD {
+                        let (key,value) = read_key_value(current as *const u8);
+                        Some((key, Value { txn:self.txn, value:value }))
+                    } else {
+                        // Else, we're at the beginning of the page,
+                        // the element is either in the page we just
+                        // pushed, or (if there's no page below) the
+                        // next element.
+                        self.next()
+                    }
+                }
+            }
+        }
+    }
+}
 
 
 // Page layout: Starts with a header of 32 bytes.
