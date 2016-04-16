@@ -44,6 +44,31 @@ pub enum Error {
     IO(std::io::Error),
     NotEnoughSpace
 }
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {
+            Error::IO(ref err) => write!(f, "IO error: {}", err),
+            Error::NotEnoughSpace => write!(f, "Not enough space. Try opening the environment with a larger size."),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn description(&self) -> &str {
+        match *self {
+            Error::IO(ref err) => err.description(),
+            Error::NotEnoughSpace => "Not enough space. Try opening the environment with a larger size."
+        }
+    }
+    fn cause(&self) -> Option<&std::error::Error> {
+        match *self {
+            Error::IO(ref err) => Some(err),
+            Error::NotEnoughSpace => None
+
+        }
+    }
+}
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Error {
         Error::IO(e)
@@ -85,7 +110,7 @@ pub struct MutTxn<'env,T> {
     occupied_clean_pages: HashSet<u64>, /* Offsets of pages that were allocated by this transaction, and have not been freed since. */
     free_clean_pages: Vec<u64>, /* Offsets of pages that were allocated by this transaction, and then freed. */
     free_pages: Vec<u64>, /* Offsets of old pages freed by this transaction. These were *not* allocated by this transaction. */
-    pub roots:HashMap<usize,u64>,
+    pub roots:HashMap<isize,u64>,
 }
 
 impl<'env> Drop for Txn<'env> {
@@ -274,9 +299,10 @@ impl<'env> Txn<'env> {
             }
         }
     }
-    pub fn root(&self) -> u64 {
+    pub fn root(&self,num:isize) -> u64 {
+        assert!(ZERO_HEADER + ((num+1)<<3) < (PAGE_SIZE as isize));
         unsafe {
-            u64::from_le(*(self.env.map.offset(ZERO_HEADER) as *const u64))
+            u64::from_le(*((self.env.map.offset(ZERO_HEADER) as *const u64).offset(num)))
         }
     }
 }
@@ -318,17 +344,17 @@ impl<'env,T> MutTxn<'env,T> {
             }
         }
     }
-    pub fn root(&self, num:usize) -> u64 {
+    pub fn root(&self, num:isize) -> u64 {
         if let Some(root) = self.roots.get(&num) {
             *root
         } else {
-            assert!(ZERO_HEADER as usize + ((num+1)<<3) < PAGE_SIZE);
+            assert!(ZERO_HEADER + ((num+1)<<3) < (PAGE_SIZE as isize));
             unsafe {
                 u64::from_le(*((self.env.map.offset(ZERO_HEADER) as *const u64).offset(num as isize)))
             }
         }
     }
-    pub fn set_root(&mut self, num:usize, value:u64) {
+    pub fn set_root(&mut self, num:isize, value:u64) {
         self.roots.insert(num,value);
     }
     pub fn load_cow_page(&mut self, off: u64) -> Cow {

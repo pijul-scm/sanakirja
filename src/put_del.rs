@@ -540,7 +540,7 @@ unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
 }
 
 // This function deals with the case where the main page split, either during insert, or during delete.
-fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Res) -> Result<Db,Error> {
+fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db:&Db, x:Res) -> Result<Db,Error> {
     debug!("ROOT SPLIT");
     if let Res::Split { left,right,key_ptr,key_len,value,free_page } = x {
         let mut page = try!(txn.alloc_page());
@@ -554,7 +554,7 @@ fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Res) -> Result<Db,Erro
             try!(free(rng, txn, free_page));
             match ins {
                 Res::Ok { page,.. } => {
-                    Ok(Db { root:page.page_offset() })
+                    Ok(Db { root_num:db.root_num, root:page.page_offset() })
                 },
                 _ => unreachable!() // We just inserted a small enough value into a freshly allocated page, no split can possibly happen.
             }
@@ -578,7 +578,7 @@ pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], va
         match try!(insert(rng, txn, root_page, key, value, 0, false)) {
             Res::Ok { page,.. } => db.root = page.page_offset(),
             x => {
-                db.root = try!(root_split(rng,txn,x)).root
+                db.root = try!(root_split(rng,txn,db,x)).root
             }
         }
         Ok(())
@@ -1092,7 +1092,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                         db.root = page.page_offset()
                     },
                     x => {
-                        let x = try!(root_split(rng,txn,x));
+                        let x = try!(root_split(rng,txn,db,x));
                         debug!("free del: {:?}", reinsert.free_page);
                         try!(free(rng, txn, reinsert.free_page));
                         db.root = x.root
@@ -1117,7 +1117,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                 Ok(())
             },
             Some((x,_)) => {
-                db.root = try!(root_split(rng,txn,x)).root;
+                db.root = try!(root_split(rng,txn,db,x)).root;
                 Ok(())
             },
             None => Ok(())

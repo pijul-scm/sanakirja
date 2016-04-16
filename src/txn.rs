@@ -28,6 +28,8 @@ pub const VALUE_HEADER_LEN:usize = 8;
 pub struct Db {
     #[doc(hidden)]
     pub root: u64,
+    #[doc(hidden)]
+    pub root_num: isize
 }
 
 /// Mutable transaction
@@ -43,8 +45,8 @@ pub struct Txn<'env> {
 
 type Error = transaction::Error;
 
-const MAIN_ROOT:usize = 0;
-const REFERENCE_COUNTS:usize = 1;
+const REFERENCE_COUNTS:isize = 0;
+// pub const MAIN_ROOT:usize = 1;
 
 impl<'env,T> MutTxn<'env,T> {
     #[doc(hidden)]
@@ -62,7 +64,7 @@ impl<'env,T> MutTxn<'env,T> {
         if rc == 0 {
             None
         } else {
-            Some(Db { root: rc })
+            Some(Db { root_num:REFERENCE_COUNTS, root: rc })
         }
     }
     #[doc(hidden)]
@@ -183,6 +185,9 @@ impl<'a,T> Value<'a,T> {
     pub fn len(&self) -> u32 {
         self.value.len()
     }
+    pub fn from_slice(t:&'a T, slice:&'a[u8]) -> Value<'a,T> {
+        Value { txn:t, value: UnsafeValue::S { p:slice.as_ptr(), len:slice.len() as u32 } }
+    }
 }
 
 
@@ -226,19 +231,19 @@ pub enum Iterate {
 }
 pub trait LoadPage:Sized {
     fn length(&self) -> u64;
-    fn root_db_(&self) -> Option<Db>;
-    fn open_db_<'a>(&'a self, key: &[u8]) -> Option<Db> {
-        self.root_db_().and_then(|root| {
-            let page = self.load_page(root.root);
-            unsafe {
-                let db = self.get_(page, key, None);
-                if let Some(UnsafeValue::S{p,..}) = db {
-                    Some(Db { root: u64::from_le(*(p as *const u64)) })
-                } else {
-                    None
-                }
+
+    fn root_db_(&self,num:isize) -> Option<Db>;
+
+    fn open_db_<'a>(&'a self, root:&Db, key: &[u8]) -> Option<Db> {
+        let page = self.load_page(root.root);
+        unsafe {
+            let db = self.get_(page, key, None);
+            if let Some(UnsafeValue::S{p,..}) = db {
+                Some(Db { root_num: -1, root: u64::from_le(*(p as *const u64)) })
+            } else {
+                None
             }
-        })
+        }
     }
 
     fn load_page(&self, off: u64) -> Page;
@@ -715,12 +720,12 @@ impl<'env,T> LoadPage for MutTxn<'env,T> {
     fn length(&self) -> u64 {
         self.txn.env.length
     }
-    fn root_db_(&self) -> Option<Db> {
-        let root = self.txn.root(MAIN_ROOT);
+    fn root_db_(&self,num:isize) -> Option<Db> {
+        let root = self.txn.root(num);
         if root == 0 {
             None
         } else {
-            Some(Db { root: self.txn.root(MAIN_ROOT) })
+            Some(Db { root_num:num, root: self.txn.root(num) })
         }
     }
     fn load_page(&self, off: u64) -> Page {
@@ -731,12 +736,12 @@ impl<'env> LoadPage for Txn<'env> {
     fn length(&self) -> u64 {
         self.txn.env.length
     }
-    fn root_db_(&self) -> Option<Db> {
-        let root = self.txn.root();
+    fn root_db_(&self,num:isize) -> Option<Db> {
+        let root = self.txn.root(num);
         if root == 0 {
             None
         } else {
-            Some(Db { root: self.txn.root() })
+            Some(Db { root_num:num, root: self.txn.root(num) })
         }
     }
     fn load_page(&self, off: u64) -> Page {
