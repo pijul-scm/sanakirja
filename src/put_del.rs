@@ -89,13 +89,18 @@ fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Error> {
             while current != NIL {
                 let pp = p.offset(current as isize);
                 let right_page = u64::from_le(*((pp as *const u64).offset(2)));
+                /*
                 if current > FIRST_HEAD {
                     let (_,value) = read_key_value(pp);
                     // Decrease count of value
                     if let UnsafeValue::O { offset, .. } = value {
-                        try!(free_value(rng, txn, offset))
+                        if deallocate_values {
+                            //debug!(target:"free_value", "free, not preserved {:?}", preserved_value);
+                            try!(free_value(rng, txn, offset))
+                        }
                     }
                 }
+                 */
                 // Decrease count of right_page
                 if right_page > 0 {
                     try!(free(rng, txn, right_page))
@@ -148,7 +153,7 @@ fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> Result<UnsafeValue,Error>
 
 
 fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64)->Result<(),Error> {
-    debug!("freeing value {:?}", offset);
+    debug!(target:"free_value", "freeing value {:?}", offset);
     let really_free =
         if let Some(mut rc) = txn.rc() {
             if let Some(count) = txn.get_u64(&mut rc, offset) {
@@ -363,9 +368,6 @@ unsafe fn insert<R:Rng,T>(
                     // Then, reinsert (key_,value_) in the current page.
                     let result = insert(rng,txn,Cow::from_mut_page(page),key_, value_, right.page_offset(), needs_copying);
                     debug!("free split 1: {:?}", free_page);
-                    if let UnsafeValue::O { offset,.. } = value_ {
-                        try!(incr_rc(rng,txn,offset));
-                    }
                     try!(free(rng, txn, free_page));
                     result
                 } else {
@@ -375,9 +377,6 @@ unsafe fn insert<R:Rng,T>(
                                             key_, value_, right.page_offset(),
                                             current_off, left.page_offset());
                     debug!("free split 2: {:?}", free_page);
-                    if let UnsafeValue::O { offset,.. } = value_ {
-                        try!(incr_rc(rng,txn,offset));
-                    }
                     try!(free(rng, txn, free_page));
                     result
                 }
@@ -557,9 +556,6 @@ fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db:&Db, x:Res) -> Result
             let right_offset = right.page_offset();
             let ins = try!(insert(rng, txn, Cow::from_mut_page(page), key, value, right_offset, false));
             debug!("free root_split: {:?}", free_page);
-            if let UnsafeValue::O { offset,.. } = value {
-                try!(incr_rc(rng,txn,offset));
-            }
             try!(free(rng, txn, free_page));
             match ins {
                 Res::Ok { page,.. } => {
@@ -734,9 +730,6 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:MutPage, off: u16
             *(page.offset((off+16) as isize) as *mut u64) = left.page_offset().to_le();
             let key = std::slice::from_raw_parts(key_ptr,key_len);
             let result = try!(insert(rng, txn, Cow::from_mut_page(page), key, value, right.page_offset(), false));
-            if let UnsafeValue::O { offset,.. } = value {
-                try!(incr_rc(rng,txn,offset));
-            }
             try!(free(rng, txn, free_page));
             Ok(result)
         }
@@ -859,6 +852,7 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C, mut 
                         let (key,value) = read_key_value(next as *const u8);
                         if let UnsafeValue::O { offset, .. } = value {
                             if !comp.is_smallest() {
+                                debug!(target:"free_value", "found value, freeing");
                                 try!(free_value(rng,txn,offset))
                             }
                         }
@@ -945,9 +939,6 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C, mut 
                         let key = std::slice::from_raw_parts(key_ptr,key_len);
                         let result = Some((try!(insert(rng,txn,page,key, value, right.page_offset(), false)), smallest));
                         // After reinserting, we can free the page containing the middle element.
-                        if let UnsafeValue::O { offset,.. } = value {
-                            try!(incr_rc(rng,txn,offset));
-                        }
                         try!(free(rng, txn, free_page));
                         Ok(result)
                     },
@@ -1031,6 +1022,7 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C, mut 
                                 let (key,value) = read_key_value(next as *const u8);
                                 if let UnsafeValue::O { offset, .. } = value {
                                     if !comp.is_smallest() {
+                                        debug!(target:"free_value", "found value, freeing");
                                         try!(free_value(rng,txn,offset))
                                     }
                                 }
@@ -1078,9 +1070,6 @@ unsafe fn delete<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C, mut 
             let key = std::slice::from_raw_parts(key_ptr,key_len);
             let result = Some((try!(insert(rng,txn,page,key, value, right.page_offset(), false)), smallest));
             // After reinserting, we can free the page containing the middle element.
-            if let UnsafeValue::O { offset,.. } = value {
-                try!(incr_rc(rng,txn,offset));
-            }
             try!(free(rng, txn, free_page));
             Ok(result)
         }
@@ -1106,18 +1095,12 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                 assert!(key.len() < MAX_KEY_SIZE);
                 match try!(insert(rng, txn, Cow::from_mut_page(page), key, reinsert.value, 0, false)) {
                     Res::Ok { page,.. } => {
-                        if let UnsafeValue::O { offset,.. } = reinsert.value {
-                            try!(incr_rc(rng,txn,offset));
-                        }
                         try!(free(rng, txn, reinsert.free_page));
                         db.root = page.page_offset()
                     },
                     x => {
                         let x = try!(root_split(rng,txn,db,x));
                         debug!("free del: {:?}", reinsert.free_page);
-                        if let UnsafeValue::O { offset,.. } = reinsert.value {
-                            try!(incr_rc(rng,txn,offset));
-                        }
                         try!(free(rng, txn, reinsert.free_page));
                         db.root = x.root
                     }
