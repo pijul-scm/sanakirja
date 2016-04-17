@@ -36,6 +36,10 @@ impl Db {
     pub unsafe fn clone(&self) -> Db {
         Db { root:self.root, root_num:self.root_num }
     }
+    pub unsafe fn from_value(v:&[u8]) -> Db {
+        let root = u64::from_le(*(v.as_ptr() as *const u64));
+        Db { root:root, root_num: -1 }
+    }
 }
 
 /// Mutable transaction
@@ -413,7 +417,10 @@ pub trait LoadPage:Sized {
         state
     }
 
-
+    // In iterators, the page stack stores a list of pages from the
+    // top of the tree down, where each page is stored as a couple,
+    // with the page offset in the file (u64), and the current
+    // position in that page (u16).
     unsafe fn iter_<'a,'b>(&'a self,
                            page_stack: &'b mut Vec<(u64,u16)>,
                            initial_page: &Page,
@@ -429,7 +436,6 @@ pub trait LoadPage:Sized {
                 let page = self.load_page(page_offset);
                 let mut current = page.offset(*current_off as isize) as *const u16;
                 let mut level = MAX_LEVEL;
-                next_page = u64::from_le(*((current as *const u64).offset(2)));
                 
                 // First mission: find first element.
                 loop {
@@ -464,6 +470,9 @@ pub trait LoadPage:Sized {
                         }
                     }
                     if level == 0 {
+                        let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
+                        *current_off = next;
+                        next_page = u64::from_le(*((current as *const u64).offset(2)));
                         break
                     } else {
                         level -= 1
