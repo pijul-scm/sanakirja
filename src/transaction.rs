@@ -336,7 +336,9 @@ impl<'env,T> MutTxn<'env,T> {
         }
     }
     pub fn load_page(&self, off: u64) -> Page {
-        assert!(off < self.env.length);
+        if off >= self.env.length {
+            panic!("{:?} >= {:?}", off,self.env.length)
+        }
         unsafe {
             Page {
                 data: self.env.map.offset(off as isize),

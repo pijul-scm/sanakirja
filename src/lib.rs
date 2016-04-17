@@ -74,8 +74,7 @@ extern crate memmap;
 use rand::Rng;
 use std::path::Path;
 
-#[allow(mutable_transmutes)]
-mod transaction;
+pub mod transaction;
 
 pub use transaction::{Statistics,Error};
 use transaction::Commit;
@@ -237,7 +236,7 @@ pub trait Transaction:LoadPage {
         unsafe {
             let page = self.load_page(db.root);
             let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
-            self.get_(page, key, value).map(|x| Value { txn:self, value:x })
+            self.get_(page, key, value).map(|x| Value { txn:Some(self), value:x })
         }
     }
 
@@ -464,13 +463,13 @@ mod tests {
         use rand::SeedableRng;
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path(), 100).unwrap();
+        let env = Env::new(dir.path(), 10000).unwrap();
 
         let mut random:Vec<(String,String)> = Vec::new();
         let mut buf = Vec::new();
         {
-            for i in 0..200 {
-                //println!("");
+            for i in 0..40 {
+                println!("i = {:?}", i);
                 let mut txn = env.mut_txn_begin();
                 let mut db = txn.root(0).unwrap_or_else(|| {
                     //println!("create db");
@@ -483,6 +482,7 @@ mod tests {
                         //println!("found");
                         //println!("getting {:?}", k);
                         let got = txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
+                            println!("value = {:?}", x.value);
                             buf.clear();
                             for i in x {
                                 buf.extend(i)
@@ -492,8 +492,8 @@ mod tests {
                         if got != Some(v.as_bytes()) {
                             unsafe {
                                 println!("{:?}\n{}",
-                                         got.map(|x| std::str::from_utf8_unchecked(x)),
-                                         std::str::from_utf8_unchecked(v.as_bytes())
+                                         got.map(|x| std::str::from_utf8_unchecked(&x[0..100])),
+                                         std::str::from_utf8_unchecked(&(v.as_bytes())[0..100])
                                 );
                             }
                         }
@@ -524,6 +524,7 @@ mod tests {
                     // println!("abort !");
                     // txn.abort()
                 }
+                println!("{:?}", env.statistics());
             }
         }
         let txn = env.txn_begin();
@@ -544,7 +545,7 @@ mod tests {
         consecutive_commits_(50,60);
     }
 
-
+    #[test]
     pub fn large_values() -> () {
         consecutive_commits_(400,8000);
     }

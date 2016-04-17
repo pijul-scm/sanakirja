@@ -32,6 +32,12 @@ pub struct Db {
     pub root_num: isize
 }
 
+impl Db {
+    pub unsafe fn clone(&self) -> Db {
+        Db { root:self.root, root_num:self.root_num }
+    }
+}
+
 /// Mutable transaction
 pub struct MutTxn<'env,T> {
     #[doc(hidden)]
@@ -99,7 +105,7 @@ pub enum UnsafeValue {
 /// Iterator over parts of a value. On values of size at most 1024 bytes, the iterator will run exactly once. On larger values, it returns all parts of the value, in order.
 pub struct Value<'a,T:'a> {
     #[doc(hidden)]
-    pub txn:&'a T,
+    pub txn:Option<&'a T>,
     #[doc(hidden)]
     pub value:UnsafeValue
 }
@@ -130,7 +136,7 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
                     None
                 } else {
                     unsafe {
-                        let page = self.txn.load_page(*offset).offset(0);
+                        let page = self.txn.unwrap().load_page(*offset).offset(0);
                         // change the pointer of "current page" to the next page
                         let next_offset = u64::from_le(*(page as *const u64));
                         //println!("current={:?}, next_offset:{:?}", *offset, next_offset);
@@ -185,8 +191,11 @@ impl<'a,T> Value<'a,T> {
     pub fn len(&self) -> u32 {
         self.value.len()
     }
-    pub fn from_slice(t:&'a T, slice:&'a[u8]) -> Value<'a,T> {
-        Value { txn:t, value: UnsafeValue::S { p:slice.as_ptr(), len:slice.len() as u32 } }
+    pub fn clone(&self) -> Value<'a,T> {
+        Value { txn:self.txn, value: self.value.clone() }
+    }
+    pub fn from_slice(slice:&'a[u8]) -> Value<'a,T> {
+        Value { txn: None, value: UnsafeValue::S { p:slice.as_ptr(), len:slice.len() as u32 } }
     }
 }
 
@@ -291,7 +300,7 @@ pub trait LoadPage:Sized {
                         Ordering::Less => break,
                         Ordering::Equal =>
                             if let Some(value) = value {
-                                match (Value{txn:self,value:value}).cmp(Value{txn:self,value:next_value}) {
+                                match (Value{txn:Some(self),value:value}).cmp(Value{txn:Some(self),value:next_value}) {
                                     Ordering::Less => break,
                                     Ordering::Equal => {
                                         equal = Some(next_value);
@@ -353,7 +362,7 @@ pub trait LoadPage:Sized {
                             Ordering::Less => break,
                             Ordering::Equal =>
                                 if let Some(value) = value {
-                                    match (Value{txn:self,value:value}).cmp(Value{txn:self,value:next_value}) {
+                                    match (Value{txn:Some(self),value:value}).cmp(Value{txn:Some(self),value:next_value}) {
                                         Ordering::Less => break,
                                         Ordering::Equal => break,
                                         Ordering::Greater => {
@@ -395,7 +404,7 @@ pub trait LoadPage:Sized {
             state = Iterate::Started;
             // On the first time, the "current" entry must not be included.
             let (key,value) = read_key_value(current as *const u8);
-            let continue_ = f(key,Value{ txn:self, value:value });
+            let continue_ = f(key,Value{ txn:Some(self), value:value });
             if ! continue_ {
                 state = Iterate::Finished;
                 break
@@ -436,7 +445,7 @@ pub trait LoadPage:Sized {
                                 Ordering::Less => break,
                                 Ordering::Equal =>
                                     if let Some(value) = value {
-                                        match (Value{txn:self,value:value}).cmp(Value{txn:self,value:next_value}) {
+                                        match (Value{txn:Some(self),value:value}).cmp(Value{txn:Some(self),value:next_value}) {
                                             Ordering::Less => break,
                                             Ordering::Equal => break,
                                             Ordering::Greater => {
@@ -508,7 +517,7 @@ impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a,'b,T> {
                     // Now, return the current element. If we're inside the page, there's an element to return.
                     if current_off > FIRST_HEAD {
                         let (key,value) = read_key_value(current as *const u8);
-                        Some((key, Value { txn:self.txn, value:value }))
+                        Some((key, Value { txn:Some(self.txn), value:value }))
                     } else {
                         // Else, we're at the beginning of the page,
                         // the element is either in the page we just
@@ -819,7 +828,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
                         };
                     let value = {
                         let mut value_ = Vec::new();
-                        let mut value = Value { txn:txn,value:value };
+                        let mut value = Value { txn:Some(txn),value:value };
                         if values_hex {
                             for i in value {
                                 value_.extend(i)
