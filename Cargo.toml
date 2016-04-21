@@ -24,3 +24,8 @@ libc="0.2"
 
 [dev-dependencies]
 tempdir="0.3"
+
+
+[features]
+
+delete_always_realloc = []

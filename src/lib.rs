@@ -81,7 +81,8 @@ use transaction::Commit;
 mod txn;
 pub use txn::{MutTxn, Txn, Value, Db, Iter};
 use txn::{P, LoadPage}; // , MAIN_ROOT};
-mod put_del;
+mod put;
+mod del;
 
 /// Environment, essentially containing locks and mmaps.
 pub struct Env {
@@ -152,7 +153,7 @@ impl<'env,T> MutTxn<'env,T> {
     /// 
     /// ```
     pub fn fork_db<R:Rng>(&mut self, rng:&mut R, db:&Db) -> Result<Db,Error> {
-        Ok(Db { root_num:-1, root: try!(put_del::fork_db(rng, self, db.root)) })
+        Ok(Db { root_num:-1, root: try!(put::fork_db(rng, self, db.root)) })
     }
 
     /// Specialized version of ```put``` to register the name of a database. Argument ```db``` can be the root database (as in LMDB) or any other database.
@@ -167,22 +168,22 @@ impl<'env,T> MutTxn<'env,T> {
     }
 
     /// Add a binding to a B tree.
-    pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8])->Result<(),Error> {
-        put_del::put(r, self, db, key, value)
+    pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8])->Result<bool,Error> {
+        put::put(r, self, db, key, value)
     }
 
     /// Replace the binding for a key. This is actually no more than `del` and `put` in a row: if there are more than one binding for that key, replace the smallest one, in lexicographical order.
     pub fn replace<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8])->Result<(),Error> {
-        put_del::replace(r, self, db, key, value)
+        del::replace(r, self, db, key, value)
     }
 
     /// Delete the smallest binding (in lexicographical order) from the map matching the key and value. When the `value` argument is `None`, delete the smallest binding for that key.
-    pub fn del<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: Option<&[u8]>)->Result<(),Error> {
-        put_del::del(r, self, db, key, value)
+    pub fn del<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: Option<&[u8]>)->Result<bool,Error> {
+        del::del(r, self, db, key, value)
     }
 
     /// Specialized version of ```put`` for the case where both the key and value are 64-bits integers.
-    pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64)->Result<(),Error> {
+    pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64)->Result<bool,Error> {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
         unsafe {
@@ -192,7 +193,7 @@ impl<'env,T> MutTxn<'env,T> {
         self.put(rng, db, &k, &v)
     }
     /// Specialized version of ```del`` for the case where the key is a 64-bits integer, and the value is None.
-    pub fn del_u64<R:Rng>(&mut self, rng:&mut R, db:&mut Db, key:u64)->Result<(),Error> {
+    pub fn del_u64<R:Rng>(&mut self, rng:&mut R, db:&mut Db, key:u64)->Result<bool,Error> {
         let mut k: [u8; 8] = [0; 8];
         unsafe {
             *(k.as_mut_ptr() as *mut u64) = key.to_le();
@@ -223,7 +224,9 @@ impl<'env,T> MutTxn<'env,T> {
             txn: self.txn.mut_txn_begin()
         }
     }
+    pub fn abort(self) {
 
+    }
 }
 
 pub trait Transaction:LoadPage {
@@ -282,14 +285,14 @@ impl<'env,T> Transaction for MutTxn<'env,T> {}
 
 impl<'env> MutTxn<'env,()> {
     /// Commit the transaction to the file (consuming it).
-    pub fn commit(self) -> Result<(), transaction::Error> {
+    pub fn commit(mut self) -> Result<(), transaction::Error> {
         self.txn.commit()
     }
 }
 
 impl<'env,'txn,T> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
     /// Commit the child transaction to its parent (consuming it).
-    pub fn commit(self) -> Result<(), transaction::Error> {
+    pub fn commit(mut self) -> Result<(), transaction::Error> {
         self.txn.commit()
     }
 }
@@ -377,15 +380,27 @@ mod tests {
     {
         extern crate tempdir;
         extern crate rand;
+        extern crate env_logger;
         use rand::{Rng};
-        let mut rng = rand::thread_rng();
+
+        struct R { current:u32 }
+        impl Rng for R {
+            fn next_u32(&mut self) -> u32 {
+                let x = self.current;
+                self.current = x.wrapping_add(1);
+                x
+            }
+        }
+        
+        let mut rng = R { current:0 }; // rand::thread_rng();
+        env_logger::init().unwrap_or(());
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path(), 100).unwrap();
+        let env = Env::new(dir.path(), 1000).unwrap();
         let mut txn = env.mut_txn_begin();
         let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
 
         let mut bindings = Vec::new();
-        for i in 0..30 {
+        for i in 0..500 {
             let k: String = rng
                 .gen_ascii_chars()
                 .take(200)
@@ -394,16 +409,23 @@ mod tests {
                 .gen_ascii_chars()
                 .take(200)
                 .collect();
+            println!("putting {:?}", i);
+
             txn.put(&mut rng, &mut root, k.as_bytes(), v.as_bytes());
+            txn.debug(&root, format!("/tmp/debug_{}",i), false, false);
             bindings.push((k,v));
         }
-
+        println!("now deleting");
         bindings.sort();
         let mut i = 0;
         for &(ref k,ref v) in bindings.iter() {
-            txn.debug(&root, format!("/tmp/debug_{}",i), false, false);
             //println!(">>>>>>>>>>>>>>>>>> {} deleting {:?}\nv = {:?}", i, k, v);
-            txn.del(&mut rng, &mut root, k.as_bytes(), Some(v.as_bytes())).unwrap();
+            let r0 = rng.gen();
+            let r1 = rng.gen();
+            if r0 {
+                txn.del(&mut rng, &mut root, k.as_bytes(),
+                        if r1 { None } else { Some(v.as_bytes()) }).unwrap();
+            }
             i+=1;
         }        
         txn.debug(&root, format!("/tmp/debug_{}",i), false, false);
@@ -610,7 +632,7 @@ mod tests {
                     .take(value_len)
                     .collect();
 
-                //println!("Putting {:?}, {:?}", k,v);
+                println!("Putting {:?}, {:?}", k,v);
                 txn.put(&mut rng, &mut db, k.as_bytes(), v.as_bytes()).unwrap();
                 
                 if rng.gen() {
@@ -622,8 +644,9 @@ mod tests {
                     random.push((k, v));
                 } else {
                     txn.set_root(0, db);
-                    // println!("abort !");
-                    // txn.abort()
+                    println!("abort !");
+                    txn.abort()
+                    // std::mem::drop(txn);
                 }
                 println!("{:?}", env.statistics());
             }

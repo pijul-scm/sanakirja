@@ -121,7 +121,12 @@ impl<'env> Drop for Txn<'env> {
 }
 impl<'env,T> Drop for MutTxn<'env,T> {
     fn drop(&mut self) {
+        debug!("dropping transaction");
         self.env.mutable_file.unlock().unwrap();
+        if let Some(ref mut guard) = self.mutable {
+            debug!("dropping guard");
+            **guard
+        }
     }
 }
 
@@ -190,7 +195,9 @@ impl Env {
             let (last_page, current_list_page) = self.read_map_header();
             debug!("map header = {:?}, {:?}", last_page ,current_list_page);
             let guard = self.mutable.lock().unwrap();
+            debug!("taking file lock");
             self.mutable_file.lock_exclusive().unwrap();
+            debug!("lock ok");
             let current_list_page = Page {
                 data: self.map.offset(current_list_page as isize),
                 offset: current_list_page,
@@ -459,11 +466,11 @@ impl<'env,T> MutTxn<'env,T> {
 }
 
 pub trait Commit {
-    fn commit(mut self)->Result<(),Error>;
+    fn commit(&mut self)->Result<(),Error>;
 }
 
 impl<'a,'env,T> Commit for MutTxn<'env,&'a mut MutTxn<'env,T>> {
-    fn commit(mut self)->Result<(),Error> {
+    fn commit(&mut self)->Result<(),Error> {
 
         self.parent.last_page = self.last_page;
         self.parent.current_list_page = Page { offset:self.current_list_page.offset,
@@ -482,7 +489,7 @@ impl<'a,'env,T> Commit for MutTxn<'env,&'a mut MutTxn<'env,T>> {
 
 impl<'env> Commit for MutTxn<'env,()> {
     /// Commit a transaction. This is guaranteed to be atomic: either the commit succeeds, and all the changes made during the transaction are written to disk. Or the commit doesn't succeed, and we're back to the state just before starting the transaction.
-    fn commit(mut self) -> Result<(), Error> {
+    fn commit(&mut self) -> Result<(), Error> {
         // Tasks:
         // - allocate new pages (copy-on-write) to write the new list of free pages, including edited "stack pages".
         //
@@ -555,8 +562,11 @@ impl<'env> Commit for MutTxn<'env,()> {
             }
             // Take lock
             {
+                debug!("commit: taking local lock");
                 *self.env.lock.write().unwrap();
+                debug!("commit: taking file lock");
                 self.env.lock_file.lock_exclusive().unwrap();
+                debug!("commit: lock ok");
                 *(self.env.map as *mut u64) = self.last_page.to_le();
                 *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
                 for (u, v) in self.roots.iter() {
@@ -569,9 +579,6 @@ impl<'env> Commit for MutTxn<'env,()> {
                 try!(self.env.mmap.flush_range(2*PAGE_SIZE, (self.env.length - 2*PAGE_SIZE_64) as usize));
                 try!(self.env.mmap.flush_range(0, 2*PAGE_SIZE));
                 self.env.lock_file.unlock().unwrap();
-                if let Some(ref guard) = self.mutable {
-                    **guard // just unit, prevents warnings.
-                }
                 Ok(())
             }
         }

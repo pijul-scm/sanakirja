@@ -14,13 +14,14 @@ use rustc_serialize::hex::ToHex;
 
 // Guarantee: there are at least 2 bindings per page.
 const BINDING_HEADER_SIZE: usize = 16; // each binding on B tree pages requires 16 bytes of header.
+pub const INITIAL_HEADER_SIZE: usize = 24; // The first binding has an extra 4+4 bytes.
 
 pub const MAX_KEY_SIZE: usize = (PAGE_SIZE >> 3);
 pub const VALUE_SIZE_THRESHOLD: usize = (PAGE_SIZE >> 3) - BINDING_HEADER_SIZE;
 
 pub const NIL:u16 = 0xffff;
 pub const FIRST_HEAD:u16 = 0;
-pub const MAX_LEVEL:usize = 4;
+pub const N_LEVELS:usize = 5;
 pub const VALUE_HEADER_LEN:usize = 8;
 
 #[derive(Debug)]
@@ -47,6 +48,14 @@ pub struct MutTxn<'env,T> {
     #[doc(hidden)]
     pub txn: transaction::MutTxn<'env,T>,
 }
+
+impl<'env,T> Drop for MutTxn<'env,T> {
+    fn drop(&mut self) {
+        debug!("dropping muttxn");
+        std::mem::drop(&mut self.txn)
+    }
+}
+
 
 /// Immutable transaction
 pub struct Txn<'env> {
@@ -285,7 +294,7 @@ pub trait LoadPage:Sized {
         //println!("get from page {:?}", page);
         let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
-        let mut level = MAX_LEVEL;
+        let mut level = N_LEVELS-1;
         let mut next_page = 0;
         let mut equal:Option<UnsafeValue> = None;
         loop {
@@ -349,7 +358,7 @@ pub trait LoadPage:Sized {
                                                                     f: &mut F) -> Iterate {
         let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
-        let mut level = MAX_LEVEL;
+        let mut level = N_LEVELS-1;
         let mut next_page = u64::from_le(*((current as *const u64).offset(2)));
         // First mission: find first element.
         if state == Iterate::NotStarted {
@@ -435,7 +444,7 @@ pub trait LoadPage:Sized {
                 let &mut (page_offset, ref mut current_off) = page_stack.last_mut().unwrap();
                 let page = self.load_page(page_offset);
                 let mut current = page.offset(*current_off as isize) as *const u16;
-                let mut level = MAX_LEVEL;
+                let mut level = N_LEVELS-1;
                 
                 // First mission: find first element.
                 loop {
@@ -684,13 +693,7 @@ impl MutPage {
             *(self.p_occupied()) = (self.occupied() + size).to_le();
             self.alloc(off_ptr, size);
             let ptr = self.offset(off_ptr as isize) as *mut u8;
-            *(ptr as *mut u16) = NIL;
-            *((ptr as *mut u16).offset(1)) = NIL;
-            *((ptr as *mut u16).offset(2)) = NIL;
-            *((ptr as *mut u16).offset(3)) = NIL;
-            *((ptr as *mut u16).offset(4)) = NIL;
             *((ptr as *mut u16).offset(5)) = (key_len as u16).to_le();
-            *((ptr as *mut u64).offset(2)) = 0;
             let target_key_ptr = match value {
                 UnsafeValue::S { p,len } => {
                     *((ptr as *mut u32).offset(3)) = len.to_le();
@@ -705,6 +708,15 @@ impl MutPage {
             };
             copy_nonoverlapping(key_ptr, target_key_ptr, key_len);
         }
+    }
+    pub unsafe fn reset_pointers(&mut self, off_ptr:u16) {
+        let ptr = self.offset(off_ptr as isize) as *mut u8;
+        *(ptr as *mut u16) = NIL;
+        *((ptr as *mut u16).offset(1)) = NIL;
+        *((ptr as *mut u16).offset(2)) = NIL;
+        *((ptr as *mut u16).offset(3)) = NIL;
+        *((ptr as *mut u16).offset(4)) = NIL;
+        *((ptr as *mut u64).offset(2)) = 0;
     }
 }
 
