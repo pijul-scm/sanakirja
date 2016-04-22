@@ -334,7 +334,6 @@ mod tests {
         extern crate rand;
         extern crate rustc_serialize;
         use rand::Rng;
-        use std;
 
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
@@ -343,7 +342,7 @@ mod tests {
         let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
 
         let mut random = Vec::new();
-        for i in 0..300 {
+        for _ in 0..300 {
             let k: String = rng
                 .gen_ascii_chars()
                 .take(20)
@@ -367,7 +366,7 @@ mod tests {
 
         let mut i = 100;
         let (ref k0,ref v0) = random[i];
-        for (k,v) in txn.iter(&root, k0.as_bytes(), Some(v0.as_bytes()), &mut ws).take(100) {
+        for (k,_) in txn.iter(&root, k0.as_bytes(), Some(v0.as_bytes()), &mut ws).take(100) {
             let (ref kk,_) = random[i];
             assert!(k == kk.as_bytes());
             i+=1
@@ -411,7 +410,7 @@ mod tests {
                 .collect();
             println!("putting {:?}", i);
 
-            txn.put(&mut rng, &mut root, k.as_bytes(), v.as_bytes());
+            txn.put(&mut rng, &mut root, k.as_bytes(), v.as_bytes()).unwrap();
             txn.debug(&root, format!("/tmp/debug_{}",i), false, false);
             bindings.push((k,v));
         }
@@ -449,7 +448,7 @@ mod tests {
             let mut root = child_txn.root(0).unwrap_or_else(|| child_txn.create_db().unwrap());
             child_txn.put(&mut rng, &mut root, b"A", b"Value for A").unwrap();
             child_txn.set_root(0, root);
-            child_txn.commit();
+            child_txn.commit().unwrap();
         }
         {
             let mut child_txn = txn.mut_txn_begin();
@@ -463,9 +462,9 @@ mod tests {
             let mut root = child_txn.root(0).unwrap_or_else(|| child_txn.create_db().unwrap());
             child_txn.put(&mut rng, &mut root, b"C", b"Value for C").unwrap();
             child_txn.set_root(0, root);
-            child_txn.commit();
+            child_txn.commit().unwrap();
         }
-        txn.commit();
+        txn.commit().unwrap();
 
         let txn = env.txn_begin();
         let root = txn.root(0).unwrap();
@@ -500,7 +499,7 @@ mod tests {
                     .gen_iter::<char>()
                     .take(len)
                     .collect();
-                txn.put(&mut rng, &mut root, k.as_bytes(), v.as_bytes());
+                txn.put(&mut rng, &mut root, k.as_bytes(), v.as_bytes()).unwrap();
                 random.push((n_root, k, v));
                 
                 txn.set_root(n_root as isize, root);
@@ -546,20 +545,17 @@ mod tests {
                         .gen_iter::<char>()
                         .take(len)
                         .collect();
-                    txn.put(&mut rng, &mut db, k.as_bytes(), v.as_bytes());
+                    txn.put(&mut rng, &mut db, k.as_bytes(), v.as_bytes()).unwrap();
                     random.push((name.clone(), k, v));
                     
                     let r:u8 = rng.gen();
                     if r > 200 { break }
                 }
-                txn.put_db(&mut rng, &mut root, &name[..], db);
+                txn.put_db(&mut rng, &mut root, &name[..], db).unwrap();
             }
             txn.set_root(42, root);
             txn.commit().unwrap();
         }
-
-        let db_name = b"great db";
-
 
         let txn = env.txn_begin();
         let root = txn.root(42).unwrap();
@@ -582,7 +578,7 @@ mod tests {
         extern crate env_logger;
         use rand::Rng;
         use std;
-        use rand::SeedableRng;
+
         env_logger::init().unwrap_or(());
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
@@ -604,7 +600,7 @@ mod tests {
                     for &(ref k, ref v) in random.iter() {
                         //println!("found");
                         //println!("getting {:?}", k);
-                        let got = txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
+                        let got = txn.get(&db, k.as_bytes(), None).and_then(|x| {
                             //println!("value = {:?}", x.value);
                             buf.clear();
                             for i in x {
@@ -639,7 +635,7 @@ mod tests {
                     //txn.debug(&db,format!("/tmp/debug_{}",i),false,false);
                     txn.set_root(0, db);
                     txn.commit().unwrap();
-                    let stats = env.statistics();
+                    //let stats = env.statistics();
                     //println!("statistics: {:?}", stats);
                     random.push((k, v));
                 } else {
@@ -654,7 +650,7 @@ mod tests {
         let txn = env.txn_begin();
         let db = txn.root(0).unwrap();
         for &(ref k, ref v) in random.iter() {
-            assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
+            assert!(txn.get(&db, k.as_bytes(), None).and_then(|x| {
                 buf.clear();
                 for i in x {
                     buf.extend(i)
@@ -679,7 +675,7 @@ mod tests {
         extern crate tempdir;
         extern crate rand;
         use rand::Rng;
-        use rand::SeedableRng;
+
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
@@ -713,8 +709,8 @@ mod tests {
         {
             let mut txn = env.mut_txn_begin();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
-            txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes());
-            txn.put(&mut rng, &mut db, k1.as_bytes(), v1.as_bytes());
+            txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes()).unwrap();
+            txn.put(&mut rng, &mut db, k1.as_bytes(), v1.as_bytes()).unwrap();
             txn.set_root(0, db);
             txn.commit().unwrap();
         }
@@ -733,7 +729,7 @@ mod tests {
         let txn = env.txn_begin();
         let db = txn.root(0).unwrap();
         for &(ref k, ref v) in random.iter() {
-            assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| {
+            assert!(txn.get(&db, k.as_bytes(), None).and_then(|x| {
                 buf.clear();
                 for i in x {
                     buf.extend(i)

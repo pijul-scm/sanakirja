@@ -14,7 +14,6 @@ use rustc_serialize::hex::ToHex;
 
 // Guarantee: there are at least 2 bindings per page.
 const BINDING_HEADER_SIZE: usize = 16; // each binding on B tree pages requires 16 bytes of header.
-pub const INITIAL_HEADER_SIZE: usize = 24; // The first binding has an extra 4+4 bytes.
 
 pub const MAX_KEY_SIZE: usize = (PAGE_SIZE >> 3);
 pub const VALUE_SIZE_THRESHOLD: usize = (PAGE_SIZE >> 3) - BINDING_HEADER_SIZE;
@@ -527,7 +526,7 @@ impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a,'b,T> {
                         *current_off = u16::from_le(*(current as *const u16));
                     }
                     // If there's a page below, push it: the next element is there.
-                    let mut next_page = u64::from_le(*((current as *const u64).offset(2)));
+                    let next_page = u64::from_le(*((current as *const u64).offset(2)));
                     if next_page != 0 {
                         self.page_stack.push((next_page,FIRST_HEAD));
                     }
@@ -692,6 +691,16 @@ impl MutPage {
         unsafe {
             *(self.p_occupied()) = (self.occupied() + size).to_le();
             self.alloc(off_ptr, size);
+            self.write_key_value(off_ptr, key_ptr, key_len, value)
+        }
+    }
+    // allocate and write key, value, left and right neighbors.
+    pub fn write_key_value(&mut self,
+                           off_ptr: u16,
+                           key_ptr:*const u8,
+                           key_len:usize,
+                           value: UnsafeValue) {
+        unsafe {
             let ptr = self.offset(off_ptr as isize) as *mut u8;
             *((ptr as *mut u16).offset(5)) = (key_len as u16).to_le();
             let target_key_ptr = match value {
@@ -732,6 +741,7 @@ impl Cow {
         Cow{cow:transaction::Cow::MutPage(p.page)}
     }
 
+    #[cfg(test)]
     pub fn unwrap_mut(self) -> MutPage {
         match self.cow {
             transaction::Cow::MutPage(p) => MutPage { page: p },
@@ -882,7 +892,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
             if !nodes.contains(&off) {
                 let next_page = u64::from_le(*((ptr as *const u64).offset(2)));
                 if next_page>0 {
-                    //debug!("print_tree, next_page = {:?}", next_page);
+                    debug!("print_tree, page = {:?}, next_page = {:?}", p.page.offset, next_page);
                     pages.push(txn.load_page(next_page));
                     edges.push(format!(
                              "n_{}_{}->n_{}_{}[color=\"red\"];",
