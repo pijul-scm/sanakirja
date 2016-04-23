@@ -739,4 +739,133 @@ mod tests {
         }
     }
 
+
+
+
+
+    #[cfg(test)]
+    pub fn leakproof_put(n_insertions:usize, value_size:usize) -> () {
+        extern crate tempdir;
+        extern crate rand;
+        use rand::Rng;
+        //use std::collections::{HashMap};
+
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path(), ((n_insertions*value_size)/512) as u64).unwrap();
+
+        //let mut random:HashMap<String,String> = HashMap::new();
+
+        let key_len = 50;
+
+        for _ in 0..n_insertions {
+
+            let k0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(key_len)
+                .collect();
+            let v0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(value_size)
+                .collect();
+
+            let mut txn = env.mut_txn_begin();
+            let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
+            txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes()).unwrap();
+
+            //random.insert(k0,v0);
+            
+            txn.set_root(0, db);
+            txn.commit().unwrap();
+        }
+        check_memory(&env);
+    }
+
+    #[cfg(test)]
+    fn check_memory(env:&Env) {
+        use std::collections::{HashSet};
+        use super::txn::{Page,LoadPage,P, read_key_value, UnsafeValue};
+
+        let txn = env.txn_begin();
+        let db = txn.root(0).unwrap();
+        fn count_pages(txn:&Txn, page:&Page, pages:&mut HashSet<u64>, value_pages:&mut HashSet<u64>) {
+            unsafe {
+                let already = pages.insert(page.page_offset());
+                if already {
+                    let mut current = 0;
+                    while current != 0xffff {
+                        let child = u64::from_le(*(page.offset(current as isize) as *const u64).offset(2));
+                        if child > 0 {
+                            let child = txn.load_page(child);
+                            count_pages(txn, &child, pages, value_pages);
+                        }
+                        if current > 0 {
+                            let (_,value) = read_key_value(page.offset(current as isize));
+                            if let UnsafeValue::O { offset,.. } = value {
+                                count_values(txn, offset, value_pages);
+                            }
+                        }
+                        current = u16::from_le(*(page.offset(current as isize) as *const u16));
+                    }
+                }
+            }
+        }
+        fn count_values(txn:&Txn, offset:u64, pages:&mut HashSet<u64>) {
+            let mut current = offset;
+            while current != 0 {
+                debug!("current = {:?}", current);
+                pages.insert(current);
+                let p = txn.load_page(current);
+                unsafe {
+                    current = u64::from_le(*(p.offset(0) as *const u64));
+                }
+            }
+        }
+        let mut used_pages = HashSet::new();
+        let mut value_pages = HashSet::new();
+        let cow = txn.load_page(db.root);
+        count_pages(&txn, &cow, &mut used_pages, &mut value_pages);
+        let statistics = env.statistics();
+
+        // Check that no page is referenced and free at the same time.
+        assert!(statistics.free_pages.intersection(&used_pages).next().is_none());
+        assert!(statistics.free_pages.intersection(&value_pages).next().is_none());
+        assert!(value_pages.intersection(&used_pages).next().is_none());
+
+        // Check that no page is referenced/free and bookkeeping at the same time.
+        for i in statistics.bookkeeping_pages.iter() {
+            assert!(! used_pages.contains(i));
+            assert!(! value_pages.contains(i));
+            assert!(! statistics.free_pages.contains(i));
+        }
+
+        println!("env statistics: {:?}", env.statistics());
+        println!("counted pages: {:?}", used_pages);
+        println!("value pages: {:?}", value_pages);
+
+        assert!( (statistics.total_pages as usize) ==
+                  1
+                  + statistics.bookkeeping_pages.len()
+                  + statistics.free_pages.len()
+                  + used_pages.len()
+                  + value_pages.len()
+        );
+    }
+
+    #[test]
+    pub fn leakproof_put_short() {
+        leakproof_put(1000, 50)
+    }
+
+    #[test]
+    pub fn leakproof_put_long() {
+        leakproof_put(100, 1200)
+    }
+
+    #[test]
+    pub fn leakproof_put_really_long() {
+        leakproof_put(100, 8000)
+    }
+
+
 }
