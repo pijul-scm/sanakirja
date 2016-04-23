@@ -119,7 +119,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
     // Insert the separator into the next_right_child page.
     let mut result = {
         let next_right_left_child = u64::from_le(*((next_right_child.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
-        let (key,value) = if let Some(ref replacement) = replace {
+        let (key,value) = if let Some(replacement) = replace {
             (std::slice::from_raw_parts(replacement.key_ptr, replacement.key_len), replacement.value)
         } else {
             read_key_value(page.offset(next as isize))
@@ -129,12 +129,6 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
             *((right_child.offset(FIRST_HEAD as isize) as *const u64).offset(2));
         try!(insert(rng, txn, next_right_child, key, value, next_right_left_child))
     };
-
-    if let Some(replacement) = replace {
-        if replacement.free_page > 0 {
-            //try!(free(rng, txn, replacement.free_page))
-        }
-    }
     trace!("now really merging");
     // Next, cycle through the right child's bottom list, and insert
     // the elements into the next right child.
@@ -339,6 +333,10 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
                         let next = page.offset(next_off as isize);
                         *((next as *mut u64).offset(2)) = child_page.page_offset().to_le();
                         let result = try!(merge(rng, txn, Cow::from_mut_page(page), &mut new_levels, Some(smallest)));
+
+                        /*if smallest.free_page > 0 {
+                            try!(free(rng, txn, smallest.free_page));
+                        }*/
                         Ok((result,None))
                     } else {
                         debug!("not underfull");
@@ -376,11 +374,6 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
                     let key = std::slice::from_raw_parts(key_ptr,key_len);
                     let result = try!(replace_with_smallest(rng, txn, page, &levels[..], &mut new_levels[..],
                                                             false, left.page_offset(), &smallest));
-
-                    if smallest.free_page > 0 {
-                        try!(free(rng, txn, smallest.free_page));
-                    }
-
                     insert_in_res(rng, txn, result, &levels[..], &mut new_levels[..], key, value, right.page_offset())
                 },
                 (Res::Ok { .. }, None) |
