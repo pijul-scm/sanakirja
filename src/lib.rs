@@ -131,13 +131,7 @@ impl Env {
 }
 
 impl<'env,T> MutTxn<'env,T> {
-    /// Creates a new database. Use
-    ///
-    /// ```
-    /// // txn.open_db(b"name").unwrap_or_else(|| txn.create_db())
-    /// ```
-    ///
-    /// To open a database called "name" from the root database, and create it if it doesn't exist.
+    /// Creates a new database.
     pub fn create_db(&mut self) -> Result<Db,Error> {
         let mut db = try!(self.alloc_page());
         db.init();
@@ -145,13 +139,6 @@ impl<'env,T> MutTxn<'env,T> {
     }
 
     /// Produce an independent fork of a database. This method copies at most one block, and uses reference-counting on child blocks. The two databases share their bindings at the time of the fork, and can safely be considered separate databases after the fork.
-    /// A typical way to fork a database and add it under a different name is:
-    ///
-    /// ```
-    /// // let fork = txn.fork_db(&mut rng, &original);
-    /// // txn.put_db(&mut rng, &mut root, b"name of the forked db", fork);
-    /// 
-    /// ```
     pub fn fork_db<R:Rng>(&mut self, rng:&mut R, db:&Db) -> Result<Db,Error> {
         Ok(Db { root_num:-1, root: try!(put::fork_db(rng, self, db.root)) })
     }
@@ -744,17 +731,11 @@ mod tests {
 
 
     #[cfg(test)]
-    pub fn leakproof_put(n_insertions:usize, value_size:usize) -> () {
-        extern crate tempdir;
+    pub fn leakproof_put(env:&Env, n_insertions:usize, value_size:usize) -> () {
         extern crate rand;
         use rand::Rng;
-        //use std::collections::{HashMap};
 
         let mut rng = rand::thread_rng();
-        let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path(), ((n_insertions*value_size)/512) as u64).unwrap();
-
-        //let mut random:HashMap<String,String> = HashMap::new();
 
         let key_len = 50;
 
@@ -773,14 +754,57 @@ mod tests {
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes()).unwrap();
 
-            //random.insert(k0,v0);
+            txn.set_root(0, db);
+            txn.commit().unwrap();
+        }
+    }
+
+
+
+
+    #[cfg(test)]
+    pub fn leakproof_put_del(env:&Env, n_insertions:usize, value_size:usize) -> () {
+        extern crate rand;
+        use rand::Rng;
+        use std::collections::{HashMap};
+
+        let mut rng = rand::thread_rng();
+
+        let mut random:HashMap<String,String> = HashMap::new();
+
+        let key_len = 50;
+
+        for _ in 0..n_insertions {
+
+            let k0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(key_len)
+                .collect();
+            let v0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(value_size)
+                .collect();
+
+            let mut txn = env.mut_txn_begin();
+            let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
+            txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes()).unwrap();
+
+            random.insert(k0,v0);
             
             txn.set_root(0, db);
             txn.commit().unwrap();
         }
-        check_memory(&env);
+
+        for (ref k, ref v) in random.iter() {
+            let mut txn = env.mut_txn_begin();
+            let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
+            txn.del(&mut rng, &mut db, k.as_bytes(), Some(v.as_bytes())).unwrap();
+            txn.set_root(0, db);
+            txn.commit().unwrap();
+        }
     }
 
+    
     #[cfg(test)]
     fn check_memory(env:&Env) {
         use std::collections::{HashSet};
@@ -854,18 +878,83 @@ mod tests {
 
     #[test]
     pub fn leakproof_put_short() {
-        leakproof_put(1000, 50)
+        extern crate tempdir;
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+
+        let n_insertions = 1000;
+        let value_size = 50;
+
+        let env = Env::new(dir.path(), 5000).unwrap();
+        leakproof_put(&env, n_insertions, value_size);
+        check_memory(&env);
     }
 
     #[test]
     pub fn leakproof_put_long() {
-        leakproof_put(100, 1200)
+        extern crate tempdir;
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+
+        let n_insertions = 1000;
+        let value_size = 1200;
+
+        let env = Env::new(dir.path(), 5000).unwrap();
+        leakproof_put(&env, n_insertions, value_size);
+        check_memory(&env);
     }
 
     #[test]
     pub fn leakproof_put_really_long() {
-        leakproof_put(100, 8000)
+        extern crate tempdir;
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+
+        let n_insertions = 1000;
+        let value_size = 8000;
+
+        let env = Env::new(dir.path(), 5000).unwrap();
+        leakproof_put(&env, n_insertions, value_size);
+        check_memory(&env);
     }
 
+    #[test]
+    pub fn leakproof_put_del_short() {
+        extern crate tempdir;
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+
+        let n_insertions = 1000;
+        let value_size = 400;
+
+        let env = Env::new(dir.path(), 5000 as u64).unwrap();
+        leakproof_put_del(&env, n_insertions, value_size);
+        println!("checking");
+        check_memory(&env);
+    }
+
+    #[test]
+    pub fn leakproof_put_del_long() {
+        extern crate tempdir;
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+
+        let n_insertions = 1000;
+        let value_size = 500;
+
+        let env = Env::new(dir.path(), 10000 as u64).unwrap();
+        leakproof_put_del(&env, n_insertions, value_size);
+        println!("checking");
+        check_memory(&env);
+    }
+
+    #[test]
+    pub fn leakproof_put_del_really_long() {
+        extern crate tempdir;
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+
+        let n_insertions = 100;
+        let value_size = 8000;
+
+        let env = Env::new(dir.path(), 10000 as u64).unwrap();
+        leakproof_put_del(&env, n_insertions, value_size);
+        println!("checking");
+        check_memory(&env);
+    }
 
 }

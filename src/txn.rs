@@ -741,7 +741,6 @@ impl Cow {
         Cow{cow:transaction::Cow::MutPage(p.page)}
     }
 
-    #[cfg(test)]
     pub fn unwrap_mut(self) -> MutPage {
         match self.cow {
             transaction::Cow::MutPage(p) => MutPage { page: p },

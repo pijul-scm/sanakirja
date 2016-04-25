@@ -27,6 +27,44 @@ pub enum Res {
 }
 
 
+pub struct PI<'a> {
+    pub page:&'a Cow,
+    pub current:u16
+}
+impl<'a> PI<'a> {
+    pub fn new(page:&'a Cow) -> Self {
+        unsafe {
+            // Skip the first pointer (has no key/value)
+            let current = u16::from_le(*(page.offset(FIRST_HEAD as isize) as *const u16));
+            PI { page:page, current:current }
+        }
+    }
+}
+impl<'a> Iterator for PI<'a> {
+
+    type Item = (u16, &'a [u8], UnsafeValue, u64);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == NIL {
+            None
+        } else {
+            unsafe {
+                let current = self.current;
+                let (key,value) = read_key_value(self.page.offset(self.current as isize));
+                let right_child = u64::from_le(*((self.page.offset(self.current as isize) as *const u64).offset(2)));
+                self.current = u16::from_le(*(self.page.offset(self.current as isize) as *const u16));
+                Some((current,key,value,right_child))
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
 pub fn fork_db<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<u64,Error> {
     match txn.load_cow_page(off).cow {
         transaction::Cow::Page(p) => {
@@ -37,7 +75,7 @@ pub fn fork_db<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<u64,E
             try!(incr_rc(rng,txn,p.offset));
             let levels = [0;N_LEVELS];
             let mut levels_ = [0;N_LEVELS];
-            let page = try!(cow_pinpointing(rng, txn, Cow { cow:transaction::Cow::Page(p.as_page()) }, &levels, &mut levels_, NIL));
+            let page = try!(cow_pinpointing(rng, txn, Cow { cow:transaction::Cow::Page(p.as_page()) }, &levels, &mut levels_, false));
             Ok(page.page_offset())
         }
     }
@@ -231,7 +269,7 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64)->Resu
 }
 
 /// Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zero offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
-pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16], forgetting:u16) -> Result<MutPage,Error> {
+pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool) -> Result<MutPage,Error> {
     unsafe {
         match page.cow {
             transaction::Cow::Page(p) => {
@@ -241,10 +279,17 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                     pinpoints[i] = FIRST_HEAD;
                 }
                 //
-
+                
                 let page_offset = p.offset;
                 let page_rc = get_rc(txn, page_offset);
                 let p = Page { page:p };
+
+                let forget = if forgetting_next {
+                    u16::from_le(*(p.offset(old_levels[0] as isize) as *const u16))
+                } else {
+                    NIL
+                };
+
                 let mut page = try!(txn.alloc_page());
                 page.init();
                 let mut current = FIRST_HEAD;
@@ -261,7 +306,7 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                     if right_page > 0 && page_rc > 1 {
                         try!(incr_rc(rng, txn, right_page))
                     }
-                    if current != forgetting {
+                    if current != forget {
                         if current > FIRST_HEAD {
                             let (key,value) = read_key_value(pp);
                             // Increase count of value
@@ -316,8 +361,26 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                 Ok(page)
             }
             transaction::Cow::MutPage(p) => {
+                let p = MutPage { page:p };
                 std::ptr::copy_nonoverlapping(old_levels.as_ptr(), pinpoints.as_mut_ptr(), old_levels.len());
-                Ok(MutPage { page:p })
+                if forgetting_next {
+                    let next = u16::from_le(*(p.offset(old_levels[0] as isize) as *const u16));
+                    // We forget an entry, register the freed memory.
+                    let (key,value) = read_key_value(p.offset(next as isize));
+                    // Mark the freed space on the page.
+                    let size = record_size(key.len(),value.len() as usize);
+                    *(p.p_occupied()) = (p.occupied() - size).to_le();
+                    // Now, really delete!
+                    for l in 0..N_LEVELS {
+                        let next_l = u16::from_le(*((p.offset(old_levels[l] as isize) as *const u16).offset(l as isize)));
+                        if next_l == next {
+                            // Replace the next one with the next-next-one, at this level.
+                            *((p.offset(old_levels[l] as isize) as *mut u16).offset(l as isize)) =
+                                *((p.offset(next_l as isize) as *const u16).offset(l as isize));
+                        }
+                    }
+                }
+                Ok(p)
             }
         }
     }
@@ -329,7 +392,7 @@ fn test_insert() {
     extern crate tempdir;
     extern crate rand;
     extern crate env_logger;
-    use super::{Env};
+    use super::{Env, Transaction};
 
     use rand::{Rng};
     let mut rng = rand::thread_rng();
@@ -341,37 +404,47 @@ fn test_insert() {
 
     let mut page = txn.alloc_page().unwrap();
     page.init();
+
+    let mut random = Vec::new();
+    
     unsafe {
-        for _ in 0..500 {
+        for _ in 0..20 {
             //println!("i={:?}", i);
             let key: String = rng
                 .gen_ascii_chars()
-                .take(20)
+                .take(200)
                 .collect();
             //println!("key = {:?}", key);
-            let key = key.as_bytes();
             let value: String = rng
                 .gen_ascii_chars()
-                .take(20)
+                .take(200)
                 .collect();
-            let value = value.as_bytes();
-            let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
-            match insert(&mut rng, &mut txn, Cow::from_mut_page(page), key, value, 0) {
-                Ok(Res::Ok { page:page_,.. }) => {
-                    page = page_
-                },
-                Ok(Res::Nothing { page:page_ }) => {
-                    //println!("already present");
-                    page = page_.unwrap_mut()
-                },
-                Ok(x) => {
-                    page = root_split(&mut rng, &mut txn, x).unwrap()
-                },
-                _ => panic!("")
+            {
+                let key = key.as_bytes();
+                let value = value.as_bytes();
+                let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
+                match insert(&mut rng, &mut txn, Cow::from_mut_page(page), key, value, 0) {
+                    Ok(Res::Ok { page:page_,.. }) => {
+                        page = page_
+                    },
+                    Ok(Res::Nothing { page:page_ }) => {
+                        //println!("already present");
+                        page = page_.unwrap_mut()
+                    },
+                    Ok(x) => {
+                        page = root_split(&mut rng, &mut txn, x).unwrap()
+                    },
+                    _ => panic!("")
+                }
             }
+            random.push((key,value));
         }
+
         let db = Db { root_num: -1, root: page.page_offset() };
         txn.debug(&db, format!("/tmp/debug"), false, false);
+        for &(ref key, ref value) in random.iter() {
+            assert!(txn.get(&db, key.as_bytes(), None).is_some())
+        }
     }
 }
 
@@ -447,11 +520,11 @@ pub fn can_alloc_and_compact<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow,
     if off > 0 {
         if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
             // No need to copy nor compact the page, the value can be written right away.
-            Ok(Alloc::Can(try!(cow_pinpointing(rng, txn, page, levels, new_levels, NIL)), off))
+            Ok(Alloc::Can(try!(cow_pinpointing(rng, txn, page, levels, new_levels, false)), off))
         } else {
             // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
             debug!("copy/compact");
-            let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, NIL));
+            let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, false));
             debug!("/copy/compact");
             let off = page.can_alloc(size);
             Ok(Alloc::Can(page,off))
@@ -485,10 +558,10 @@ pub unsafe fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8
                     
                     let page =
                         if get_rc(txn, page.page_offset()) <= 1 {
-                            try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], NIL))
+                            try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], false))
                         } else {
                             // If several pages reference this one, force a copy.
-                            try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels[..], &mut new_levels[..], NIL))
+                            try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels[..], &mut new_levels[..], false))
                         };
                     let current = page.offset(new_levels[0] as isize);
                     *((current as *mut u64).offset(2)) = next_page.page_offset().to_le();
@@ -534,22 +607,32 @@ pub unsafe fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8
         } else {
             debug!("inserting here");
             // No child page, insert on this page.
-            let size = record_size(key.len(), value.len() as usize);
-            let mut new_levels = [0;N_LEVELS];
-            match try!(can_alloc_and_compact(rng,txn,page,size,&levels[..], &mut new_levels[..])) {
-                Alloc::Can(mut page,off) => {
-                    debug!("local_insert_at {:?} {:?} {:?}", new_levels, page.page_offset(), off);
-                    local_insert_at(rng, &mut page, key, value, right_page, off, size, &mut new_levels[..]);
-                    std::ptr::copy_nonoverlapping(new_levels.as_ptr(), levels.as_mut_ptr(), N_LEVELS);
-                    Ok(Res::Ok { page:page, underfull:false })
-                },
-                Alloc::Cannot(page) => {
-                    Ok(try!(split_page(rng, txn, &page, key, value, right_page, NIL, 0)))
-                }
-            }
+            check_alloc_local_insert(rng, txn, page, key, value, right_page, &mut levels)
         }
     }
 }
+
+
+/// If the levels have already been found, compact or split the page
+/// if necessary, and inserts the input (key, value) into the result,
+/// at the input levels.
+pub unsafe fn check_alloc_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16]) -> Result<Res, Error> {
+
+    let size = record_size(key.len(), value.len() as usize);
+    let mut new_levels = [0;N_LEVELS];
+    match try!(can_alloc_and_compact(rng,txn,page,size,&levels[..], &mut new_levels[..])) {
+        Alloc::Can(mut page,off) => {
+            debug!("local_insert_at {:?} {:?} {:?}", new_levels, page.page_offset(), off);
+            local_insert_at(rng, &mut page, key, value, right_page, off, size, &mut new_levels[..]);
+            std::ptr::copy_nonoverlapping(new_levels.as_ptr(), levels.as_mut_ptr(), N_LEVELS);
+            Ok(Res::Ok { page:page, underfull:false })
+        },
+        Alloc::Cannot(page) => {
+            Ok(try!(split_page(rng, txn, &page, key, value, right_page, NIL, 0)))
+        }
+    }
+}
+
 
 /// If the "levels" (pointers to the current elements of each of the
 /// lists) are known, allocate an element of size size at offset off,
@@ -570,17 +653,6 @@ pub unsafe fn local_insert_at<R:Rng>(rng:&mut R, page:&mut MutPage, key:&[u8], v
         }
     }
     debug!("exiting local_insert_at");
-}
-
-/// Insert an element locally. The caller must ensure that there is enough space, and the page doesn't need to be compacted.
-unsafe fn local_insert<R:Rng, T>(rng:&mut R, txn:&MutTxn<T>, page:&mut MutPage, key:&[u8], value:UnsafeValue, right_page:u64) {
-    let mut levels = [0;N_LEVELS];
-    let mut eq = false;
-    set_levels(txn, page, key, Some(value), &mut levels[..], &mut eq);
-    let size = record_size(key.len(), value.len() as usize);
-    let off = page.can_alloc(size);
-    debug_assert!(off > 0 && off+size < PAGE_SIZE as u16);
-    local_insert_at(rng, page, key, value, right_page, off, size, &mut levels);
 }
 
 
@@ -612,8 +684,10 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
 
     debug!("split {:?}", page.page_offset());
     let mut left = try!(txn.alloc_page());
-    debug!("alloc left {:?}", left.page_offset());
     left.init();
+    let mut right = try!(txn.alloc_page());
+    right.init();
+
     *((left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) =
         if translate_index == 0 {
             translate_right_page.to_le()
@@ -621,137 +695,96 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
             *((page.offset(FIRST_HEAD as isize) as *const u64).offset(2))
         };
 
-    let mut levels = [0;N_LEVELS];
-    let mut left_bytes = FIRST_HEAD;
-    let mut current = FIRST_HEAD;
-
-    let extra_size = record_size(key.len(), value.len() as usize);
-    let mut extra_key_inserted_in_left = false;
     // Loop through the values of the page, in order, and insert them to left in order.
-    // Stop at half the page.
-    current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
-    debug_assert!(current>0);
-    while current!=NIL {
-        let p = page.offset(current as isize);
-        let right_page_ = u64::from_le(*((p as *const u64).offset(2)));
-        let (key_,value_) = read_key_value(p);
-        let current_size = record_size(key_.len(), value_.len() as usize);
+    // Stop whenever both pages can include one extra entry after inserting the input entry to this function.
 
-        // The global goal of this function is to keep the left page
-        // less than 3 PAGE_SIZE/4 bytes long, even after inserting the
-        // extra element.
+    let mut left_bytes = 24;
+    let mut left_levels = [FIRST_HEAD;N_LEVELS];
+    let mut right_levels = [FIRST_HEAD;N_LEVELS];
+    let mut middle = None;
 
-        // Should we insert (key, value) into the left page?
-        // - If left_page + size <= PAGE_SIZE/2, yes
-        // - Or left_page < PAGE_SIZE/2, and the extra key will not be inserted in the left page, yes.
-        // - Else, no
-
-        let extra_key_here = (!extra_key_inserted_in_left) && {
-            match key.cmp(key_) {
-                Ordering::Greater => false,
-                Ordering::Less => true,
-                Ordering::Equal => {
-                    match (Value{txn:Some(txn),value:value}).cmp(Value{txn:Some(txn),value:value_}) {
-                        Ordering::Less|Ordering::Equal => true,
-                        Ordering::Greater => false
-                    }
-                }
-            }
-        };
-
-        if extra_key_here {
-            if left_bytes < (PAGE_SIZE as u16)/2 {
-                let off = left.can_alloc(extra_size);
-                local_insert_at(rng, &mut left, key, value, right_page, off, extra_size, &mut levels);
-                extra_key_inserted_in_left = true;
-                left_bytes += extra_size as u16;
+    let mut extra_on_lhs = false;
+    
+    for (current, key_, value_, r) in PI::new(page) {
+        let r = if current == translate_index {
+            if translate_right_page == 0 {
+                // This means "forget about translate_right_page"
+                continue
             } else {
-                break
+                translate_right_page
             }
         } else {
-            if left_bytes + current_size <= (PAGE_SIZE as u16)/2 {
-                if current == translate_index {
-                    if translate_right_page > 0 {
-                        let off = left.can_alloc(current_size);
-                        local_insert_at(rng, &mut left, key_, value_, translate_right_page, off, current_size, &mut levels);
-                        left_bytes += current_size as u16;
+            r
+        };
+        let next_size = record_size(key_.len(),value_.len() as usize);
+        if middle.is_none() { // Insert in left page.
+            if left_bytes + next_size <= (PAGE_SIZE as u16) / 2 {
+                // insert in left page.
+                let off = left.can_alloc(next_size);
+                local_insert_at(rng, &mut left, key_, value_, r, off, next_size, &mut left_levels);
+                left_bytes += next_size;
+            } else {
+                // Maybe we won't insert the new key here, and we can go one more step.
+                if left_bytes <= (PAGE_SIZE as u16) / 2 {
+                    extra_on_lhs = match key.cmp(key_) {
+                        Ordering::Less => true,
+                        Ordering::Greater => false,
+                        Ordering::Equal =>
+                            match (Value { txn:Some(txn), value:value }).cmp(Value { txn:Some(txn), value:value_ }) {
+                                Ordering::Less | Ordering::Equal => true,
+                                Ordering::Greater => false
+                            }
+                    };
+                    if !extra_on_lhs {
+                        let off = left.can_alloc(next_size);
+                        local_insert_at(rng, &mut left, key_, value_, r, off, next_size, &mut left_levels);
+                        left_bytes += next_size;
                     } else {
-                        debug!("Forgetting {:?} {:?}", current, std::str::from_utf8(key_).unwrap())
+
+                        let mut levels = [0;N_LEVELS];
+                        let mut eq = false;
+                        set_levels(txn, &left, key, Some(value), &mut levels[..], &mut eq);
+
+                        let size = record_size(key.len(), value.len() as usize);
+                        let off = left.can_alloc(size);
+                        local_insert_at(rng, &mut left, key, value, right_page, off, size, &mut levels);
+                        left_bytes += size;
+
+                        middle = Some((key_.as_ptr(),key_.len(),value_,r))
                     }
-                    // Else forget the index.
                 } else {
-                    let off = left.can_alloc(current_size);
-                    local_insert_at(rng, &mut left, key_, value_, right_page_, off, current_size, &mut levels);
-                    left_bytes += current_size as u16;
+                    middle = Some((key_.as_ptr(),key_.len(),value_,r))
                 }
-            } else {
-                break
             }
-            current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
+        } else {
+            // insert in right page.
+            let off = right.can_alloc(next_size);
+            local_insert_at(rng, &mut right, key_, value_, r, off, next_size, &mut right_levels);
         }
     }
-    let middle = current;
-    debug_assert!(middle != NIL);
-    // move on to next
-    current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
-    //debug_assert!(current != NIL);
+    if !extra_on_lhs {
+        let mut levels = [0;N_LEVELS];
+        let mut eq = false;
+        set_levels(txn, &right, key, Some(value), &mut levels[..], &mut eq);
 
-    let mut right = try!(txn.alloc_page());
-    debug!("SPLIT, alloc right {:?}", right.page_offset());
-    right.init();
-    if middle == translate_index {
-        *((right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = translate_right_page.to_le();
-        debug!("split, translated right right child = {:?}", *((right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)));
+        let size = record_size(key.len(), value.len() as usize);
+        let off = right.can_alloc(size);
+        local_insert_at(rng, &mut right, key, value, right_page, off, size, &mut levels);
+    }
+    if let Some((key_ptr, key_len, value_, right_child)) = middle {
+
+        *((right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_child.to_le();
+        Ok(Res::Split {
+            key_ptr: key_ptr,
+            key_len: key_len,
+            value: value_,
+            left: left,
+            right: right,
+            free_page: page.page_offset()
+        })
     } else {
-        *((right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = *((page.offset(middle as isize) as *const u64).offset(2));
-        debug!("split, right right child = {:?}", *((right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)));
+        unreachable!()
     }
-    let mut levels = [0;N_LEVELS];
-
-    while current != NIL {
-        if current > FIRST_HEAD {
-            let p = page.offset(current as isize);
-            let right_page = u64::from_le(*((p as *const u64).offset(2)));
-
-            let (key,value) = read_key_value(p);
-            let current_size = record_size(key.len(), value.len() as usize);
-                
-            if current == translate_index {
-                if translate_right_page > 0 {
-                    let off = right.can_alloc(current_size);
-                    debug_assert!(off+current_size < PAGE_SIZE as u16);
-                    local_insert_at(rng, &mut right, key, value, translate_right_page, off, current_size, &mut levels);
-                } else {
-                    debug!("Forgetting {:?} {:?}", current, std::str::from_utf8(key).unwrap())
-                }
-                // Else forget the index.
-            } else {
-                let right_page = if current == translate_index { translate_right_page } else { right_page };
-                let off = right.can_alloc(current_size);
-                debug_assert!(off+current_size < PAGE_SIZE as u16);
-                local_insert_at(rng, &mut right, key, value, right_page, off, current_size, &mut levels);
-            }
-        }
-        current = u16::from_le(*((page.data() as *const u8).offset(current as isize) as *const u16));
-    }
-
-    let p = page.offset(middle as isize);
-    let (key_,value_) = read_key_value(p);
-
-    // We still need to reinsert the (key,value) given in argument, in one of the two pages.
-    if !extra_key_inserted_in_left {
-        local_insert(rng, txn, &mut right, key, value, right_page)
-    }
-    debug!("/SPLIT");
-    debug!("middle: {:?}", std::str::from_utf8(key_).unwrap());
-    Ok(Res::Split {
-        key_ptr: key_.as_ptr(),
-        key_len: key_.len(),
-        value: value_,
-        left: left,
-        right: right,
-        free_page: page.page_offset()
-    })
 }
 
 
