@@ -157,7 +157,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
                 _ => unreachable!()
             }
         }
-        println!("size after merging: {:?}", right_child.occupied());
+        debug!("size after merging: {:?}", right_child.occupied());
         // Then set the new left child for the right child, and re-insert the middle element.
         let right_left_child = u64::from_le(*((right_child.offset(0) as *const u64).offset(2)));
         *((right_child.offset(0) as *mut u64).offset(2)) = *((left_child.offset(0) as *const u64).offset(2));
