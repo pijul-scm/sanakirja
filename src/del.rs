@@ -148,6 +148,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
     // right child to simply merge the pages, or we need to rebalance.
 
     if size - 24 <= PAGE_SIZE as u16 { // `- 24` because the initial header is counted twice in `size`.
+        debug!("merging");
         // Merge the left page into the right page.
         for (_, key,value,r) in PI::new(&left_child) {
             debug!("inserting {:?} into {:?}", std::str::from_utf8_unchecked(key), right_child);
@@ -186,6 +187,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
         let underfull = page.occupied() < (PAGE_SIZE/2) as u16;
         Ok(Res::Ok { page:page, underfull: underfull })
     } else {
+        debug!("rebalancing");
         // Rebalance. Allocate two pages, fill the first one to ceil(size/2), which is smaller than PAGE_SIZE.
         // Delete the middle element and insert it in the appropriate page.
         //
@@ -246,7 +248,9 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
             // Delete the current entry, insert the new one instead.
             let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true));
             *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = new_left.page_offset().to_le();
+
             if let Some((key_ptr,key_len,value,r)) = middle {
+
                 *((new_right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = r.to_le();
                 let key = std::slice::from_raw_parts(key_ptr, key_len);
                 check_alloc_local_insert(rng, txn, Cow::from_mut_page(page),
@@ -255,8 +259,30 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
                 unreachable!()
             }
         };
+
         // We can safely free the right child. TODO: Causes tests to fail, why?
-        // try!(free(rng, txn, right_child.page_offset()));
+        if cfg!(test) {
+            match result {
+                Ok(Res::Ok { ref page, .. }) => {
+                    for (_,_,_,r) in PI::new(page) {
+                        assert!(r != right_child.page_offset());
+                        assert!(r != left_child.page_offset());
+                    }
+                },
+                Ok(Res::Split { ref left, ref right, .. }) => {
+                    for (_,_,_,r) in PI::new(left) {
+                        assert!(r != right_child.page_offset());
+                        assert!(r != left_child.page_offset());
+                    }
+                    for (_,_,_,r) in PI::new(right) {
+                        assert!(r != right_child.page_offset());
+                        assert!(r != left_child.page_offset());
+                    }
+                },
+                _ => {}
+            }
+        }
+        //try!(free(rng, txn, right_child.page_offset()));
         // TODO: free left child, except if we're currently looking for the smallest element.
         result
     }
@@ -287,6 +313,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
     // Then delete in the current page, depending on the results.
     match del {
         None if eq => {
+            debug!("none + eq");
             // No page below, but we can delete something here.
             let mut new_levels = [0;N_LEVELS];
             let mut page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false));
@@ -317,6 +344,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
             }
         },
         Some((Res::Nothing { .. }, _)) if eq => {
+            debug!("nothing + eq");
             // Not found below, but we can delete something here.
 
             // Find the matching element, and the page to its right.
@@ -400,6 +428,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
             }
         },
         Some((Res::Ok { page:child_page, underfull }, smallest)) => {
+            debug!("ok");
             // Update the pointer here
             let mut new_levels = [0;N_LEVELS];
             let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false));
@@ -411,10 +440,12 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
             }
         },
         Some((Res::Nothing {.. },_)) | None => {
+            debug!("nothing or none + not eq");
             // No page below, or not found below, and not found here.
             Ok((Res::Nothing { page:page }, None))
         },
         Some((Res::Split { key_ptr,key_len,value:value_,left,right,free_page }, smallest)) => {
+            debug!("split");
             // An entry was deleted from the page below, causing that page to split.
 
             // Now reinsert the element here.

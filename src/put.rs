@@ -27,12 +27,12 @@ pub enum Res {
 }
 
 
-pub struct PI<'a> {
-    pub page:&'a Cow,
+pub struct PI<'a,P:super::txn::P + 'a> {
+    pub page:&'a P,
     pub current:u16
 }
-impl<'a> PI<'a> {
-    pub fn new(page:&'a Cow) -> Self {
+impl<'a,P:super::txn::P + 'a> PI<'a,P> {
+    pub fn new(page:&'a P) -> Self {
         unsafe {
             // Skip the first pointer (has no key/value)
             let current = u16::from_le(*(page.offset(FIRST_HEAD as isize) as *const u16));
@@ -40,7 +40,7 @@ impl<'a> PI<'a> {
         }
     }
 }
-impl<'a> Iterator for PI<'a> {
+impl<'a,P:super::txn::P + 'a> Iterator for PI<'a,P> {
 
     type Item = (u16, &'a [u8], UnsafeValue, u64);
     fn next(&mut self) -> Option<Self::Item> {
@@ -683,6 +683,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                                   translate_index:u16, translate_right_page:u64)->Result<Res,Error> {
 
     debug!("split {:?}", page.page_offset());
+    debug!("split {:?}", std::str::from_utf8_unchecked(key));
     let mut left = try!(txn.alloc_page());
     left.init();
     let mut right = try!(txn.alloc_page());
@@ -706,6 +707,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
     let mut extra_on_lhs = false;
     
     for (current, key_, value_, r) in PI::new(page) {
+        debug!("split key_ = {:?}", std::str::from_utf8_unchecked(key_));
         let r = if current == translate_index {
             if translate_right_page == 0 {
                 // This means "forget about translate_right_page"
@@ -724,7 +726,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                 local_insert_at(rng, &mut left, key_, value_, r, off, next_size, &mut left_levels);
                 left_bytes += next_size;
             } else {
-                // Maybe we won't insert the new key here, and we can go one more step.
+                // Maybe we won't insert the new key here, in which case we can go one more step.
                 if left_bytes <= (PAGE_SIZE as u16) / 2 {
                     extra_on_lhs = match key.cmp(key_) {
                         Ordering::Less => true,
@@ -735,12 +737,14 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                                 Ordering::Greater => false
                             }
                     };
+                    debug!("one more key ? {:?}", extra_on_lhs);
                     if !extra_on_lhs {
-                        let off = left.can_alloc(next_size);
-                        local_insert_at(rng, &mut left, key_, value_, r, off, next_size, &mut left_levels);
-                        left_bytes += next_size;
+                        // The next key is larger than all elements on
+                        // the left page, but smaller than the extra key.
+                        // This is the separator.
+                        middle = Some((key_.as_ptr(),key_.len(),value_,r))
                     } else {
-
+                        // We insert the extra key on the left-hand side now. and save (key_,value_) for later.
                         let mut levels = [0;N_LEVELS];
                         let mut eq = false;
                         set_levels(txn, &left, key, Some(value), &mut levels[..], &mut eq);
@@ -749,7 +753,6 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                         let off = left.can_alloc(size);
                         local_insert_at(rng, &mut left, key, value, right_page, off, size, &mut levels);
                         left_bytes += size;
-
                         middle = Some((key_.as_ptr(),key_.len(),value_,r))
                     }
                 } else {
@@ -762,7 +765,19 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
             local_insert_at(rng, &mut right, key_, value_, r, off, next_size, &mut right_levels);
         }
     }
+
+    // If the extra entry was not added to the left-hand side, add it to the right-hand side.
+    debug!("extra_on_lhs: {:?}", extra_on_lhs);
     if !extra_on_lhs {
+
+        if cfg!(test) {
+            if let Some((key_ptr, key_len, value_, right_child)) = middle {
+                // check that we're inserting on the right side.
+                let key_ = std::slice::from_raw_parts(key_ptr, key_len);
+                debug_assert!( key >= key_ )
+            }
+        }
+
         let mut levels = [0;N_LEVELS];
         let mut eq = false;
         set_levels(txn, &right, key, Some(value), &mut levels[..], &mut eq);
@@ -772,7 +787,6 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
         local_insert_at(rng, &mut right, key, value, right_page, off, size, &mut levels);
     }
     if let Some((key_ptr, key_len, value_, right_child)) = middle {
-
         *((right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_child.to_le();
         Ok(Res::Split {
             key_ptr: key_ptr,
