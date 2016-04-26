@@ -705,11 +705,13 @@ impl MutPage {
             *((ptr as *mut u16).offset(5)) = (key_len as u16).to_le();
             let target_key_ptr = match value {
                 UnsafeValue::S { p,len } => {
+                    debug_assert!(len < VALUE_SIZE_THRESHOLD as u32);
                     *((ptr as *mut u32).offset(3)) = len.to_le();
                     copy_nonoverlapping(p,(ptr as *mut u8).offset(24), len as usize);
                     (ptr as *mut u8).offset(24 + len as isize)
                 },
                 UnsafeValue::O { offset,len } => {
+                    debug!("write_key_value: {:?}", offset);
                     *((ptr as *mut u32).offset(3)) = len.to_le();
                     *((ptr as *mut u64).offset(3)) = offset.to_le();
                     (ptr as *mut u8).offset(32)
@@ -848,7 +850,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
                     ("root".to_string(),"".to_string())
                 } else {
                     let (key, value) = read_key_value(ptr as *const u8);
-                    //println!("key,value = ({:?},{:?})", key.as_ptr(), value.len());
+                    // debug!("key,value = ({:?},{:?})", key.as_ptr(), value);
                     let key =
                         if keys_hex {
                             key.to_hex()
@@ -891,7 +893,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
             if !nodes.contains(&off) {
                 let next_page = u64::from_le(*((ptr as *const u64).offset(2)));
                 if next_page>0 {
-                    debug!("print_tree, page = {:?}, next_page = {:?}", p.page.offset, next_page);
+                    //debug!("print_tree, page = {:?}, next_page = {:?}", p.page.offset, next_page);
                     pages.push(txn.load_page(next_page));
                     edges.push(format!(
                              "n_{}_{}->n_{}_{}[color=\"red\"];",

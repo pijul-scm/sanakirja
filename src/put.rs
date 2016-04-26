@@ -7,6 +7,7 @@ use rand::{Rng};
 
 extern crate log;
 
+#[derive(Debug)]
 pub enum Res {
     Ok { page: MutPage,
          // position is the offset in the page where the insertion
@@ -101,7 +102,7 @@ pub fn get_rc<T>(txn:&mut MutTxn<T>, off:u64) -> u64 {
 
 
 /// Decrease the reference count of a page, freeing it if it's no longer referenced.
-pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Error> {
+pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool) -> Result<(),Error> {
     debug!("freeing {:?}", off);
     unsafe {
         let really_free = {
@@ -125,78 +126,22 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Error
             }
         };
         if really_free {
-            let p = txn.load_cow_page(off);
-            // Decrement all children and values.
-            let mut current = FIRST_HEAD;
-            while current != NIL {
-                let pp = p.offset(current as isize);
-                let right_page = u64::from_le(*((pp as *const u64).offset(2)));
-                /*
-                if current > FIRST_HEAD {
-                    let (_,value) = read_key_value(pp);
-                    // Decrease count of value
-                    if let UnsafeValue::O { offset, .. } = value {
-                        if deallocate_values {
-                            //debug!(target:"free_value", "free, not preserved {:?}", preserved_value);
-                            try!(free_value(rng, txn, offset))
-                        }
-                    }
+            if free_children {
+                let p = txn.load_cow_page(off);
+                for (_,_,_,r) in PI::new(&p) {
+                    try!(free(rng, txn, r, true))
                 }
-                 */
-                // Decrease count of right_page
-                if right_page > 0 {
-                    try!(free(rng, txn, right_page))
-                }
-                current = u16::from_le(*((p.offset(current as isize) as *const u16)));
             }
             transaction::free(&mut txn.txn, off);
         }
         Ok(())
     }
 }
-
-
-
-/// Decrease the reference count of a page, freeing it if it's no longer referenced. Does not free children.
-pub fn free_local<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Error> {
-    debug!("freeing {:?}", off);
-    unsafe {
-        let really_free = {
-            if let Some(mut rc) = txn.rc() {
-                if let Some(count) = txn.get_u64(&rc, off) {
-                    if count>1 {
-                        debug!("rc: {:?}, off: {:?}, count: {:?}", rc, off, rc);
-                        try!(txn.replace_u64(rng, &mut rc, off, count-1));
-                        txn.set_rc(rc);
-                        false
-                    } else {
-                        try!(txn.del_u64(rng,&mut rc,off));
-                        txn.set_rc(rc);
-                        true
-                    }
-                } else {
-                    true
-                }
-            } else {
-                true
-            }
-        };
-        if really_free {
-            transaction::free(&mut txn.txn, off);
-        }
-        Ok(())
-    }
-}
-
-
-
-
-
 
 
 
 /// Allocate one large values, spanning over at least one page.
-fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> Result<UnsafeValue,Error> {
+pub fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> Result<UnsafeValue,Error> {
     debug!("alloc_value");
     let mut len = value.len();
     let mut p_value = value.as_ptr();
@@ -387,8 +332,8 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
 }
 
 
-#[test]
-fn test_insert() {
+#[cfg(test)]
+fn test_insert(value_size:usize) {
     extern crate tempdir;
     extern crate rand;
     extern crate env_logger;
@@ -408,21 +353,26 @@ fn test_insert() {
     let mut random = Vec::new();
     
     unsafe {
-        for _ in 0..20 {
-            //println!("i={:?}", i);
+        for i in 0..20 {
+            println!("i={:?}", i);
             let key: String = rng
                 .gen_ascii_chars()
                 .take(200)
                 .collect();
-            //println!("key = {:?}", key);
+            println!("key = {:?}", key);
             let value: String = rng
                 .gen_ascii_chars()
-                .take(200)
+                .take(value_size)
                 .collect();
             {
                 let key = key.as_bytes();
                 let value = value.as_bytes();
-                let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
+                let value = if value.len() > VALUE_SIZE_THRESHOLD {
+                    alloc_value(&mut txn,value).unwrap()
+                } else {
+                    UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
+                };
+
                 match insert(&mut rng, &mut txn, Cow::from_mut_page(page), key, value, 0) {
                     Ok(Res::Ok { page:page_,.. }) => {
                         page = page_
@@ -436,6 +386,9 @@ fn test_insert() {
                     },
                     _ => panic!("")
                 }
+                debug!("debugging");
+                let db = Db { root_num: -1, root: page.page_offset() };
+                txn.debug(&db, format!("/tmp/after_{}",i), false, false);
             }
             random.push((key,value));
         }
@@ -449,7 +402,15 @@ fn test_insert() {
 }
 
 
+#[test]
+fn test_insert_small() {
+    test_insert(50)
+}
 
+#[test]
+fn test_insert_large() {
+    test_insert(2000)
+}
 
 
 
@@ -599,8 +560,8 @@ pub unsafe fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8
                             Ok(try!(split_page(rng, txn, &page, key_, value_, right.page_offset(), levels[0], left.page_offset())))
                         }
                     };
-                    debug!("freeing page with middle element");
-                    try!(free_local(rng, txn, free_page));
+                    debug!("freeing page with middle element: {:?}", free_page);
+                    try!(free(rng, txn, free_page, false));
                     result
                 }
             }
@@ -816,7 +777,8 @@ pub fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Res) -> Result<Mut
             let off = page.can_alloc(size);
             let key = std::slice::from_raw_parts(key_ptr, key_len);
             local_insert_at(rng, &mut page, key, value, right.page_offset(), off, size, &mut levels);
-            try!(free_local(rng, txn,free_page));
+            debug!("root split, freeing {:?}", free_page);
+            try!(free(rng, txn, free_page, false));
             Ok(page)
         }
     } else {

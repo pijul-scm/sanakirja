@@ -767,7 +767,9 @@ mod tests {
         extern crate rand;
         use rand::Rng;
         use std::collections::{HashMap};
+        extern crate env_logger;
 
+        env_logger::init().unwrap_or(());
         let mut rng = rand::thread_rng();
 
         let mut random:HashMap<String,String> = HashMap::new();
@@ -794,13 +796,16 @@ mod tests {
             txn.set_root(0, db);
             txn.commit().unwrap();
         }
-
+        let mut i = 0;
         for (ref k, ref v) in random.iter() {
+            debug!("i = {:?}, k = {:?}", i, k);
             let mut txn = env.mut_txn_begin();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.del(&mut rng, &mut db, k.as_bytes(), Some(v.as_bytes())).unwrap();
+            txn.debug(&db, format!("/tmp/after_{}",i), false, false);
             txn.set_root(0, db);
             txn.commit().unwrap();
+            i+=1;
         }
     }
 
@@ -867,6 +872,25 @@ mod tests {
         println!("counted pages: {:?}", used_pages);
         println!("value pages: {:?}", value_pages);
 
+        println!("total: {:?}, counted: {:?}",
+                 (statistics.total_pages as usize),
+                 1
+                 + statistics.bookkeeping_pages.len()
+                 + statistics.free_pages.len()
+                 + used_pages.len()
+                 + value_pages.len());
+        let mut leaking = Vec::new();
+        let mut p = 4096;
+        while p < statistics.total_pages*4096 {
+            if !(statistics.bookkeeping_pages.contains(&p)
+                 || statistics.free_pages.contains(&p)
+                 || used_pages.contains(&p)
+                 || value_pages.contains(&p)) {
+                leaking.push(p)
+                }
+            p+=4096
+        }
+        println!("leaking: {:?}", leaking);
         assert!( (statistics.total_pages as usize) ==
                   1
                   + statistics.bookkeeping_pages.len()
@@ -920,7 +944,7 @@ mod tests {
         extern crate tempdir;
         let dir = tempdir::TempDir::new("pijul").unwrap();
 
-        let n_insertions = 1000;
+        let n_insertions = 500;
         let value_size = 400;
 
         let env = Env::new(dir.path(), 5000 as u64).unwrap();
