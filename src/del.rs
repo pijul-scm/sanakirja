@@ -387,9 +387,15 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
 
                         let result = try!(merge(rng, txn, Cow::from_mut_page(page), &mut new_levels,
                                                 Some(&smallest), false));
-                        if smallest.free_page > 0 {
-                            debug!("merged, we'd like to free {:?}", smallest.free_page);
-                            //try!(free(rng, txn, smallest.free_page, false))
+
+                        // When `page` is only one level above the
+                        // leaves, and the current entry is the last
+                        // one on the page, merge might have merged
+                        // the right child onto the left child (instead
+                        // of the opposite in all other cases).
+                        if smallest.free_page > 0 && smallest.free_page != child_page.page_offset() {
+                            debug!("merged, freeing {:?}, child_page = {:?}", smallest.free_page, child_page.page_offset());
+                            try!(free(rng, txn, smallest.free_page, false))
                         }
                         Ok((result,None))
                     } else {
