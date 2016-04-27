@@ -76,7 +76,7 @@ pub fn fork_db<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<u64,E
             try!(incr_rc(rng,txn,p.offset));
             let levels = [0;N_LEVELS];
             let mut levels_ = [0;N_LEVELS];
-            let page = try!(cow_pinpointing(rng, txn, Cow { cow:transaction::Cow::Page(p.as_page()) }, &levels, &mut levels_, false));
+            let page = try!(cow_pinpointing(rng, txn, Cow { cow:transaction::Cow::Page(p.as_page()) }, &levels, &mut levels_, false, false));
             Ok(page.page_offset())
         }
     }
@@ -103,7 +103,7 @@ pub fn get_rc<T>(txn:&mut MutTxn<T>, off:u64) -> u64 {
 
 /// Decrease the reference count of a page, freeing it if it's no longer referenced.
 pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool) -> Result<(),Error> {
-    debug!("freeing {:?}", off);
+    //println!("freeing {:?}", off);
     unsafe {
         let really_free = {
             if let Some(mut rc) = txn.rc() {
@@ -145,30 +145,20 @@ pub fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> Result<UnsafeValue,Er
     debug!("alloc_value");
     let mut len = value.len();
     let mut p_value = value.as_ptr();
-    let mut ptr:*mut u64 = std::ptr::null_mut();
-    let mut first_page = 0;
+    let mut page = try!(txn.alloc_page());
+    let first_page = page.page_offset();
     unsafe {
-        while len > 0 {
-            let page = try!(txn.alloc_page());
-            debug!("PAGE= {:?}", page.page_offset());
-            if !ptr.is_null() {
-                *((ptr as *mut u64)) = page.page_offset().to_le()
+        loop {
+            if len <= PAGE_SIZE {
+                std::ptr::copy_nonoverlapping(p_value, page.offset(0), len);
+                break
             } else {
-                first_page = page.page_offset();
-            }
-            ptr = page.data() as *mut u64;
-            *ptr = 0;
-            if len > PAGE_SIZE - VALUE_HEADER_LEN {
-                std::ptr::copy_nonoverlapping(p_value,
-                                              (ptr as *mut u8).offset(VALUE_HEADER_LEN as isize),
-                                              PAGE_SIZE - VALUE_HEADER_LEN);
-                len -= PAGE_SIZE - VALUE_HEADER_LEN;
-                p_value = p_value.offset((PAGE_SIZE-VALUE_HEADER_LEN) as isize);
-            } else {
-                std::ptr::copy_nonoverlapping(p_value,
-                                              (ptr as *mut u8).offset(VALUE_HEADER_LEN as isize),
-                                              len);
-                len = 0;
+                std::ptr::copy_nonoverlapping(p_value, page.offset(8), PAGE_SIZE-8);
+                p_value = p_value.offset((PAGE_SIZE-8) as isize);
+                len -= PAGE_SIZE - 8;
+                let next_page = try!(txn.alloc_page());
+                *(page.offset(0) as *mut u64) = next_page.page_offset().to_le();
+                page = next_page
             }
         }
     }
@@ -179,8 +169,8 @@ pub fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> Result<UnsafeValue,Er
 
 
 
-pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64)->Result<(),Error> {
-    debug!(target:"free_value", "freeing value {:?}", offset);
+pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut len:u32)->Result<(),Error> {
+    debug!("freeing value {:?}", offset);
     let really_free =
         if let Some(mut rc) = txn.rc() {
             if let Some(count) = txn.get_u64(&mut rc, offset) {
@@ -201,20 +191,27 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64)->Resu
         };
     if really_free {
         unsafe {
-            while offset!=0 {
-                let off = offset;
-                debug!("free value: {:?}", off);
-                let page = txn.load_cow_page(off).data();
-                offset = u64::from_le(*(page as *const u64));
-                transaction::free(&mut txn.txn, off)
+            loop {
+                if len <= PAGE_SIZE as u32 {
+                    transaction::free(&mut txn.txn, offset);
+                    break
+                } else {
+                    let page = txn.load_cow_page(offset).data();
+                    let next_offset = u64::from_le(*(page as *const u64));
+                    transaction::free(&mut txn.txn, offset);
+
+                    len -= (PAGE_SIZE-8) as u32;
+                    offset = next_offset;
+                }
             }
         }
     }
     Ok(())
 }
 
+
 /// Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zero offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
-pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool) -> Result<MutPage,Error> {
+pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool, forgetting_value:bool) -> Result<MutPage,Error> {
     unsafe {
         match page.cow {
             transaction::Cow::Page(p) => {
@@ -254,7 +251,9 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                     if current != forget {
                         if current > FIRST_HEAD {
                             let (key,value) = read_key_value(pp);
-                            // Increase count of value
+                            // Increase count of value if the previous
+                            // page is not freed at the end of this
+                            // function.
                             if page_rc > 1 {
                                 if let UnsafeValue::O { offset,.. } = value {
                                     try!(incr_rc(rng, txn, offset))
@@ -289,6 +288,13 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                         } else {
                             *((page.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_page.to_le()
                         }
+                    } else if forgetting_value {
+                        // Here, maybe we need to forget
+                        let (_,value) = read_key_value(pp);
+                        if let UnsafeValue::O { offset, len } = value {
+                            //println!("cow_pinpointing: freeing value {:?}", offset);
+                            try!(free_value(rng, txn, offset, len))
+                        }
                     }
                     n+=1;
                     current = u16::from_le(*((p.offset(current as isize) as *const u16)));
@@ -300,7 +306,7 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                         try!(txn.del_u64(rng, &mut rc, page_offset));
                         txn.set_rc(rc);
                     }
-                    debug!("free cow: {:?}", page_offset);
+                    //println!("free cow: {:?}", page_offset);
                     transaction::free(&mut(txn.txn),page_offset)
                 }
                 Ok(page)
@@ -312,6 +318,12 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                     let next = u16::from_le(*(p.offset(old_levels[0] as isize) as *const u16));
                     // We forget an entry, register the freed memory.
                     let (key,value) = read_key_value(p.offset(next as isize));
+                    if forgetting_value {
+                        if let UnsafeValue::O { offset, len } = value {
+                            // println!("cow_pinpointing: freeing value {:?}", offset);
+                            try!(free_value(rng, txn, offset, len))
+                        }
+                    }
                     // Mark the freed space on the page.
                     let size = record_size(key.len(),value.len() as usize);
                     *(p.p_occupied()) = (p.occupied() - size).to_le();
@@ -395,7 +407,7 @@ fn test_insert(value_size:usize) {
 
         let db = Db { root_num: -1, root: page.page_offset() };
         txn.debug(&db, format!("/tmp/debug"), false, false);
-        for &(ref key, ref value) in random.iter() {
+        for &(ref key, _) in random.iter() {
             assert!(txn.get(&db, key.as_bytes(), None).is_some())
         }
     }
@@ -481,11 +493,11 @@ pub fn can_alloc_and_compact<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow,
     if off > 0 {
         if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
             // No need to copy nor compact the page, the value can be written right away.
-            Ok(Alloc::Can(try!(cow_pinpointing(rng, txn, page, levels, new_levels, false)), off))
+            Ok(Alloc::Can(try!(cow_pinpointing(rng, txn, page, levels, new_levels, false, false)), off))
         } else {
             // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
             debug!("copy/compact");
-            let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, false));
+            let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, false, false));
             debug!("/copy/compact");
             let off = page.can_alloc(size);
             Ok(Alloc::Can(page,off))
@@ -519,10 +531,10 @@ pub unsafe fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8
                     
                     let page =
                         if get_rc(txn, page.page_offset()) <= 1 {
-                            try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], false))
+                            try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], false, false))
                         } else {
                             // If several pages reference this one, force a copy.
-                            try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels[..], &mut new_levels[..], false))
+                            try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels[..], &mut new_levels[..], false, false))
                         };
                     let current = page.offset(new_levels[0] as isize);
                     *((current as *mut u64).offset(2)) = next_page.page_offset().to_le();
@@ -732,7 +744,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
     if !extra_on_lhs {
 
         if cfg!(test) {
-            if let Some((key_ptr, key_len, value_, right_child)) = middle {
+            if let Some((key_ptr, key_len, _, _)) = middle {
                 // check that we're inserting on the right side.
                 let key_ = std::slice::from_raw_parts(key_ptr, key_len);
                 debug_assert!( key >= key_ )

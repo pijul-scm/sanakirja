@@ -163,6 +163,12 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
 
         let (key,value) =
             if let Some(ref repl) = replace {
+                let next = u16::from_le(*(page.offset(levels[0] as isize) as *const u16));
+                let (_,former_value) = read_key_value(page.offset(next as isize));
+                if let UnsafeValue::O { offset,len } = former_value {
+                    debug!("merge: I'd like to free {:?}", offset);
+                    try!(free_value(rng, txn, offset, len))
+                }
                 (std::slice::from_raw_parts(repl.key_ptr, repl.key_len), repl.value)
             } else {
                 let next = u16::from_le(*(page.offset(levels[0] as isize) as *const u16));
@@ -178,7 +184,8 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
         debug!("right child = {:?}", right_child);
         // Finally, delete the middle element, and update its right child.
         let mut new_levels = [0;N_LEVELS];
-        let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true));
+        // We don't need to free the value associated to the middle element, since we reinserted it below.
+        let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false));
 
         *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = right_child.page_offset().to_le();
 
@@ -212,7 +219,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
         }
         {
             let right_left_child = u64::from_le(*((right_child.offset(0) as *const u64).offset(2)));
-            let mut it = PI::new(&left_child)
+            let it = PI::new(&left_child)
                 .chain((PI { page: &page, current:next }).take(1))
                 .chain(PI::new(&right_child));
 
@@ -223,6 +230,14 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
                 debug!("rebalance, inserting {:?} {:?} {:?}", std::str::from_utf8_unchecked(key), r, right_child.page_offset());
                 let (key,value, r) = match replace {
                     Some(ref repl) if r == right_child.page_offset() => {
+
+
+                        if let UnsafeValue::O { offset,len } = value {
+                            debug!("rebalancing: I'd like to free {:?}", offset);
+                            try!(free_value(rng, txn, offset, len))
+                        }
+
+
                         (std::slice::from_raw_parts(repl.key_ptr, repl.key_len), repl.value, right_left_child)
                     },
                     _ if r == right_child.page_offset() => (key, value, right_left_child),
@@ -249,7 +264,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
         let result = {
             let mut new_levels = [0;N_LEVELS];
             // Delete the current entry, insert the new one instead.
-            let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true));
+            let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false));
             *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = new_left.page_offset().to_le();
 
             if let Some((key_ptr,key_len,value,r)) = middle {
@@ -328,7 +343,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
             // No page below, but we can delete something here.
             if comp.is_smallest() {
                 let mut new_levels = [0;N_LEVELS];
-                let mut page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false));
+                let mut page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false, false));
 
                 let cur_ptr = page.offset(new_levels[0] as isize) as *const u16;
                 let next_off = u16::from_le(*cur_ptr);
@@ -350,7 +365,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
                     })))
             } else {
                 let mut new_levels = [0;N_LEVELS];
-                let mut page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true));
+                let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true));
                 let underfull = page.occupied() < (PAGE_SIZE as u16)/2;
                 Ok((Res::Ok { page:page, underfull:underfull }, None))
             }
@@ -373,7 +388,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
             match try!(delete(rng,txn, child_page, C::Smallest)) {
                 (Res::Ok { page: child_page, underfull }, Some(smallest)) => {
                     let mut new_levels = [0;N_LEVELS];
-                    let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false));
+                    let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false, false));
 
                     // Set the child page here, regardless of whether a merge is coming after this.
                     if underfull {
@@ -403,7 +418,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
                         let mut new_new_levels = [0;N_LEVELS];
                         let result = try!(replace_with_smallest(
                             rng, txn, Cow::from_mut_page(page),
-                            &new_levels[..], &mut new_new_levels[..], false,
+                            &new_levels[..], &mut new_new_levels[..], true,
                             child_page.page_offset(), &smallest
                         ));
 
@@ -441,7 +456,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
             debug!("ok, back to page {:?} with child {:?}", page.page_offset(), child_page.page_offset());
             // Update the pointer here
             let mut new_levels = [0;N_LEVELS];
-            let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false));
+            let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false, false));
             *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = child_page.page_offset().to_le();
             if underfull {
                 let keep_left = if let Some(ref smallest)=smallest {
@@ -516,9 +531,9 @@ unsafe fn local_delete_at<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:&mut Mut
                 // decrement its reference counter.
                 let (key,value) = read_key_value(next as *const u8);
                 if value_must_be_freed {
-                    if let UnsafeValue::O { offset, .. } = value {
+                    if let UnsafeValue::O { offset, len } = value {
                         debug!("found value, freeing {:?}", offset);
-                        try!(free_value(rng,txn,offset))
+                        // try!(free_value(rng,txn,offset,len))
                     }
                 }
                 // Mark the freed space on the page.
@@ -559,9 +574,16 @@ unsafe fn replace_with_smallest<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
     };
     if cfg!(not(feature="delete_always_realloc")) && former_size >= size {
 
-        let mut page = try!(cow_pinpointing(rng, txn, page, levels, new_levels, false));
+        let mut page = try!(cow_pinpointing(rng, txn, page, levels, new_levels, false, false));
 
         let next_off = u16::from_le(*(page.offset(new_levels[0] as isize) as *const u16));
+        if value_must_be_freed {
+            let (_,value) = read_key_value(page.offset(next_off as isize));
+            if let UnsafeValue::O { offset, len } = value {
+                debug!("replace_with_smallest: freeing {:?}", offset);
+                try!(free_value(rng, txn, offset, len))
+            }
+        }
         debug!("replacing in page {:?} at offset {:?}", page.page_offset(), next_off);
         // advance the levels containing the element before the one we're inserting.
         for l in 0..N_LEVELS {
@@ -591,7 +613,7 @@ unsafe fn replace_with_smallest<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
             if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
                 debug!("replace_with_smallest, no copy");
                 // No need to copy, we can just delete in place.
-                let mut page = try!(cow_pinpointing(rng, txn, page, levels, new_levels, false));
+                let mut page = try!(cow_pinpointing(rng, txn, page, levels, new_levels, false, false));
                 try!(local_delete_at(rng, txn, &mut page, new_levels, value_must_be_freed));
                 debug_assert!(off+size < PAGE_SIZE as u16);
                 local_insert_at(rng, &mut page, key_, value_, child, off, size, new_levels);
@@ -601,7 +623,7 @@ unsafe fn replace_with_smallest<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
 
             } else {
                 debug!("replace_with_smallest, copy");
-                let mut page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, true));
+                let mut page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, true, false));
                 let off = page.can_alloc(size);
                 debug_assert!(off+size < PAGE_SIZE as u16);
                 local_insert_at(rng, &mut page, key_, value_, child, off, size, new_levels);
@@ -869,7 +891,7 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
             //println!("key = {:?}", key);
             let value_: String = rng
                 .gen_ascii_chars()
-                .take(keysize)
+                .take(valuesize)
                 .collect();
             {
                 let key = key_.as_bytes();

@@ -128,9 +128,9 @@ impl <'a,T:LoadPage>fmt::Debug for Value<'a,T> {
         let mut first = true;
         for x in it {
             if !first {
-                try!(write!(f, ", {:?}", x))
+                try!(write!(f, ", {:?}", std::str::from_utf8(x).unwrap_or("")))
             } else {
-                try!(write!(f, "{:?}", x));
+                try!(write!(f, "{:?}", std::str::from_utf8(x).unwrap_or("")));
                 first = false;
             }
         }
@@ -147,20 +147,20 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
                 if *len == 0 {
                     None
                 } else {
-                    unsafe {
-                        let page = self.txn.unwrap().load_page(*offset).offset(0);
-                        // change the pointer of "current page" to the next page
-                        let next_offset = u64::from_le(*(page as *const u64));
-                        //println!("current={:?}, next_offset:{:?}", *offset, next_offset);
-                        //
-                        if next_offset != 0 {
-                            *offset = next_offset;
-                            *len -= (PAGE_SIZE-VALUE_HEADER_LEN) as u32;
-                            Some(std::slice::from_raw_parts(page.offset(VALUE_HEADER_LEN as isize), PAGE_SIZE-VALUE_HEADER_LEN))
-                        } else {
-                            let slice=std::slice::from_raw_parts(page.offset(VALUE_HEADER_LEN as isize), *len as usize);
+                    if *len <= PAGE_SIZE as u32 {
+                        unsafe {
+                            let page = self.txn.unwrap().load_page(*offset).offset(0);
+                            let slice=std::slice::from_raw_parts(page.offset(0), *len as usize);
                             *len = 0;
                             Some(slice)
+                        }
+                    } else {
+                        unsafe {
+                            let page = self.txn.unwrap().load_page(*offset).offset(0);
+                            // change the pointer of "current page" to the next page
+                            *offset = u64::from_le(*(page as *const u64));
+                            *len -= (PAGE_SIZE-VALUE_HEADER_LEN) as u32;
+                            Some(std::slice::from_raw_parts(page.offset(8), PAGE_SIZE-8))
                         }
                     }
                 }
@@ -342,8 +342,8 @@ pub trait LoadPage:Sized {
             }
         }
         if next_page > 0 {
-            let next_page = self.load_page(next_page);
-            self.get_(next_page, key, value).or(equal)
+            let next_page_ = self.load_page(next_page);
+            self.get_(next_page_, key, value).or(equal)
         } else {
             equal
         }
@@ -743,12 +743,14 @@ impl Cow {
         Cow{cow:transaction::Cow::MutPage(p.page)}
     }
 
+    #[cfg(test)]
     pub fn unwrap_mut(self) -> MutPage {
         match self.cow {
             transaction::Cow::MutPage(p) => MutPage { page: p },
             transaction::Cow::Page(_) => panic!("unwrap")
         }
     }
+
     pub fn as_nonmut(self) -> Cow {
         match self.cow {
             transaction::Cow::MutPage(p) => Cow { cow: transaction::Cow::Page(p.as_page()) },
@@ -859,23 +861,27 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
                             key.to_string()
                         };
                     let value = {
-                        let mut value_ = Vec::new();
-                        let mut value = Value { txn:Some(txn),value:value };
-                        if values_hex {
-                            for i in value {
-                                value_.extend(i)
-                            }
-                            value_.to_hex()
+                        if let UnsafeValue::O { ref offset, ref len } = value {
+                            format!("{:?}", offset)
                         } else {
-                            let value = if value.len() > 20 {
-                                let contents = value.next().unwrap();
-                                value_.extend(&contents[0..20]);
-                                value_.extend(b"...");
-                                &value_[..]
+                            let mut value_=Vec::new();
+                            let mut value = Value { value:value, txn:Some(txn) };
+                            if values_hex {
+                                for i in value {
+                                    value_.extend(i)
+                                }
+                                value_.to_hex()
                             } else {
-                                value.next().unwrap()
-                            };
-                            std::str::from_utf8_unchecked(value).to_string()
+                                let value = if value.len() > 20 {
+                                    let contents = value.next().unwrap();
+                                    value_.extend(&contents[0..20]);
+                                    value_.extend(b"...");
+                                    &value_[..]
+                                } else {
+                                    value.next().unwrap()
+                                };
+                                std::str::from_utf8_unchecked(value).to_string()
+                            }
                         }
                     };
                     (key,value)

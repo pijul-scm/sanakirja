@@ -285,7 +285,7 @@ impl MutPage {
 }
 
 pub unsafe fn free<T>(txn: &mut MutTxn<T>, offset: u64) {
-    debug!("free page: {:?}", offset);
+    println!("transaction::free page: {:?}", offset);
     if txn.occupied_clean_pages.remove(&offset) {
         txn.free_clean_pages.push(offset);
     } else {
@@ -498,66 +498,61 @@ impl<'env> Commit for MutTxn<'env,()> {
         //
         // everything can be sync'ed at any time, except that the first page needs to be sync'ed last.
         unsafe {
-            // While we've not written everything.
-            // Write free pages first.
-            let mut current_page: *mut u8 = std::ptr::null_mut();
-            let mut current_page_offset = 0;
-            // Trick here: we want to merge the last free page with the blank space, but since the following while loop can allocate pages, there is a risk the blank space gets overwritten. Therefore, we'll change the value of last_free_page (in page 0) only if a page has been freed next to it, and none has been allocated in the blank space.
-            let mut last_freed_page = 0;
+            // Copy the current bookkeeping page to a newly allocated page.
+            let mut current_page = try!(self.alloc_page());
+            if self.current_list_page.offset != 0 {
+                // If there was at least one bookkeeping page before.
+                println!("commit: realloc BK, copy {:?}", self.current_list_position);
+                copy_nonoverlapping(self.current_list_page.data as *const u64,
+                                    current_page.data as *mut u64,
+                                    2 + self.current_list_position as usize);
+                *((current_page.data as *mut u64).offset(1)) = self.current_list_position.to_le();
+
+                // and free the previous current bookkeeping page.
+                println!("freeing BK page {:?}", self.current_list_page.offset);
+                self.free_pages.push(self.current_list_page.offset);
+
+            } else {
+                // Else, init the page.
+                *(current_page.data as *mut u64) = 0; // previous page: none
+                *((current_page.data as *mut u64).offset(1)) = 0; // len: 0
+            }
 
             while !(self.free_pages.is_empty() && self.free_clean_pages.is_empty()) {
                 debug!("commit: pushing");
                 // If page is full, or this is the first page, allocate new page.
-                if current_page.is_null() {
-                    debug!("commit: current is null");
-                    // First page, copy-on-write
-                    let new_page = self.alloc_page().unwrap();
-                    if self.current_list_page.offset != 0 {
-                        debug!("Copying from {} to {}",
-                               self.current_list_page.offset,
-                               new_page.offset);
-                        copy_nonoverlapping(self.current_list_page.data as *const u64,
-                                            new_page.data as *mut u64,
-                                            2 + self.current_list_position as usize);
-                        *((new_page.data as *mut u64).offset(1)) = self.current_list_position
-                                                                       .to_le();
-                        self.free_pages.push(self.current_list_page.offset);
-                        let off = u64::from_le(*(new_page.data as *const u64));
-                        let len = u64::from_le(*((new_page.data as *const u64).offset(1)));
-                        debug!("off={}, len={}", off, len);
-                    } else {
-                        debug!("commit: allocate");
-                        *(new_page.data as *mut u64) = 0; // previous page: none
-                        *((new_page.data as *mut u64).offset(1)) = 0; // len: 0
-                    }
-                    current_page = new_page.data;
-                    current_page_offset = new_page.offset;
+                let len = u64::from_le(*((current_page.data as *const u64).offset(1)));
+                println!("len={:?}", len);
+                if 16 + len * 8 + 8 >= PAGE_SIZE as u64 {
+                    debug!("commit: current is full, len={}", len);
+                    // 8 more bytes wouldn't fit in this page, time to allocate a new one
+
+                    let p = self.free_pages
+                        .pop()
+                        .unwrap_or_else(|| self.free_clean_pages.pop().unwrap());
+
+                    let new_page =
+                        MutPage {
+                            data: self.env.map.offset(p as isize),
+                            offset: p,
+                        };
+
+                    println!("commit {} allocated {:?}", line!(), new_page.offset);
+                    // Write a reference to the current page (which cannot be null).
+                    *(new_page.data as *mut u64) = current_page.offset.to_le();
+                    // Write the length of the new page (0).
+                    *((new_page.data as *mut u64).offset(1)) = 0;
+
+                    current_page = new_page;
                 } else {
-                    debug!("commit: current is not null");
-                    let len = u64::from_le(*((current_page as *const u64).offset(1)));
-                    if len * 8 + 24 > PAGE_SIZE as u64 {
-                        debug!("commit: current is full, len={}", len);
-                        // 8 more bytes wouldn't fit in this page, time to allocate a new one
-                        let new_page = self.alloc_page().unwrap();
-                        // Write a reference to the current page (which cannot be null).
-                        *(new_page.data as *mut u64) = current_page_offset.to_le();
-                        // Write the length of the new page (0).
-                        *((new_page.data as *mut u64).offset(1)) = 0;
+                    // push
+                    let p = self.free_pages
+                        .pop()
+                        .unwrap_or_else(|| self.free_clean_pages.pop().unwrap());
+                    println!("commit: push {}", p);
 
-                        current_page = new_page.data;
-                        current_page_offset = new_page.offset
-                    } else {
-                        // push
-                        let p = self.free_pages
-                                    .pop()
-                                    .unwrap_or_else(|| self.free_clean_pages.pop().unwrap());
-                        debug!("commit: push {}", p);
-                        // This is one of the pages freed by this transaction.
-                        last_freed_page = max(p, last_freed_page);
-
-                        *((current_page as *mut u64).offset(1)) = (len + 1).to_le(); // increase length.
-                        *((current_page as *mut u64).offset(2 + len as isize)) = p.to_le(); // write pointer.
-                    }
+                    *((current_page.data as *mut u64).offset(1)) = (len + 1).to_le(); // increase length.
+                    *((current_page.data as *mut u64).offset(2 + len as isize)) = p.to_le(); // write pointer.
                 }
             }
             // Take lock
@@ -567,16 +562,16 @@ impl<'env> Commit for MutTxn<'env,()> {
                 debug!("commit: taking file lock");
                 self.env.lock_file.lock_exclusive().unwrap();
                 debug!("commit: lock ok");
-                *(self.env.map as *mut u64) = self.last_page.to_le();
-                *((self.env.map as *mut u64).offset(1)) = current_page_offset.to_le();
                 for (u, v) in self.roots.iter() {
                     *((self.env.map.offset(ZERO_HEADER) as *mut u64).offset(*u as isize)) = (*v).to_le();
                 }
-
                 // synchronize all maps. Since PAGE_SIZE is not always
                 // an actual page size, we flush the first two pages
                 // last, instead of just the last one.
                 try!(self.env.mmap.flush_range(2*PAGE_SIZE, (self.env.length - 2*PAGE_SIZE_64) as usize));
+
+                *(self.env.map as *mut u64) = self.last_page.to_le();
+                *((self.env.map as *mut u64).offset(1)) = current_page.offset.to_le();
                 try!(self.env.mmap.flush_range(0, 2*PAGE_SIZE));
                 self.env.lock_file.unlock().unwrap();
                 Ok(())

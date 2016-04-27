@@ -734,6 +734,9 @@ mod tests {
     pub fn leakproof_put(env:&Env, n_insertions:usize, value_size:usize) -> () {
         extern crate rand;
         use rand::Rng;
+        extern crate env_logger;
+
+        env_logger::init().unwrap_or(());
 
         let mut rng = rand::thread_rng();
 
@@ -802,16 +805,18 @@ mod tests {
             let mut txn = env.mut_txn_begin();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.del(&mut rng, &mut db, k.as_bytes(), Some(v.as_bytes())).unwrap();
-            txn.debug(&db, format!("/tmp/after_{}",i), false, false);
+            //txn.debug(&db, format!("/tmp/after_{}",i), false, false);
             txn.set_root(0, db);
             txn.commit().unwrap();
+            env.statistics();
+            check_memory(&env, false);
             i+=1;
         }
     }
 
     
     #[cfg(test)]
-    fn check_memory(env:&Env) {
+    fn check_memory(env:&Env, print:bool) {
         use std::collections::{HashSet};
         use super::txn::{Page,LoadPage,P, read_key_value, UnsafeValue};
 
@@ -830,8 +835,8 @@ mod tests {
                         }
                         if current > 0 {
                             let (_,value) = read_key_value(page.offset(current as isize));
-                            if let UnsafeValue::O { offset,.. } = value {
-                                count_values(txn, offset, value_pages);
+                            if let UnsafeValue::O { offset, len } = value {
+                                count_values(txn, offset, len, value_pages);
                             }
                         }
                         current = u16::from_le(*(page.offset(current as isize) as *const u16));
@@ -839,14 +844,18 @@ mod tests {
                 }
             }
         }
-        fn count_values(txn:&Txn, offset:u64, pages:&mut HashSet<u64>) {
-            let mut current = offset;
-            while current != 0 {
-                debug!("current = {:?}", current);
-                pages.insert(current);
-                let p = txn.load_page(current);
-                unsafe {
-                    current = u64::from_le(*(p.offset(0) as *const u64));
+        fn count_values(txn:&Txn, mut offset:u64, mut len:u32, pages:&mut HashSet<u64>) {
+            loop {
+                //println!("current offset = {:?}", offset);
+                pages.insert(offset);
+                if len <= super::transaction::PAGE_SIZE as u32 {
+                    break
+                } else {
+                    let p = txn.load_page(offset);
+                    unsafe {
+                        offset = u64::from_le(*(p.offset(0) as *const u64));
+                    }
+                    len -= (super::transaction::PAGE_SIZE-8) as u32
                 }
             }
         }
@@ -863,22 +872,26 @@ mod tests {
 
         // Check that no page is referenced/free and bookkeeping at the same time.
         for i in statistics.bookkeeping_pages.iter() {
+            if !(used_pages.contains(i) && value_pages.contains(i) && statistics.free_pages.contains(i)) {
+                println!("i={:?}", i)
+            }
             assert!(! used_pages.contains(i));
             assert!(! value_pages.contains(i));
             assert!(! statistics.free_pages.contains(i));
         }
+        if print {
+            println!("env statistics: {:?}", env.statistics());
+            println!("counted pages: {:?}", used_pages);
+            println!("value pages: {:?}", value_pages);
 
-        println!("env statistics: {:?}", env.statistics());
-        println!("counted pages: {:?}", used_pages);
-        println!("value pages: {:?}", value_pages);
-
-        println!("total: {:?}, counted: {:?}",
-                 (statistics.total_pages as usize),
-                 1
-                 + statistics.bookkeeping_pages.len()
-                 + statistics.free_pages.len()
-                 + used_pages.len()
-                 + value_pages.len());
+            println!("total: {:?}, counted: {:?}",
+                     (statistics.total_pages as usize),
+                     1
+                     + statistics.bookkeeping_pages.len()
+                     + statistics.free_pages.len()
+                     + used_pages.len()
+                     + value_pages.len());
+        }
         let mut leaking = Vec::new();
         let mut p = 4096;
         while p < statistics.total_pages*4096 {
@@ -910,7 +923,7 @@ mod tests {
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        check_memory(&env);
+        check_memory(&env, true);
     }
 
     #[test]
@@ -918,12 +931,12 @@ mod tests {
         extern crate tempdir;
         let dir = tempdir::TempDir::new("pijul").unwrap();
 
-        let n_insertions = 1000;
+        let n_insertions = 100;
         let value_size = 1200;
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        check_memory(&env);
+        check_memory(&env, true);
     }
 
     #[test]
@@ -936,7 +949,7 @@ mod tests {
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        check_memory(&env);
+        check_memory(&env, true);
     }
 
     #[test]
@@ -944,13 +957,13 @@ mod tests {
         extern crate tempdir;
         let dir = tempdir::TempDir::new("pijul").unwrap();
 
-        let n_insertions = 500;
+        let n_insertions = 1000;
         let value_size = 400;
 
         let env = Env::new(dir.path(), 5000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, value_size);
         println!("checking");
-        check_memory(&env);
+        check_memory(&env, true);
     }
 
     #[test]
@@ -964,7 +977,7 @@ mod tests {
         let env = Env::new(dir.path(), 10000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, value_size);
         println!("checking");
-        check_memory(&env);
+        check_memory(&env, true);
     }
 
     #[test]
@@ -978,7 +991,7 @@ mod tests {
         let env = Env::new(dir.path(), 10000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, value_size);
         println!("checking");
-        check_memory(&env);
+        check_memory(&env, true);
     }
 
 }
