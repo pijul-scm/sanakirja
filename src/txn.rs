@@ -70,6 +70,7 @@ impl<'env,T> MutTxn<'env,T> {
     #[doc(hidden)]
     pub fn alloc_page(&mut self) -> Result<MutPage,transaction::Error> {
         let page = try!(self.txn.alloc_page());
+        // debug!("txn.alloc_page: {:?}", page.offset);
         Ok(MutPage { page: page })
     }
     #[doc(hidden)]
@@ -115,15 +116,19 @@ pub enum UnsafeValue {
 }
 
 /// Iterator over parts of a value. On values of size at most 1024 bytes, the iterator will run exactly once. On larger values, it returns all parts of the value, in order.
-pub struct Value<'a,T:'a> {
-    #[doc(hidden)]
-    pub txn:Option<&'a T>,
-    #[doc(hidden)]
-    pub value:UnsafeValue
+#[derive(Clone)]
+pub enum Value<'a,T:'a> {
+    S { p:*const u8,
+        len:u32 },
+    O { txn:&'a T,
+        offset: u64,
+        len: u32 }
 }
+
 impl <'a,T:LoadPage>fmt::Debug for Value<'a,T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let it = Value { txn:self.txn, value:self.value.clone() };
+        // let it = Value { txn:self.txn, value:self.value.clone() };
+        let it:Value<_> = self.clone();
         try!(write!(f,"Value {{ value: ["));
         let mut first = true;
         for x in it {
@@ -141,22 +146,22 @@ impl <'a,T:LoadPage>fmt::Debug for Value<'a,T> {
 impl <'a,T:LoadPage> Iterator for Value<'a,T> {
     type Item = &'a [u8];
     fn next(&mut self)->Option<&'a [u8]> {
-        match self.value {
-            UnsafeValue::O { ref mut offset, ref mut len } => {
+        match self {
+            &mut Value::O { ref txn, ref mut offset, ref mut len } => {
                 debug!("iterator: {:?}, {:?}", offset, len);
                 if *len == 0 {
                     None
                 } else {
                     if *len <= PAGE_SIZE as u32 {
                         unsafe {
-                            let page = self.txn.unwrap().load_page(*offset).offset(0);
+                            let page = txn.load_page(*offset).offset(0);
                             let slice=std::slice::from_raw_parts(page.offset(0), *len as usize);
                             *len = 0;
                             Some(slice)
                         }
                     } else {
                         unsafe {
-                            let page = self.txn.unwrap().load_page(*offset).offset(0);
+                            let page = txn.load_page(*offset).offset(0);
                             // change the pointer of "current page" to the next page
                             *offset = u64::from_le(*(page as *const u64));
                             *len -= (PAGE_SIZE-VALUE_HEADER_LEN) as u32;
@@ -165,7 +170,7 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
                     }
                 }
             },
-            UnsafeValue::S{ref mut p,ref mut len} => {
+            &mut Value::S{ref mut p,ref mut len} => {
                 if (*p).is_null() {
                     None
                 } else {
@@ -201,13 +206,28 @@ impl UnsafeValue {
 }
 impl<'a,T> Value<'a,T> {
     pub fn len(&self) -> u32 {
-        self.value.len()
+        match self {
+            &Value::S{len,..} => len,
+            &Value::O{len,..} => len,
+        }
     }
+
     pub fn clone(&self) -> Value<'a,T> {
-        Value { txn:self.txn, value: self.value.clone() }
+        match self {
+            &Value::S{ref p, ref len} => Value::S { len:*len, p:*p },
+            &Value::O{ref offset, ref len, ref txn} => Value::O { len:*len, offset:*offset, txn:*txn },
+        }
+    }
+
+    pub unsafe fn from_unsafe(u:&UnsafeValue, txn: &'a T) -> Value<'a,T> {
+        match u {
+            &UnsafeValue::S{ref p, ref len} => Value::S { len:*len, p:*p },
+            &UnsafeValue::O{ref offset, ref len} => Value::O { len:*len, offset:*offset, txn:txn },
+        }
     }
     pub fn from_slice(slice:&'a[u8]) -> Value<'a,T> {
-        Value { txn: None, value: UnsafeValue::S { p:slice.as_ptr(), len:slice.len() as u32 } }
+        Value::S { p:slice.as_ptr(), len:slice.len() as u32 }
+        // Value { txn: None, value: UnsafeValue::S { p:slice.as_ptr(), len:slice.len() as u32 } }
     }
 }
 
@@ -306,13 +326,13 @@ pub trait LoadPage:Sized {
                     let next_ptr = page.offset(next as isize);
                     let (next_key,next_value) = read_key_value(next_ptr);
                     /*println!("cmp {:?} {:?}",
-                             std::str::from_utf8_unchecked(key),
-                             std::str::from_utf8_unchecked(next_key));*/
+                    std::str::from_utf8_unchecked(key),
+                    std::str::from_utf8_unchecked(next_key));*/
                     match key.cmp(next_key) {
                         Ordering::Less => break,
                         Ordering::Equal =>
                             if let Some(value) = value {
-                                match (Value{txn:Some(self),value:value}).cmp(Value{txn:Some(self),value:next_value}) {
+                                match (Value::from_unsafe(&value, self)).cmp(Value::from_unsafe(&next_value, self)) {
                                     Ordering::Less => break,
                                     Ordering::Equal => {
                                         equal = Some(next_value);
@@ -374,7 +394,7 @@ pub trait LoadPage:Sized {
                             Ordering::Less => break,
                             Ordering::Equal =>
                                 if let Some(value) = value {
-                                    match (Value{txn:Some(self),value:value}).cmp(Value{txn:Some(self),value:next_value}) {
+                                    match (Value::from_unsafe(&value,self)).cmp(Value::from_unsafe(&next_value, self)) {
                                         Ordering::Less => break,
                                         Ordering::Equal => break,
                                         Ordering::Greater => {
@@ -416,7 +436,7 @@ pub trait LoadPage:Sized {
             state = Iterate::Started;
             // On the first time, the "current" entry must not be included.
             let (key,value) = read_key_value(current as *const u8);
-            let continue_ = f(key,Value{ txn:Some(self), value:value });
+            let continue_ = f(key,Value::from_unsafe(&value, self));
             if ! continue_ {
                 state = Iterate::Finished;
                 break
@@ -459,7 +479,7 @@ pub trait LoadPage:Sized {
                                 Ordering::Less => break,
                                 Ordering::Equal =>
                                     if let Some(value) = value {
-                                        match (Value{txn:Some(self),value:value}).cmp(Value{txn:Some(self),value:next_value}) {
+                                        match (Value::from_unsafe(&value, self)).cmp(Value::from_unsafe(&next_value, self)) {
                                             Ordering::Less => break,
                                             Ordering::Equal => break,
                                             Ordering::Greater => {
@@ -534,7 +554,7 @@ impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a,'b,T> {
                     // Now, return the current element. If we're inside the page, there's an element to return.
                     if current_off > FIRST_HEAD {
                         let (key,value) = read_key_value(current as *const u8);
-                        Some((key, Value { txn:Some(self.txn), value:value }))
+                        Some((key, Value::from_unsafe(&value, self.txn)))
                     } else {
                         // Else, we're at the beginning of the page,
                         // the element is either in the page we just
@@ -861,11 +881,11 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
                             key.to_string()
                         };
                     let value = {
-                        if let UnsafeValue::O { ref offset, ref len } = value {
+                        if let UnsafeValue::O { ref offset, .. } = value {
                             format!("{:?}", offset)
                         } else {
                             let mut value_=Vec::new();
-                            let mut value = Value { value:value, txn:Some(txn) };
+                            let mut value = Value::from_unsafe(&value, txn);
                             if values_hex {
                                 for i in value {
                                     value_.extend(i)

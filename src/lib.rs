@@ -226,7 +226,7 @@ pub trait Transaction:LoadPage {
         unsafe {
             let page = self.load_page(db.root);
             let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
-            self.get_(page, key, value).map(|x| Value { txn:Some(self), value:x })
+            self.get_(page, key, value).map(|x| Value::from_unsafe(&x, self))
         }
     }
 

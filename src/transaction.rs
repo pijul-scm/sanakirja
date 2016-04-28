@@ -26,8 +26,6 @@ use std;
 use std::sync::{RwLock, RwLockReadGuard, Mutex, MutexGuard};
 use std::ptr::copy_nonoverlapping;
 use std::collections::{HashSet,HashMap};
-use std::cmp::max;
-// use std::marker::PhantomData;
 use fs2::FileExt;
 use std::fs::{File,OpenOptions};
 use std::path::Path;
@@ -182,17 +180,13 @@ impl Env {
             guard: read,
         }
     }
-    fn read_map_header(&self) -> (u64, u64) {
-        unsafe {
-            let last_page = u64::from_le(*(self.map as *const u64));
-            let current_list_page = u64::from_le(*((self.map as *const u64).offset(1)));
-            (last_page, current_list_page)
-        }
-    }
+
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
     pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env,()> {
         unsafe {
-            let (last_page, current_list_page) = self.read_map_header();
+            let last_page = u64::from_le(*(self.map as *const u64));
+            let current_list_page = u64::from_le(*((self.map as *const u64).offset(1)));
+
             debug!("map header = {:?}, {:?}", last_page ,current_list_page);
             let guard = self.mutable.lock().unwrap();
             debug!("taking file lock");
@@ -222,13 +216,13 @@ impl Env {
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
-                roots: HashMap::new(), // u64::from_le(*(self.map.offset(ZERO_HEADER) as *const u64)),
-                //reference_counts: u64::from_le(*(self.map.offset(ZERO_HEADER + 8) as *const u64))
+                roots: HashMap::new(),
             }
         }
     }
 
     /// Compute statistics about pages. This is a potentially costlty operation, as we need to go through all bookkeeping pages.
+    #[cfg(debug_assertions)]
     pub fn statistics(&self) -> Statistics {
         unsafe {
             let total_pages = u64::from_le(*(self.map as *const u64)) as usize;
@@ -391,36 +385,37 @@ impl<'env,T> MutTxn<'env,T> {
 
     /// Pop a free page from the list of free pages.
     fn free_pages_pop(&mut self) -> Option<u64> {
-        unsafe {
-            debug!("free_pages_pop, current_list_position:{}",
-                   self.current_list_position);
-            if self.current_list_page.offset == 0 {
-                None
-            } else {
-                if self.current_list_position == 0 {
-                    let previous_page = u64::from_le(*(self.current_list_page.data as *const u64));
-                    debug!("free_pages_pop, previous page:{}", previous_page);
-                    if previous_page == 0 {
-                        None
-                    } else {
-                        // free page (i.e. push to the list of old
-                        // free pages), move to previous bookkeeping
-                        // pages, and call recursively.
-                        self.free_pages.push(self.current_list_page.offset);
+        debug!("free_pages_pop, current_list_position:{}",
+               self.current_list_position);
+        if self.current_list_page.offset == 0 {
+            None
+        } else {
+            if self.current_list_position == 0 {
+                let previous_page = unsafe { u64::from_le(*(self.current_list_page.data as *const u64)) };
+                debug!("free_pages_pop, previous page:{}", previous_page);
+                if previous_page == 0 {
+                    None
+                } else {
+                    // free page (i.e. push to the list of old
+                    // free pages), move to previous bookkeeping
+                    // pages, and call recursively.
+                    self.free_pages.push(self.current_list_page.offset);
+                    unsafe {
                         self.current_list_page = Page {
                             data: self.env.map.offset(previous_page as isize),
                             offset: previous_page,
                         };
-                        self.current_list_length =
-                            u64::from_le(*((self.current_list_page.data as *const u64).offset(1)));
-                        self.current_list_position = self.current_list_length;
-                        self.free_pages_pop()
+                        self.current_list_length = u64::from_le(*((self.current_list_page.data as *const u64).offset(1)))
                     }
-                } else {
-                    let pos = self.current_list_position;
-                    // find the page at the top.
-                    self.current_list_position -= 1;
-                    debug!("free_pages_pop, new position:{}", self.current_list_position);
+                    self.current_list_position = self.current_list_length;
+                    self.free_pages_pop()
+                }
+            } else {
+                let pos = self.current_list_position;
+                // find the page at the top.
+                self.current_list_position -= 1;
+                debug!("free_pages_pop, new position:{}", self.current_list_position);
+                unsafe {
                     Some(u64::from_le(*((self.current_list_page.data as *mut u64).offset(1 + pos as isize))))
                 }
             }

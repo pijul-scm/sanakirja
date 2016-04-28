@@ -343,6 +343,9 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
             // No page below, but we can delete something here.
             if comp.is_smallest() {
                 let mut new_levels = [0;N_LEVELS];
+                // Here's an important step: we first copy the page
+                // *without forgetting the value*, so that we can copy
+                // it back in the parent.
                 let mut page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false, false));
 
                 let cur_ptr = page.offset(new_levels[0] as isize) as *const u16;
@@ -354,7 +357,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
                 let (next_key,next_value) = read_key_value(next_ptr);
 
                 let page_offset = page.page_offset();
-                let underfull = try!(local_delete_at(rng, txn, &mut page, &new_levels, true));
+                let underfull = try!(local_delete_at(&mut page, &new_levels, true));
                 debug!("smallest free page:{:?}", page_offset);
                 Ok((Res::Ok { page:page, underfull:underfull },
                     Some(Smallest {
@@ -510,7 +513,7 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
 /// Adjusts the pointers on a page to skip the next value. if argument
 /// `value_must_be_freed` is `true`, also free the large values pages
 /// referenced from this page.
-unsafe fn local_delete_at<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:&mut MutPage, levels:&[u16], value_must_be_freed:bool) -> Result<bool,Error> {
+unsafe fn local_delete_at(page:&mut MutPage, levels:&[u16], value_must_be_freed:bool) -> Result<bool,Error> {
     let mut page_becomes_underoccupied = false;
 
     let next_off_0 = {
@@ -531,7 +534,7 @@ unsafe fn local_delete_at<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:&mut Mut
                 // decrement its reference counter.
                 let (key,value) = read_key_value(next as *const u8);
                 if value_must_be_freed {
-                    if let UnsafeValue::O { offset, len } = value {
+                    if let UnsafeValue::O { offset, .. } = value {
                         debug!("found value, freeing {:?}", offset);
                         // try!(free_value(rng,txn,offset,len))
                     }
@@ -614,7 +617,7 @@ unsafe fn replace_with_smallest<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
                 debug!("replace_with_smallest, no copy");
                 // No need to copy, we can just delete in place.
                 let mut page = try!(cow_pinpointing(rng, txn, page, levels, new_levels, false, false));
-                try!(local_delete_at(rng, txn, &mut page, new_levels, value_must_be_freed));
+                try!(local_delete_at(&mut page, new_levels, value_must_be_freed));
                 debug_assert!(off+size < PAGE_SIZE as u16);
                 local_insert_at(rng, &mut page, key_, value_, child, off, size, new_levels);
 
@@ -671,7 +674,7 @@ unsafe fn insert_in_res<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, result: Res, l
                     Ordering::Less => true,
                     Ordering::Greater => false,
                     Ordering::Equal => {
-                        let ord = (Value { txn:Some(txn), value:value }).cmp(Value { txn:Some(txn), value:value_ });
+                        let ord = (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&value_, txn));
                         ord == Ordering::Less || ord == Ordering::Equal
                     }
                 };
@@ -702,9 +705,52 @@ unsafe fn insert_in_res<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, result: Res, l
 
 }
 
+pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value:Option<&[u8]>)->Result<bool,Error> {
+
+    assert!(key.len() < MAX_KEY_SIZE);
+    let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
+
+    let comp = if let Some(value) = value {
+        C::KV { key: key,
+                value: UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 } }
+    } else {
+        C::K { key:key }
+    };
+    unsafe {
+        debug!("root: {:?}", root_page);
+        match try!(delete(rng,txn, root_page, comp)) {
+            (Res::Ok { page, .. }, None) => {
+                // Maybe the root is empty. Check
+                let next = u16::from_le(*(page.offset(FIRST_HEAD as isize) as *const u16));
+                let next_page = u64::from_le(*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
+                if next == NIL && next_page != 0 {
+                    db.root = next_page;
+                    try!(free(rng, txn, page.page_offset(), false));
+                } else {
+                    db.root = page.page_offset();
+                }
+                Ok(true)
+            },
+            (Res::Nothing { .. }, None) => {
+                Ok(false)
+            },
+            (x,_) => {
+                db.root = try!(root_split(rng,txn,x)).page_offset();
+                Ok(true)
+            }
+        }
+    }
+
+}
+
+pub fn replace<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], value: &[u8])->Result<(),Error> {
+    try!(del(rng,txn,db,key,None));
+    try!(put(rng,txn,db,key,value));
+    Ok(())
+}
 
 
-
+///////////////////////////////////////////////////////////// Tests
 
 #[test]
 fn test_delete_leaf() {
@@ -1007,53 +1053,4 @@ fn test_delete_all_large() {
 #[test]
 fn test_delete_all_really_large() {
     test_delete_all(200, 200, 10000, Sorted::No)
-}
-
-
-
-
-
-
-pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value:Option<&[u8]>)->Result<bool,Error> {
-
-    assert!(key.len() < MAX_KEY_SIZE);
-    let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
-
-    let comp = if let Some(value) = value {
-        C::KV { key: key,
-                value: UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 } }
-    } else {
-        C::K { key:key }
-    };
-    unsafe {
-        debug!("root: {:?}", root_page);
-        match try!(delete(rng,txn, root_page, comp)) {
-            (Res::Ok { page, .. }, None) => {
-                // Maybe the root is empty. Check
-                let next = u16::from_le(*(page.offset(FIRST_HEAD as isize) as *const u16));
-                let next_page = u64::from_le(*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
-                if next == NIL && next_page != 0 {
-                    db.root = next_page;
-                    try!(free(rng, txn, page.page_offset(), false));
-                } else {
-                    db.root = page.page_offset();
-                }
-                Ok(true)
-            },
-            (Res::Nothing { .. }, None) => {
-                Ok(false)
-            },
-            (x,_) => {
-                db.root = try!(root_split(rng,txn,x)).page_offset();
-                Ok(true)
-            }
-        }
-    }
-
-}
-
-pub fn replace<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], value: &[u8])->Result<(),Error> {
-    try!(del(rng,txn,db,key,None));
-    try!(put(rng,txn,db,key,value));
-    Ok(())
 }

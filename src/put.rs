@@ -104,38 +104,36 @@ pub fn get_rc<T>(txn:&mut MutTxn<T>, off:u64) -> u64 {
 /// Decrease the reference count of a page, freeing it if it's no longer referenced.
 pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool) -> Result<(),Error> {
     //println!("freeing {:?}", off);
-    unsafe {
-        let really_free = {
-            if let Some(mut rc) = txn.rc() {
-                if let Some(count) = txn.get_u64(&rc, off) {
-                    if count>1 {
-                        debug!("rc: {:?}, off: {:?}, count: {:?}", rc, off, rc);
-                        try!(txn.replace_u64(rng, &mut rc, off, count-1));
-                        txn.set_rc(rc);
-                        false
-                    } else {
-                        try!(txn.del_u64(rng,&mut rc,off));
-                        txn.set_rc(rc);
-                        true
-                    }
+    let really_free = {
+        if let Some(mut rc) = txn.rc() {
+            if let Some(count) = txn.get_u64(&rc, off) {
+                if count>1 {
+                    debug!("rc: {:?}, off: {:?}, count: {:?}", rc, off, rc);
+                    try!(txn.replace_u64(rng, &mut rc, off, count-1));
+                    txn.set_rc(rc);
+                    false
                 } else {
+                    try!(txn.del_u64(rng,&mut rc,off));
+                    txn.set_rc(rc);
                     true
                 }
             } else {
                 true
             }
-        };
-        if really_free {
-            if free_children {
-                let p = txn.load_cow_page(off);
-                for (_,_,_,r) in PI::new(&p) {
-                    try!(free(rng, txn, r, true))
-                }
-            }
-            transaction::free(&mut txn.txn, off);
+        } else {
+            true
         }
-        Ok(())
+    };
+    if really_free {
+        if free_children {
+            let p = txn.load_cow_page(off);
+            for (_,_,_,r) in PI::new(&p) {
+                try!(free(rng, txn, r, true))
+            }
+        }
+        unsafe { transaction::free(&mut txn.txn, off) }
     }
+    Ok(())
 }
 
 
@@ -450,7 +448,7 @@ pub unsafe fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], 
                     Ordering::Less => break,
                     Ordering::Equal =>
                         if let Some(value) = value {
-                            match (Value{txn:Some(txn),value:value}).cmp(Value{txn:Some(txn),value:next_value}) {
+                            match (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) {
                                 Ordering::Less => break,
                                 Ordering::Equal => {
                                     *eq = true;
@@ -705,7 +703,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                         Ordering::Less => true,
                         Ordering::Greater => false,
                         Ordering::Equal =>
-                            match (Value { txn:Some(txn), value:value }).cmp(Value { txn:Some(txn), value:value_ }) {
+                            match (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&value_, txn)) {
                                 Ordering::Less | Ordering::Equal => true,
                                 Ordering::Greater => false
                             }
@@ -808,7 +806,7 @@ pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], va
         } else {
             UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
         };
-        debug!("value = {:?}", Value { txn:Some(txn),value:value });
+        debug!("value = {:?}", Value::from_unsafe(&value, txn));
         match try!(insert(rng, txn, root_page, key, value, 0)) {
             Res::Nothing { .. } => Ok(false),
             Res::Ok { page,.. } => { db.root = page.page_offset(); Ok(true) }
