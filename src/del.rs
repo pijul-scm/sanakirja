@@ -185,10 +185,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
         // Finally, delete the middle element, and update its right child.
         let mut new_levels = [0;N_LEVELS];
         // We don't need to free the value associated to the middle element, since we reinserted it below.
-        let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false, 0));
-
-        *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = right_child.page_offset().to_le();
-
+        let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false, right_child.page_offset()));
 
         if !keep_left {
             debug!("freeing left: {:?}", left_child.page_offset());
@@ -264,8 +261,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
         let result = {
             let mut new_levels = [0;N_LEVELS];
             // Delete the current entry, insert the new one instead.
-            let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false, 0));
-            *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = new_left.page_offset().to_le();
+            let page = try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false, new_left.page_offset()));
 
             if let Some((key_ptr,key_len,value,r)) = middle {
 
@@ -477,9 +473,8 @@ unsafe fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> 
             debug!("ok, back to page {:?} with child {:?}", page.page_offset(), child_page.page_offset());
             // Update the pointer here
             let mut new_levels = [0;N_LEVELS];
-            let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false, false, 0));
+            let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false, false, child_page.page_offset()));
 
-            write_right_child(&page, new_levels[0], child_page.page_offset());
             // *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = child_page.page_offset().to_le();
             if underfull {
                 let keep_left = if let Some(ref smallest)=smallest {
