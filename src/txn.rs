@@ -78,15 +78,6 @@ impl<'env,T> MutTxn<'env,T> {
         Cow { cow: self.txn.load_cow_page(off) }
     }
     #[doc(hidden)]
-    pub fn rc(&self) -> Option<Db> {
-        let rc = self.txn.root(REFERENCE_COUNTS);
-        if rc == 0 {
-            None
-        } else {
-            Some(Db { root_num:REFERENCE_COUNTS, root: rc })
-        }
-    }
-    #[doc(hidden)]
     pub fn set_rc(&mut self, db:Db) {
         self.txn.set_root(REFERENCE_COUNTS, db.root)
     }
@@ -94,7 +85,7 @@ impl<'env,T> MutTxn<'env,T> {
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
-    pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P, keys_hex:bool, values_hex:bool) {
+    pub fn debug<P: AsRef<Path>>(&self, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
         debug(self, db, p, keys_hex, values_hex)
     }
 }
@@ -102,7 +93,7 @@ impl<'env,T> MutTxn<'env,T> {
 impl<'env> Txn<'env> {
     #[cfg(debug_assertions)]
     #[doc(hidden)]
-    pub fn debug<P: AsRef<Path>>(&self, db: &Db, p: P, keys_hex:bool, values_hex:bool) {
+    pub fn debug<P: AsRef<Path>>(&self, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
         debug(self, db, p, keys_hex, values_hex)
     }
 }
@@ -516,6 +507,7 @@ pub trait LoadPage:Sized {
         Iter { txn:self,page_stack:page_stack }
     }
     
+    fn rc(&self) -> Option<Db>;
 }
 
 pub struct Iter<'a, 'b, T:'a> {
@@ -794,6 +786,15 @@ impl<'env,T> LoadPage for MutTxn<'env,T> {
     fn load_page(&self, off: u64) -> Page {
         Page { page: self.txn.load_page(off) }
     }
+
+    fn rc(&self) -> Option<Db> {
+        let rc = self.txn.root(REFERENCE_COUNTS);
+        if rc == 0 {
+            None
+        } else {
+            Some(Db { root_num:REFERENCE_COUNTS, root: rc })
+        }
+    }
 }
 impl<'env> LoadPage for Txn<'env> {
     fn length(&self) -> u64 {
@@ -810,11 +811,19 @@ impl<'env> LoadPage for Txn<'env> {
     fn load_page(&self, off: u64) -> Page {
         Page { page: self.txn.load_page(off) }
     }
+
+    fn rc(&self) -> Option<Db> {
+        let rc = self.txn.root(REFERENCE_COUNTS);
+        if rc == 0 {
+            None
+        } else {
+            Some(Db { root_num:REFERENCE_COUNTS, root: rc })
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
-fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, values_hex:bool) {
-    let page = t.load_page(db.root);
+fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
     let f = File::create(p.as_ref()).unwrap();
     let mut buf = BufWriter::new(f);
     writeln!(&mut buf, "digraph{{").unwrap();
@@ -828,12 +837,21 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
         if !pages.contains(&p.page.offset) {
             pages.insert(p.page.offset);
             if print_children {
+                
+                let rc = if let Some(rc) = txn.rc() {
+                    txn.get_u64(&rc, p.page.offset).unwrap_or(1)
+                } else {
+                    0
+                };
+
                 writeln!(buf,
-                         "subgraph cluster{} {{\nlabel=\"Page {}, first_free {}, occupied {}\";\ncolor=black;",
+                         "subgraph cluster{} {{\nlabel=\"Page {}, first_free {}, occupied {}, rc {}\";\ncolor=black;",
                          p.page.offset,
                          p.page.offset,
                          p.first_free(),
-                         p.occupied())
+                         p.occupied(),
+                         rc
+                )
                     .unwrap();
             }
             let root = FIRST_HEAD;
@@ -948,7 +966,10 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &Db, p: P, keys_hex:bool, value
             //debug!("/print tree:{:?}",p);
         }
     }
-    print_page(t, keys_hex, values_hex, &mut h, &mut buf, &page, true /* print children */);
+    for db in db {
+        let page = t.load_page(db.root);
+        print_page(t, keys_hex, values_hex, &mut h, &mut buf, &page, true /* print children */);
+    }
     writeln!(&mut buf, "}}").unwrap();
 }
 

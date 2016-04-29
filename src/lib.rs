@@ -140,7 +140,8 @@ impl<'env,T> MutTxn<'env,T> {
 
     /// Produce an independent fork of a database. This method copies at most one block, and uses reference-counting on child blocks. The two databases share their bindings at the time of the fork, and can safely be considered separate databases after the fork.
     pub fn fork_db<R:Rng>(&mut self, rng:&mut R, db:&Db) -> Result<Db,Error> {
-        Ok(Db { root_num:-1, root: try!(put::fork_db(rng, self, db.root)) })
+        try!(put::fork_db(rng, self, db.root));
+        Ok(Db { root_num:-1, root: db.root })
     }
 
     /// Specialized version of ```put``` to register the name of a database. Argument ```db``` can be the root database (as in LMDB) or any other database.
@@ -398,7 +399,7 @@ mod tests {
             println!("putting {:?}", i);
 
             txn.put(&mut rng, &mut root, k.as_bytes(), v.as_bytes()).unwrap();
-            txn.debug(&root, format!("/tmp/debug_{}",i), false, false);
+            txn.debug(&[&root], format!("/tmp/debug_{}",i), false, false);
             bindings.push((k,v));
         }
         println!("now deleting");
@@ -414,7 +415,7 @@ mod tests {
             }
             i+=1;
         }        
-        txn.debug(&root, format!("/tmp/debug_{}",i), false, false);
+        txn.debug(&[&root], format!("/tmp/debug_{}",i), false, false);
         //println!("{:?}",bindings.len());
         txn.set_root(0, root);
         txn.commit().unwrap();
@@ -742,7 +743,8 @@ mod tests {
 
         let key_len = 50;
 
-        for _ in 0..n_insertions {
+        for i in 0..n_insertions {
+            println!("i={:?}", i);
 
             let k0: String = rand::thread_rng()
                 .gen_ascii_chars()
@@ -757,6 +759,7 @@ mod tests {
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes()).unwrap();
 
+            txn.debug(&[&db], format!("/tmp/before_{}",i), false, false);
             txn.set_root(0, db);
             txn.commit().unwrap();
         }
@@ -779,8 +782,8 @@ mod tests {
 
         let key_len = 50;
 
-        for _ in 0..n_insertions {
-
+        for i in 0..n_insertions {
+            println!("i={:?}", i);
             let k0: String = rand::thread_rng()
                 .gen_ascii_chars()
                 .take(key_len)
@@ -796,6 +799,7 @@ mod tests {
 
             random.insert(k0,v0);
             
+            txn.debug(&[&db], format!("/tmp/before_{}",i), false, false);
             txn.set_root(0, db);
             txn.commit().unwrap();
         }
@@ -805,7 +809,7 @@ mod tests {
             let mut txn = env.mut_txn_begin();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.del(&mut rng, &mut db, k.as_bytes(), Some(v.as_bytes())).unwrap();
-            //txn.debug(&db, format!("/tmp/after_{}",i), false, false);
+            txn.debug(&[&db], format!("/tmp/after_{}",i), false, false);
             txn.set_root(0, db);
             txn.commit().unwrap();
             env.statistics();
@@ -857,6 +861,7 @@ mod tests {
                     }
                     len -= (super::transaction::PAGE_SIZE-8) as u32
                 }
+                
             }
         }
         let mut used_pages = HashSet::new();
@@ -993,5 +998,127 @@ mod tests {
         println!("checking");
         check_memory(&env, true);
     }
+
+    #[test]
+    fn fork_put_basic() -> ()
+    {
+        extern crate tempdir;
+        extern crate rand;
+        use std;
+        use super::Transaction;
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
+        let mut txn = env.mut_txn_begin();
+        let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
+        println!("root: {:?}", root);
+
+        let common = b"test_key";
+        let common_value = b"blabla";
+
+        let key0 = b"key 0";
+        let key0_value = b"blibli";
+
+        let key1 = b"key 1";
+        let key1_value = b"blublu";
+
+        txn.put(&mut rng, &mut root, common, common_value).unwrap();
+        let mut root2 = txn.fork_db(&mut rng, &root).unwrap();
+        txn.put(&mut rng, &mut root, key0, key0_value).unwrap();
+        txn.put(&mut rng, &mut root2, key1, key1_value).unwrap();
+        txn.set_root(0, root);
+        txn.set_root(1, root2);
+        txn.commit().unwrap();
+        println!("committed");
+
+        let txn = env.txn_begin();
+        let root0 = txn.root(0).unwrap();
+        let root1 = txn.root(1).unwrap();
+
+        assert!(txn.get(&root0, common, None).is_some());
+        assert!(txn.get(&root0, key0, None).is_some());
+        assert!(txn.get(&root0, key1, None).is_none());
+
+        assert!(txn.get(&root1, common, None).is_some());
+        assert!(txn.get(&root1, key0, None).is_none());
+        assert!(txn.get(&root1, key1, None).is_some());
+    }
+
+    #[test]
+    fn fork_put_many() -> ()
+    {
+        extern crate tempdir;
+        extern crate rand;
+        use std;
+        use super::Transaction;
+        use rand::Rng;
+        use std::collections::HashMap;
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
+
+
+        let key_len = 200;
+        let value_len = 200;
+        let n_insertions = 9;
+
+        let mut values0 = HashMap::new();
+        let mut values1 = HashMap::new();
+        
+        let mut txn = env.mut_txn_begin();
+        let mut root0 = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
+
+        for i in 0..n_insertions {
+            println!("i = {:?}", i);
+            let k0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(key_len)
+                .collect();
+            let v0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(value_len)
+                .collect();
+
+            txn.put(&mut rng, &mut root0, k0.as_bytes(), v0.as_bytes()).unwrap();
+            values0.insert(k0.clone(),v0.clone());
+            values1.insert(k0,v0);
+        }
+
+        let mut root1 = txn.fork_db(&mut rng, &root0).unwrap();
+        txn.debug(&[&root0, &root1], format!("/tmp/before"), false, false);
+        for j in 0..10 {
+            println!("j = {:?}", j);
+
+            let k0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(key_len)
+                .collect();
+            let v0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(value_len)
+                .collect();
+
+            if rng.gen() {
+                println!("in 0");
+                txn.put(&mut rng, &mut root0, k0.as_bytes(), v0.as_bytes()).unwrap();
+                values0.insert(k0.clone(),v0.clone());
+            } else {
+                println!("in 1");
+                txn.put(&mut rng, &mut root1, k0.as_bytes(), v0.as_bytes()).unwrap();
+                values1.insert(k0,v0);
+            }
+            txn.debug(&[&root0, &root1], format!("/tmp/after_{}",j), false, false);
+        }
+        txn.debug(&[&root0, &root1], format!("/tmp/forked"), false, false);
+        txn.set_root(0, root0);
+        txn.set_root(1, root1);
+
+
+        txn.commit().unwrap();
+
+
+
+    }
+    
 
 }
