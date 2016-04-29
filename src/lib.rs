@@ -1004,7 +1004,6 @@ mod tests {
     {
         extern crate tempdir;
         extern crate rand;
-        use std;
         use super::Transaction;
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
@@ -1049,7 +1048,6 @@ mod tests {
     {
         extern crate tempdir;
         extern crate rand;
-        use std;
         use super::Transaction;
         use rand::Rng;
         use std::collections::HashMap;

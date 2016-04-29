@@ -201,7 +201,8 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut l
 }
 
 
-
+/// Returns a mutable copy of the page, possibly forgetting the next binding (and then possibly also freeing the associated value), and possibly incrementing the reference counts of child pages.
+/// If translate_right > 0, replaces the next child page by translate_right.
 fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool, forgetting_value:bool, translate_right: u64, rc_children:bool) -> Result<MutPage,Error> {
     unsafe {
         // Reset all pinpoints.
@@ -559,10 +560,9 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                             try!(decr_rc(rng, txn, page.page_offset()))
                         }
                         let page = txn.load_page(page.page_offset());
-                        let page = unsafe {
+                        let page =
                             try!(copy_page(rng, txn, &page, &levels[..], &mut new_levels[..], false, false,
-                                           next_page.page_offset(), true))
-                        };
+                                           next_page.page_offset(), true));
                         Ok(Res::Ok { page: page, underfull: false })
                     }
                 },
@@ -593,15 +593,6 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
     }
 }
 
-pub fn write_right_child(page:&MutPage, offset:u16, right_child:u64) {
-    unsafe {
-        let current = page.offset(offset as isize);
-        *((current as *mut u64).offset(2)) = right_child;
-    }
-}
-
-
-
 unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16], left_page:u64, needs_dup:bool) -> Result<Res, Error> {
     let size = record_size(key.len(), value.len() as usize);
     let mut new_levels = [0;N_LEVELS];
@@ -618,17 +609,15 @@ unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, 
                 } else {
                     // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
 
-                    let mut page = try!(cow_pinpointing(rng, txn, page.as_nonmut(),
-                                                        &levels[..],
-                                                        &mut new_levels[..], false, false,
-                                                        left_page));
+                    let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(),
+                                                    &levels[..],
+                                                    &mut new_levels[..], false, false,
+                                                    left_page));
                     let off = page.can_alloc(size);
                     (page, off)
                 };
-            unsafe {
-                local_insert_at(rng, &mut page, key, value, right_page,
-                                off, size, &mut new_levels[..]);
-            }
+            local_insert_at(rng, &mut page, key, value, right_page,
+                            off, size, &mut new_levels[..]);
             Ok(Res::Ok { page:page, underfull:false })
         } else {
             debug!("splitting, key = {:?}", std::str::from_utf8_unchecked(key));
@@ -645,10 +634,8 @@ unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, 
         if off > 0 {
             let p = txn.load_page(page.page_offset());
             let mut page = try!(copy_page(rng, txn, &p, levels, &mut new_levels, false, false, left_page, false));
-            unsafe {
-                local_insert_at(rng, &mut page, key, value, right_page,
-                                off, size, &mut new_levels[..]);
-            }
+            local_insert_at(rng, &mut page, key, value, right_page,
+                            off, size, &mut new_levels[..]);
             Ok(Res::Ok { page:page, underfull:false })
         } else {
             debug!("splitting, key = {:?}", std::str::from_utf8_unchecked(key));
@@ -680,6 +667,12 @@ pub unsafe fn check_alloc_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
         Alloc::Cannot(page) => {
             Ok(try!(split_page(rng, txn, &page, key, value, right_page, NIL, 0)))
         }
+    }
+}
+pub fn write_right_child(page:&MutPage, offset:u16, right_child:u64) {
+    unsafe {
+        let current = page.offset(offset as isize);
+        *((current as *mut u64).offset(2)) = right_child;
     }
 }
 
