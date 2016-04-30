@@ -255,7 +255,7 @@ pub trait Transaction:LoadPage {
                     db: &Db,
                     key: &[u8],
                     value: Option<&[u8]>,
-                    workspace: &'b mut Vec<(u64,u16)>)->Iter<'a,'b,Self> {
+                    workspace: &'b mut Vec<u64>)->Iter<'a,'b,Self> {
         unsafe {
             let page = self.load_page(db.root);
             let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
@@ -322,7 +322,7 @@ mod tests {
         extern crate rand;
         extern crate rustc_serialize;
         use rand::Rng;
-
+        use std;
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
@@ -350,12 +350,16 @@ mod tests {
         random.sort();
         let txn = env.txn_begin();
         let root = txn.root(0).unwrap();
+        txn.debug(&[&root], "/tmp/iter", false, false);
         let mut ws = Vec::new();
 
         let mut i = 100;
         let (ref k0,ref v0) = random[i];
         for (k,_) in txn.iter(&root, k0.as_bytes(), Some(v0.as_bytes()), &mut ws).take(100) {
             let (ref kk,_) = random[i];
+            println!("{:?} {:?}",
+                     std::str::from_utf8(k).unwrap(),
+                     kk);
             assert!(k == kk.as_bytes());
             i+=1
         }
