@@ -203,6 +203,13 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut l
 
 /// Returns a mutable copy of the page, possibly forgetting the next binding (and then possibly also freeing the associated value), and possibly incrementing the reference counts of child pages.
 /// If translate_right > 0, replaces the next child page by translate_right.
+///
+/// For performance reasons, we don't copy anything on the way to the
+/// leaves, instead copying on the way back.
+///
+/// Therefore, we might need to copy pages without freeing the
+/// previous one, since their reference count is not yet updated.
+///
 fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool, forgetting_value:bool, translate_right: u64, rc_children:bool) -> Result<MutPage,Error> {
     unsafe {
         // Reset all pinpoints.
@@ -344,7 +351,8 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                                 *((p.offset(next_l as isize) as *const u16).offset(l as isize));
                         }
                     }
-                } else if translate_right > 0 {
+                }
+                if translate_right > 0 {
                     // Translate the right page.
                     *((p.offset(old_levels[0] as isize) as *mut u64).offset(2)) = translate_right.to_le();
                 }
@@ -587,7 +595,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
             debug!("inserting here");
             // No child page, insert on this page.
             unsafe {
-                full_local_insert(rng, txn, page, key, value, 0, &mut levels, 0, needs_dup)
+                full_local_insert(rng, txn, page, key, value, right_page, &mut levels, 0, needs_dup)
             }
         }
     }

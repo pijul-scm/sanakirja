@@ -150,7 +150,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
         debug!("merging {:?} and {:?}", left_child.page_offset(), right_child.page_offset());
         // Merge the left page into the right page.
         for (_, key,value,r) in PI::new(&left_child, 0) {
-            debug!("inserting {:?} into {:?}", std::str::from_utf8_unchecked(key), right_child);
+            debug!("inserting {:?} ({:?}) into {:?}", std::str::from_utf8_unchecked(key), r, right_child);
             match try!(insert(rng, txn, right_child, key, value, r, false)) {
                 Res::Ok { page, .. } => right_child = Cow::from_mut_page(page),
                 _ => unreachable!()
@@ -277,7 +277,7 @@ unsafe fn merge<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:&mut 
         };
         debug!("result = {:?}", result);
 
-        // We can safely free the right child. TODO: Causes tests to fail, why?
+        // We can safely free the right child.
         if cfg!(test) {
             match result {
                 Ok(Res::Ok { ref page, .. }) => {
@@ -1033,15 +1033,15 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
 }
 
 #[test]
-fn test_delete_all_sorted_20() {
+fn test_delete_all_sorted_20_() {
     test_delete_all(200, 100, 20, Sorted::Incr)
 }
 #[test]
-fn test_delete_all_decr_20() {
+fn test_delete_all_decr_20_() {
     test_delete_all(200, 100, 20, Sorted::Decr)
 }
 #[test]
-fn test_delete_all_unsorted_20() {
+fn test_delete_all_unsorted_20_() {
     test_delete_all(200, 100, 20, Sorted::No)
 }
 
