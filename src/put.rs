@@ -9,12 +9,11 @@ extern crate log;
 
 #[derive(Debug)]
 pub enum Res {
-    Ok { page: MutPage,
-         // position is the offset in the page where the insertion
-         // happened (cow_pinpointing uses that information to
-         // pinpoint stuff), or in the case of deletions, it is a code
-         // describing what happened to the page below.
-         underfull:bool
+    Ok { page: MutPage },
+    Underfull {
+        page: Cow,
+        delete: [u16;N_LEVELS],
+        merged: u64
     },
     Split {
         key_ptr:*const u8,
@@ -300,7 +299,7 @@ fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16]
 }
 
 /// Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zero offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
-pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool, forgetting_value:bool, translate_right:u64) -> Result<MutPage,Error> {
+pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool, forgetting_value:bool, free_page:bool, translate_right:u64) -> Result<MutPage,Error> {
     unsafe {
         match page.cow {
             transaction::Cow::Page(p0) => {
@@ -309,18 +308,20 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                 let p = Page { page:p0 };
                 
                 let page = try!(copy_page(rng, txn, &p, old_levels, pinpoints, forgetting_next, forgetting_value, translate_right, page_rc > 1));
-                if page_rc <= 1 {
-                    if page_rc == 1 {
+                if free_page {
+                    if page_rc <= 1 {
+                        if page_rc == 1 {
+                            let mut rc = txn.rc().unwrap();
+                            try!(txn.del_u64(rng, &mut rc, p0_offset));
+                            txn.set_rc(rc);
+                        }
+                        //println!("free cow: {:?}", page_offset);
+                        transaction::free(&mut(txn.txn), p0_offset)
+                    } else {
                         let mut rc = txn.rc().unwrap();
-                        try!(txn.del_u64(rng, &mut rc, p0_offset));
+                        try!(txn.replace_u64(rng, &mut rc, p0_offset, page_rc-1));
                         txn.set_rc(rc);
                     }
-                    //println!("free cow: {:?}", page_offset);
-                    transaction::free(&mut(txn.txn), p0_offset)
-                } else {
-                    let mut rc = txn.rc().unwrap();
-                    try!(txn.replace_u64(rng, &mut rc, p0_offset, page_rc-1));
-                    txn.set_rc(rc);
                 }
                 Ok(page)
             }
@@ -505,29 +506,7 @@ pub unsafe fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], 
     }
 }
 
-pub enum Alloc {
-    Can(MutPage,u16),
-    Cannot(Cow)
-}
 
-pub fn can_alloc_and_compact<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, size:u16, levels:&[u16], new_levels:&mut [u16]) -> Result<Alloc, Error> {
-    let off = page.can_alloc(size);
-    if off > 0 {
-        if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
-            // No need to copy nor compact the page, the value can be written right away.
-            Ok(Alloc::Can(try!(cow_pinpointing(rng, txn, page, levels, new_levels, false, false, 0)), off))
-        } else {
-            // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
-            debug!("copy/compact");
-            let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, false, false, 0));
-            debug!("/copy/compact");
-            let off = page.can_alloc(size);
-            Ok(Alloc::Can(page,off))
-        }
-    } else {
-        Ok(Alloc::Cannot(page))
-    }
-}
 
 pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, needs_dup:bool) -> Result<Res,Error> {
 
@@ -552,16 +531,16 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
 
             match try!(insert(rng, txn, next_page, key, value, right_page, needs_dup)) {
                 Res::Nothing{..} => Ok(Res::Nothing { page:page }),
-                Res::Ok { page:next_page, .. } => {
+                Res::Ok { page:next_page } => {
                     debug!("Child returned ok: {:?}", next_page);
 
                     // The page below was updated. Update the reference in the current page
                     let mut new_levels = [0;N_LEVELS];
                     
                     if !needs_dup {
-                        let page = try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], false, false,
+                        let page = try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], false, false, true,
                                                         next_page.page_offset()));
-                        Ok(Res::Ok { page:page, underfull:false })
+                        Ok(Res::Ok { page:page })
                     } else {
                         // If several pages reference this one, force a copy.
                         if page_rc > 1 {
@@ -571,7 +550,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                         let page =
                             try!(copy_page(rng, txn, &page, &levels[..], &mut new_levels[..], false, false,
                                            next_page.page_offset(), true));
-                        Ok(Res::Ok { page: page, underfull: false })
+                        Ok(Res::Ok { page: page })
                     }
                 },
                 Res::Split { key_ptr,key_len,value:value_,left,right,free_page } => {
@@ -589,7 +568,8 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                     };
                     try!(free(rng, txn, free_page, false));
                     result
-                }
+                },
+                Res::Underfull {..} => unreachable!()
             }
         } else {
             debug!("inserting here");
@@ -601,7 +581,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
     }
 }
 
-unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16], left_page:u64, needs_dup:bool) -> Result<Res, Error> {
+pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16], left_page:u64, needs_dup:bool) -> Result<Res, Error> {
     let size = record_size(key.len(), value.len() as usize);
     let mut new_levels = [0;N_LEVELS];
     if !needs_dup {
@@ -612,21 +592,21 @@ unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, 
                 if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
                     // No need to copy nor compact the page, the value can be written right away.
                     (try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels,
-                                          false, false, left_page)),
+                                          false, false, true, left_page)),
                      off)
                 } else {
                     // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
 
                     let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(),
                                                     &levels[..],
-                                                    &mut new_levels[..], false, false,
+                                                    &mut new_levels[..], false, false, true,
                                                     left_page));
                     let off = page.can_alloc(size);
                     (page, off)
                 };
             local_insert_at(rng, &mut page, key, value, right_page,
                             off, size, &mut new_levels[..]);
-            Ok(Res::Ok { page:page, underfull:false })
+            Ok(Res::Ok { page:page })
         } else {
             debug!("splitting, key = {:?}", std::str::from_utf8_unchecked(key));
             if left_page > 0 {
@@ -644,7 +624,7 @@ unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, 
             let mut page = try!(copy_page(rng, txn, &p, levels, &mut new_levels, false, false, left_page, false));
             local_insert_at(rng, &mut page, key, value, right_page,
                             off, size, &mut new_levels[..]);
-            Ok(Res::Ok { page:page, underfull:false })
+            Ok(Res::Ok { page:page })
         } else {
             debug!("splitting, key = {:?}", std::str::from_utf8_unchecked(key));
             if left_page > 0 {
@@ -657,6 +637,7 @@ unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, 
 }
 
     
+///////////////////////////////////////////////////////////////////////////////////////// Used only in del
 
 /// If the levels have already been found, compact or split the page
 /// if necessary, and inserts the input (key, value) into the result,
@@ -670,7 +651,7 @@ pub unsafe fn check_alloc_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
             debug!("local_insert_at {:?} {:?} {:?}", new_levels, page.page_offset(), off);
             local_insert_at(rng, &mut page, key, value, right_page, off, size, &mut new_levels[..]);
             std::ptr::copy_nonoverlapping(new_levels.as_ptr(), levels.as_mut_ptr(), N_LEVELS);
-            Ok(Res::Ok { page:page, underfull:false })
+            Ok(Res::Ok { page:page })
         },
         Alloc::Cannot(page) => {
             Ok(try!(split_page(rng, txn, &page, key, value, right_page, NIL, 0)))
@@ -683,6 +664,33 @@ pub fn write_right_child(page:&MutPage, offset:u16, right_child:u64) {
         *((current as *mut u64).offset(2)) = right_child;
     }
 }
+
+
+pub enum Alloc {
+    Can(MutPage,u16),
+    Cannot(Cow)
+}
+
+pub fn can_alloc_and_compact<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, size:u16, levels:&[u16], new_levels:&mut [u16]) -> Result<Alloc, Error> {
+    let off = page.can_alloc(size);
+    if off > 0 {
+        if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
+            // No need to copy nor compact the page, the value can be written right away.
+            Ok(Alloc::Can(try!(cow_pinpointing(rng, txn, page, levels, new_levels, false, false, true, 0)), off))
+        } else {
+            // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
+            debug!("copy/compact");
+            let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, false, false, true, 0));
+            debug!("/copy/compact");
+            let off = page.can_alloc(size);
+            Ok(Alloc::Can(page,off))
+        }
+    } else {
+        Ok(Alloc::Cannot(page))
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////// /Used only in del
 
 
 /// If the "levels" (pointers to the current elements of each of the

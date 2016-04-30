@@ -1062,7 +1062,7 @@ mod tests {
 
         let key_len = 200;
         let value_len = 200;
-        let n_insertions = 9;
+        let n_insertions = 200;
 
         let mut values0 = HashMap::new();
         let mut values1 = HashMap::new();
@@ -1088,7 +1088,7 @@ mod tests {
 
         let mut root1 = txn.fork_db(&mut rng, &root0).unwrap();
         txn.debug(&[&root0, &root1], format!("/tmp/before"), false, false);
-        for j in 0..10 {
+        for j in 0..(n_insertions / 20) {
             println!("j = {:?}", j);
 
             let k0: String = rand::thread_rng()
