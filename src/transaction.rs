@@ -279,7 +279,7 @@ impl MutPage {
 }
 
 pub unsafe fn free<T>(txn: &mut MutTxn<T>, offset: u64) {
-    println!("transaction::free page: {:?}", offset);
+    debug!("transaction::free page: {:?}", offset);
     if txn.occupied_clean_pages.remove(&offset) {
         txn.free_clean_pages.push(offset);
     } else {
@@ -497,14 +497,14 @@ impl<'env> Commit for MutTxn<'env,()> {
             let mut current_page = try!(self.alloc_page());
             if self.current_list_page.offset != 0 {
                 // If there was at least one bookkeeping page before.
-                println!("commit: realloc BK, copy {:?}", self.current_list_position);
+                debug!("commit: realloc BK, copy {:?}", self.current_list_position);
                 copy_nonoverlapping(self.current_list_page.data as *const u64,
                                     current_page.data as *mut u64,
                                     2 + self.current_list_position as usize);
                 *((current_page.data as *mut u64).offset(1)) = self.current_list_position.to_le();
 
                 // and free the previous current bookkeeping page.
-                println!("freeing BK page {:?}", self.current_list_page.offset);
+                debug!("freeing BK page {:?}", self.current_list_page.offset);
                 self.free_pages.push(self.current_list_page.offset);
 
             } else {
@@ -517,7 +517,7 @@ impl<'env> Commit for MutTxn<'env,()> {
                 debug!("commit: pushing");
                 // If page is full, or this is the first page, allocate new page.
                 let len = u64::from_le(*((current_page.data as *const u64).offset(1)));
-                println!("len={:?}", len);
+                debug!("len={:?}", len);
                 if 16 + len * 8 + 8 >= PAGE_SIZE as u64 {
                     debug!("commit: current is full, len={}", len);
                     // 8 more bytes wouldn't fit in this page, time to allocate a new one
@@ -532,7 +532,7 @@ impl<'env> Commit for MutTxn<'env,()> {
                             offset: p,
                         };
 
-                    println!("commit {} allocated {:?}", line!(), new_page.offset);
+                    debug!("commit {} allocated {:?}", line!(), new_page.offset);
                     // Write a reference to the current page (which cannot be null).
                     *(new_page.data as *mut u64) = current_page.offset.to_le();
                     // Write the length of the new page (0).
@@ -544,7 +544,7 @@ impl<'env> Commit for MutTxn<'env,()> {
                     let p = self.free_pages
                         .pop()
                         .unwrap_or_else(|| self.free_clean_pages.pop().unwrap());
-                    println!("commit: push {}", p);
+                    debug!("commit: push {}", p);
 
                     *((current_page.data as *mut u64).offset(1)) = (len + 1).to_le(); // increase length.
                     *((current_page.data as *mut u64).offset(2 + len as isize)) = p.to_le(); // write pointer.

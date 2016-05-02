@@ -11,9 +11,9 @@ extern crate log;
 pub enum Res {
     Ok { page: MutPage },
     Underfull {
-        page: Cow,
-        delete: [u16;N_LEVELS],
-        merged: u64
+        page: Cow, // The page where we want to delete something.
+        delete: [u16;N_LEVELS], // The binding before the one we want to delete.
+        merged: u64 // The updated left child of the deleted binding.
     },
     Split {
         key_ptr:*const u8,
@@ -451,14 +451,14 @@ fn test_insert_large() {
 
 
 /// Changes the value of levels and eq, so that all items in levels are offsets to the largest entry in the list strictly smaller than (key,value).
-pub unsafe fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:Option<UnsafeValue>, levels:&mut [u16], eq:&mut bool) {
+pub fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:Option<UnsafeValue>, levels:&mut [u16], eq:&mut bool) {
     let mut level = N_LEVELS-1;
     let mut current_off = FIRST_HEAD;
     let mut current = page.offset(FIRST_HEAD as isize) as *const u16;
     loop {
         // advance in the list until there's nothing more to do.
         loop {
-            let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
+            let next = u16::from_le(unsafe { *(current.offset(level as isize)) }); // next in the list at the current level.
             //println!("first loop, next = {:?}", next);
             if next == NIL {
                 debug!("next=NIL, current_off={:?}", current_off);
@@ -467,13 +467,16 @@ pub unsafe fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], 
             } else {
                 debug_assert!(next!=0);
                 let next_ptr = page.offset(next as isize);
-                let (next_key,next_value) = read_key_value(next_ptr);
-                debug!("compare: {:?}", key.cmp(next_key));
+                let (next_key,next_value) = unsafe { read_key_value(next_ptr) };
+                //println!("compare: {:?} {:?}", std::str::from_utf8_unchecked(key), std::str::from_utf8_unchecked(next_key));
                 match key.cmp(next_key) {
                     Ordering::Less => break,
                     Ordering::Equal =>
                         if let Some(value) = value {
-                            match (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) {
+                            /*if (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) != Ordering::Equal {
+                                println!("differ on value");
+                            }*/
+                            match unsafe { (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) } {
                                 Ordering::Less => break,
                                 Ordering::Equal => {
                                     *eq = true;
@@ -512,9 +515,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
 
     let mut eq = false;
     let mut levels = [0;N_LEVELS];
-    unsafe {
-        set_levels(txn, &page, key, Some(value), &mut levels[..], &mut eq);
-    }
+    set_levels(txn, &page, key, Some(value), &mut levels[..], &mut eq);
     debug!("levels={:?}", levels);
     if eq {
         Ok(Res::Nothing{page:page})
@@ -636,61 +637,6 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
     }
 }
 
-    
-///////////////////////////////////////////////////////////////////////////////////////// Used only in del
-
-/// If the levels have already been found, compact or split the page
-/// if necessary, and inserts the input (key, value) into the result,
-/// at the input levels.
-pub unsafe fn check_alloc_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16]) -> Result<Res, Error> {
-
-    let size = record_size(key.len(), value.len() as usize);
-    let mut new_levels = [0;N_LEVELS];
-    match try!(can_alloc_and_compact(rng,txn,page,size,&levels[..], &mut new_levels[..])) {
-        Alloc::Can(mut page,off) => {
-            debug!("local_insert_at {:?} {:?} {:?}", new_levels, page.page_offset(), off);
-            local_insert_at(rng, &mut page, key, value, right_page, off, size, &mut new_levels[..]);
-            std::ptr::copy_nonoverlapping(new_levels.as_ptr(), levels.as_mut_ptr(), N_LEVELS);
-            Ok(Res::Ok { page:page })
-        },
-        Alloc::Cannot(page) => {
-            Ok(try!(split_page(rng, txn, &page, key, value, right_page, NIL, 0)))
-        }
-    }
-}
-pub fn write_right_child(page:&MutPage, offset:u16, right_child:u64) {
-    unsafe {
-        let current = page.offset(offset as isize);
-        *((current as *mut u64).offset(2)) = right_child;
-    }
-}
-
-
-pub enum Alloc {
-    Can(MutPage,u16),
-    Cannot(Cow)
-}
-
-pub fn can_alloc_and_compact<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, size:u16, levels:&[u16], new_levels:&mut [u16]) -> Result<Alloc, Error> {
-    let off = page.can_alloc(size);
-    if off > 0 {
-        if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
-            // No need to copy nor compact the page, the value can be written right away.
-            Ok(Alloc::Can(try!(cow_pinpointing(rng, txn, page, levels, new_levels, false, false, true, 0)), off))
-        } else {
-            // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
-            debug!("copy/compact");
-            let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, new_levels, false, false, true, 0));
-            debug!("/copy/compact");
-            let off = page.can_alloc(size);
-            Ok(Alloc::Can(page,off))
-        }
-    } else {
-        Ok(Alloc::Cannot(page))
-    }
-}
-
-///////////////////////////////////////////////////////////////////////////////////////// /Used only in del
 
 
 /// If the "levels" (pointers to the current elements of each of the

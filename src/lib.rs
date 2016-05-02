@@ -82,6 +82,9 @@ mod txn;
 pub use txn::{MutTxn, Txn, Value, Db, Iter};
 use txn::{P, LoadPage}; // , MAIN_ROOT};
 mod put;
+
+mod merge;
+mod rebalance;
 mod del;
 
 /// Environment, essentially containing locks and mmaps.
