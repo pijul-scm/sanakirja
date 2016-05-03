@@ -116,7 +116,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     let deleted_size = {
         let ptr = child_page.offset(forgetting as isize);
         let (key,value) = unsafe { read_key_value(ptr) };
-        unsafe { debug!("delete key: {:?}", std::str::from_utf8_unchecked(key)) };
+        debug!("delete key: {:?}", std::str::from_utf8(key));
         record_size(key.len(), value.len() as usize)
     };
     if left_size <= right_size - deleted_size {
@@ -138,7 +138,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     // but raw pointers also do the trick.
     unsafe {
         *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) =
-            *((left_child.offset(0) as *const u64).offset(2));
+            *((left_child.offset(FIRST_HEAD as isize) as *const u64).offset(2));
     }
     let mut left_bytes = 24;
     let mut left_levels = [0;N_LEVELS];
@@ -156,6 +156,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
                 let off = new_left.can_alloc(next_size);
                 debug_assert!(off > 0);
                 debug_assert!(off + next_size <= PAGE_SIZE as u16);
+                debug!("key -> left: {:?}", std::str::from_utf8(key));
                 unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) }
                 left_bytes += next_size;
             } else {
@@ -166,6 +167,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             let off = new_right.can_alloc(next_size);
             debug_assert!(off > 0);
             debug_assert!(off + next_size <= PAGE_SIZE as u16);
+            debug!("key -> right: {:?}", std::str::from_utf8(key));
             unsafe { local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
         }
     }
@@ -175,18 +177,21 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         let right_left_child = u64::from_le(unsafe { *((child_page.offset(0) as *const u64).offset(2)) });
         let (key,value) =
             if let Some(repl) = replacement {
+                debug!("replacement");
                 unsafe { (std::slice::from_raw_parts(repl.key_ptr, repl.key_len), repl.value) }
             } else {
+                debug!("original");
                 unsafe { read_key_value(page.offset(next as isize)) }
             };
         let next_size = record_size(key.len(),value.len() as usize);
         let off = new_right.can_alloc(next_size);
         debug_assert!(off > 0);
         debug_assert!(off + next_size <= PAGE_SIZE as u16);
+        debug!("key -> right (middle): {:?}", std::str::from_utf8(key));
         unsafe { local_insert_at(rng, &mut new_right, key, value, right_left_child, off, next_size, &mut right_levels) }
     }
 
-    let mut last_updated_ptr = new_right.offset(0);
+    let mut last_updated_ptr = new_right.offset(right_levels[0] as isize);
     for (cur, key, value, r) in PI::new(child_page,0) {
         if cur != forgetting {
             let next_size = record_size(key.len(),value.len() as usize);
@@ -195,6 +200,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             debug_assert!(off > 0);
             debug_assert!(off + next_size <= PAGE_SIZE as u16);
             last_updated_ptr = new_right.offset(off as isize);
+            debug!("key -> right: {:?}", std::str::from_utf8(key));
             unsafe {local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
         } else {
             unsafe { *((last_updated_ptr as *mut u64).offset(2)) = replace_page.to_le(); }
@@ -211,9 +217,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 
             unsafe { *((new_right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = r.to_le(); }
             let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
-            unsafe {
-                debug!("middle = {:?}", std::str::from_utf8_unchecked(key));
-            }
+            debug!("middle = {:?}", std::str::from_utf8(key));
             // The following call might split.
             unsafe {
                 check_alloc_local_insert(rng, txn, Cow::from_mut_page(page),
@@ -225,11 +229,8 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     };
     debug!("result = {:?}", result);
     //
-    /*try!(free(rng, txn, child_page.page_offset(), false));
-    if false { // !keep_left {
-        debug!("freeing left: {:?}", left_child.page_offset());
-        try!(free(rng, txn, left_child.page_offset(), false));
-    }*/
+    debug!("freeing left: {:?}", left_child.page_offset());
+    try!(free(rng, txn, left_child.page_offset(), false));
     result
 }
 
@@ -277,7 +278,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     let deleted_size = {
         let ptr = child_page.offset(forgetting as isize);
         let (key,value) = unsafe { read_key_value(ptr) };
-        unsafe { debug!("delete key: {:?}", std::str::from_utf8_unchecked(key)) };
+        debug!("delete key: {:?}", std::str::from_utf8(key));
         record_size(key.len(), value.len() as usize)
     };
     if left_size - deleted_size <= right_size {
@@ -367,9 +368,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
 
             unsafe { *((new_right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = r.to_le(); }
             let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
-            unsafe {
-                debug!("middle = {:?}", std::str::from_utf8_unchecked(key));
-            }
+            debug!("middle = {:?}", std::str::from_utf8(key));
             // The following call might split.
             unsafe {
                 check_alloc_local_insert(rng, txn, Cow::from_mut_page(page),
@@ -381,11 +380,8 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     };
     debug!("result = {:?}", result);
     //
-    // try!(free(rng, txn, child_page.page_offset(), false));
-    /*if false { // !keep_left {
-        debug!("freeing left: {:?}", child_page.page_offset());
-        try!(free(rng, txn, left_child.page_offset(), false));
-    }*/
+    debug!("freeing left: {:?}", right_child.page_offset());
+    try!(free(rng, txn, right_child.page_offset(), false));
     result
 }
 

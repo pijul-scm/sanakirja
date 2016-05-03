@@ -21,10 +21,10 @@ fn merge_page<R:Rng>(
     unsafe {
         // A pointer to the last inserted value, so we can replace the
         // deleted's left child with `replace_page`
-        let mut current_ptr = target.offset(0);
+        let mut current_ptr = target.offset(levels[0] as isize);
         // Let's go.
         for (current, key,value,r) in PI::new(source, 0) {
-            debug!("merge_page: {:?} {:?} {:?}", current, std::str::from_utf8_unchecked(key), r);
+            debug!("merge_page: {:?} {:?} {:?}", current, std::str::from_utf8(key), r);
             if current != forgetting {
                 let size = record_size(key.len(), value.len() as usize);
                 let off = target.can_alloc(size);
@@ -49,7 +49,7 @@ fn merge_right<R:Rng>(
     left:&Cow, right:&mut MutPage, forgetting:u16, replace_page:u64,
     key:&[u8], value:UnsafeValue) {
     unsafe {
-        debug!("merge right {:?} {:?} {:?}", left.page_offset(), right.page_offset(), std::str::from_utf8_unchecked(key));
+        debug!("merge right {:?} {:?} {:?}", left.page_offset(), right.page_offset(), std::str::from_utf8(key));
         // Merge the left page into the right page.
         // TODO: maybe we need to compact `right`.
         let mut levels = [0;N_LEVELS];
@@ -73,7 +73,7 @@ fn merge_left<R:Rng>(
     right:&Cow, left:&mut MutPage, forgetting:u16, replace_page:u64,
     key:&[u8], value:UnsafeValue) {
     unsafe {
-        debug!("merge left {:?} {:?} {:?}", right.page_offset(), left.page_offset(), std::str::from_utf8_unchecked(key));
+        debug!("merge left {:?} {:?} {:?}", right.page_offset(), left.page_offset(), std::str::from_utf8(key));
         let mut levels = [0;N_LEVELS];
         // First mission: set the levels to the last entry.
         let mut l = N_LEVELS-1;
@@ -132,9 +132,7 @@ pub fn merge_children_right<R:Rng, T>(
     let deleted_size = {
         let ptr = child_page.offset(forgetting as isize);
         let (key,value) = unsafe { read_key_value(ptr) };
-        unsafe {
-            debug!("delete key: {:?}", std::str::from_utf8_unchecked(key));
-        }
+        debug!("delete key: {:?}", std::str::from_utf8(key));
         record_size(key.len(), value.len() as usize)
     };
     debug!("child_page_occupied {:?} {:?}", child_page.occupied(), deleted_size);
@@ -203,9 +201,7 @@ pub fn merge_children_left<R:Rng, T>(
     let deleted_size = {
         let ptr = child_page.offset(forgetting as isize);
         let (key,value) = unsafe { read_key_value(ptr) };
-        unsafe {
-            debug!("delete key: {:?}", std::str::from_utf8_unchecked(key));
-        }
+        debug!("delete key: {:?}", std::str::from_utf8(key));
         record_size(key.len(), value.len() as usize)
     };
     debug!("child_page_occupied {:?} {:?}", child_page.occupied(), deleted_size);
@@ -277,9 +273,7 @@ pub fn merge_children_replace<R:Rng, T>(
     let deleted_size = {
         let ptr = child_page.offset(forgetting as isize);
         let (key,value) = unsafe { read_key_value(ptr) };
-        unsafe {
-            debug!("delete key: {:?}", std::str::from_utf8_unchecked(key));
-        }
+        debug!("delete key: {:?}", std::str::from_utf8(key));
         record_size(key.len(), value.len() as usize)
     };
     // (3)
@@ -311,7 +305,7 @@ pub fn merge_children_replace<R:Rng, T>(
             left_sibling
         };
         // Now, delete (next_key, next_value) from the current page.
-        if page.occupied() - next_record_size < (PAGE_SIZE as u16)/2 {
+        let result = if page.occupied() - next_record_size < (PAGE_SIZE as u16)/2 {
             // If this makes the current page underfull.
             Ok(Res::Underfull { page:page, delete:levels, merged:merged_left_sibling.page_offset() })
         } else {
@@ -321,7 +315,13 @@ pub fn merge_children_replace<R:Rng, T>(
                                             &mut new_levels, true, false, true,
                                             merged_left_sibling.page_offset()));
             Ok(Res::Ok { page:page })
-        }
+        };
+        /*
+        try!(free(rng, txn, child_page.page_offset(), false));
+        if replacement.free_page > 0 && replacement.free_page != child_page.page_offset() {
+            try!(free(rng, txn, replacement.free_page, false));
+        }*/
+        result
     } else {
         Ok(Res::Nothing { page:page })
     }

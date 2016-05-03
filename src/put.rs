@@ -69,6 +69,9 @@ pub fn fork_db<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Er
 fn incr_rc<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64)->Result<(),Error> {
     let mut rc = if let Some(rc) = txn.rc() { rc } else { try!(txn.create_db()) };
     let count = txn.get_u64(&rc, off).unwrap_or(1);
+    if count+1 > 1 {
+        //panic!("not during tests")
+    }
     try!(txn.replace_u64(rng, &mut rc, off, count+1));
     txn.set_rc(rc);
     Ok(())
@@ -609,7 +612,7 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
                             off, size, &mut new_levels[..]);
             Ok(Res::Ok { page:page })
         } else {
-            debug!("splitting, key = {:?}", std::str::from_utf8_unchecked(key));
+            debug!("splitting, key = {:?}", std::str::from_utf8(key));
             if left_page > 0 {
                 Ok(try!(split_page(rng, txn, &page, key, value, right_page, levels[0], left_page)))
             } else {
@@ -627,7 +630,7 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
                             off, size, &mut new_levels[..]);
             Ok(Res::Ok { page:page })
         } else {
-            debug!("splitting, key = {:?}", std::str::from_utf8_unchecked(key));
+            debug!("splitting, key = {:?}", std::str::from_utf8(key));
             if left_page > 0 {
                 Ok(try!(split_page(rng, txn, &page, key, value, right_page, levels[0], left_page)))
             } else {
@@ -688,7 +691,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                                   translate_index:u16, translate_right_page:u64)->Result<Res,Error> {
 
     debug!("split {:?}", page.page_offset());
-    debug!("split {:?}", std::str::from_utf8_unchecked(key));
+    debug!("split {:?}", std::str::from_utf8(key));
     let mut left = try!(txn.alloc_page());
     left.init();
     let mut right = try!(txn.alloc_page());
@@ -712,7 +715,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
     let mut extra_on_lhs = false;
     
     for (current, key_, value_, r) in PI::new(page,0) {
-        debug!("split key_ = {:?}", std::str::from_utf8_unchecked(key_));
+        debug!("split key_ = {:?}", std::str::from_utf8(key_));
         let r = if current == translate_index {
             if translate_right_page == 0 {
                 // This means "forget about translate_right_page"
