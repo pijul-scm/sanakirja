@@ -155,29 +155,31 @@ impl <'a,T:LoadPage> Iterator for Value<'a,T> {
                             let page = txn.load_page(*offset).offset(0);
                             // change the pointer of "current page" to the next page
                             *offset = u64::from_le(*(page as *const u64));
-                            *len -= (PAGE_SIZE-VALUE_HEADER_LEN) as u32;
-                            Some(std::slice::from_raw_parts(page.offset(8), PAGE_SIZE-8))
+                            let l = PAGE_SIZE-VALUE_HEADER_LEN;
+                            *len -= l as u32;
+                            Some(std::slice::from_raw_parts(page.offset(VALUE_HEADER_LEN as isize), l as usize))
                         }
                     }
                 }
             },
             &mut Value::S{ref mut p,ref mut len} => {
-                if (*p).is_null() {
+                if *len == 0 {
                     None
                 } else {
-                    let pp = *p;
-                    unsafe {
-                        let l = if *len > PAGE_SIZE as u32 - VALUE_HEADER_LEN as u32 {
-                            *p = ((*p) as *mut u8).offset(PAGE_SIZE as isize - VALUE_HEADER_LEN as isize);
-                            *len -= (PAGE_SIZE - VALUE_HEADER_LEN) as u32;
-                            PAGE_SIZE-VALUE_HEADER_LEN
-                        } else {
-                            *p = std::ptr::null_mut();
-                            let l = *len;
-                            *len = 0;
-                            l as usize
-                        };
-                        Some(std::slice::from_raw_parts(pp,l as usize))
+                    if *len <= PAGE_SIZE as u32 {
+                        let l = *len;
+                        *len = 0;
+                        unsafe {
+                            Some(std::slice::from_raw_parts(*p,l as usize))
+                        }
+                    } else {
+                        let pp = *p;
+                        unsafe {
+                            let l = PAGE_SIZE - VALUE_HEADER_LEN;
+                            *p = ((*p) as *mut u8).offset(l as isize);
+                            *len -= l as u32;
+                            Some(std::slice::from_raw_parts(pp,l as usize))
+                        }
                     }
                 }
             }

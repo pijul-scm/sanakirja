@@ -984,7 +984,7 @@ mod tests {
         extern crate tempdir;
         let dir = tempdir::TempDir::new("pijul").unwrap();
 
-        let n_insertions = 1000;
+        let n_insertions = 100;
         let key_size = 200;
         let value_size = 500;
 

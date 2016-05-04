@@ -13,7 +13,8 @@ pub enum Res {
     Underfull {
         page: Cow, // The page where we want to delete something.
         delete: [u16;N_LEVELS], // The binding before the one we want to delete.
-        merged: u64 // The updated left child of the deleted binding.
+        merged: u64, // The updated left child of the deleted binding.
+        free_value: bool
     },
     Split {
         key_ptr:*const u8,
@@ -314,7 +315,7 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                 let p = Page { page:p0 };
                 
                 let page = try!(copy_page(rng, txn, &p, old_levels, pinpoints, forgetting_next,
-                                          forgetting_value, translate_right, !free_page));
+                                          forgetting_value, translate_right, false)); // never increase the counter of child pages
                 if free_page {
                     if page_rc <= 1 {
                         if page_rc == 1 {
@@ -480,9 +481,23 @@ pub fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:O
                     Ordering::Less => break,
                     Ordering::Equal =>
                         if let Some(value) = value {
-                            /*if (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) != Ordering::Equal {
-                                println!("differ on value");
-                            }*/
+                            if cfg!(test) {
+                                unsafe {
+                                    if (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) != Ordering::Equal {
+                                        debug!("differ on value {:?}", next_value);
+                                        let mut s0 = Vec::new();
+                                        for i in Value::from_unsafe(&value, txn) {
+                                            s0.extend(i)
+                                        }
+                                        let mut s1 = Vec::new();
+                                        for i in Value::from_unsafe(&next_value, txn) {
+                                            s1.extend(i)
+                                        }
+                                        debug!("{:?}", std::str::from_utf8(&s0));
+                                        debug!("{:?}", std::str::from_utf8(&s1));
+                                    }
+                                }
+                            }
                             match unsafe { (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) } {
                                 Ordering::Less => break,
                                 Ordering::Equal => {
@@ -723,6 +738,10 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
         let r = if current == translate_index {
             if translate_right_page == 0 {
                 // This means "forget about translate_right_page"
+                // We must free the associated value, since this feature is only called where value freeing is needed.
+                if let UnsafeValue::O { offset, len } = value {
+                    try!(free_value(rng, txn, offset, len));
+                }
                 continue
             } else {
                 translate_right_page

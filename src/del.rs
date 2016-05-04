@@ -47,7 +47,7 @@ pub struct Smallest {
 //
 fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, levels:[u16;N_LEVELS],
                               child_page:Cow,
-                              delete:[u16;N_LEVELS], merged:u64) -> Result<(Res,bool), Error> {
+                              delete:[u16;N_LEVELS], merged:u64, do_free_value:bool) -> Result<(Res,bool), Error> {
     debug!("handle_underfull");
     let mut new_levels = [0;N_LEVELS];
     unsafe {
@@ -57,7 +57,7 @@ fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, leve
     // First try to merge with our right sibling.
     let next_offset = unsafe { u16::from_le(*(page.offset(levels[0] as isize) as *const u16)) };
     if next_offset != NIL {
-        match try!(merge::merge_children_right(rng, txn, page, levels, &child_page, &delete, merged)) {
+        match try!(merge::merge_children_right(rng, txn, page, levels, &child_page, &delete, merged, do_free_value)) {
 
             Res::Nothing { page:page_ } => {
                 // If we couldn't merge:
@@ -73,9 +73,9 @@ fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, leve
                     unsafe {
                         std::ptr::copy_nonoverlapping(levels.as_ptr(), new_levels.as_mut_ptr(), N_LEVELS)
                     }
-                    match try!(rebalance::rebalance_left(rng, txn, page_, levels, &child_page, forgetting, merged)) {
+                    match try!(rebalance::rebalance_left(rng, txn, page_, levels, &child_page, forgetting, merged, do_free_value)) {
                         Res::Nothing { page:page_ } => {
-                            let result = try!(rebalance::handle_failed_left_rebalancing(rng, txn, page_, levels, child_page, delete, merged));
+                            let result = try!(rebalance::handle_failed_left_rebalancing(rng, txn, page_, levels, child_page, delete, merged, do_free_value));
                             return Ok((result, false))
                         },
                         x => {
@@ -97,15 +97,15 @@ fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, leve
     // Move back by one
     debug!("trying to merge to left");
     set_pred(&page, &mut new_levels);
-    match try!(merge::merge_children_left(rng, txn, page, new_levels, &child_page, &delete, merged)) {
+    match try!(merge::merge_children_left(rng, txn, page, new_levels, &child_page, &delete, merged, do_free_value)) {
         Res::Nothing { page } => {
             // we couldn't merge. rebalance.
             debug!("second case of rebalancing: {:?}", child_page);
             let forgetting = u16::from_le(unsafe { *(child_page.offset(delete[0] as isize) as *const u16) });
-            let result = match try!(rebalance::rebalance_right(rng, txn, page, new_levels, None, &child_page, forgetting, merged)) {
+            let result = match try!(rebalance::rebalance_right(rng, txn, page, new_levels, None, &child_page, forgetting, merged, do_free_value)) {
                 Res::Nothing { page:page_ } => {
                     debug!("failed rebalancing");
-                    Ok((try!(rebalance::handle_failed_right_rebalancing(rng, txn, page_, new_levels, None, child_page, delete, merged)), false))
+                    Ok((try!(rebalance::handle_failed_right_rebalancing(rng, txn, page_, new_levels, None, child_page, delete, merged, do_free_value)), false))
                 },
                 x => Ok((x,true))
             };
@@ -175,9 +175,9 @@ fn handle_underfull_replace<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, 
             // If we couldn't merge:
             debug!("rebalancing: {:?}", levels[0]);
             let forgetting = u16::from_le(unsafe { *(child_page.offset(delete[0] as isize) as *const u16) });
-            match try!(rebalance::rebalance_right(rng, txn, page_, levels, Some(replacement), &child_page, forgetting, merged)) {
+            match try!(rebalance::rebalance_right(rng, txn, page_, levels, Some(replacement), &child_page, forgetting, merged, false)) {
                 Res::Nothing { page:page_} => {
-                    return rebalance::handle_failed_right_rebalancing(rng, txn, page_, levels, Some(replacement), child_page, delete, merged)
+                    return rebalance::handle_failed_right_rebalancing(rng, txn, page_, levels, Some(replacement), child_page, delete, merged, false)
                 },
                 x => Ok(x)
             }
@@ -228,9 +228,9 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
 
                 let mut new_levels = [0;N_LEVELS];
                 let mut page = if off + size < PAGE_SIZE as u16 {
-                    try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, true, 0))
+                    try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true, true, 0))
                 } else {
-                    try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels, &mut new_levels, true, false, true, 0))
+                    try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels, &mut new_levels, true, true, true, 0))
                 };
                 let off = page.can_alloc(size);
 
@@ -255,7 +255,7 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
             }
             Ok(result)
         },
-        (Res::Underfull { page: child_page, delete, merged }, Some(smallest)) => {
+        (Res::Underfull { page: child_page, delete, merged, .. }, Some(smallest)) => {
 
             debug!("internal: underfull");
             let child_page_offset = child_page.page_offset();
@@ -366,7 +366,7 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
                             free_page: page.page_offset(),
                             needs_freeing: true
                         });
-                    Ok((Res::Underfull { page:page, delete: levels, merged:0 }, smallest))
+                    Ok((Res::Underfull { page:page, delete: levels, merged:0, free_value: false }, smallest))
                 } else {
                     // Else, we need to actually delete something, but
                     // since we're returning something from this page,
@@ -388,7 +388,7 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
             } else {
                 debug!("{:?} {:?}", will_be_underfull, levels);
                 if will_be_underfull {
-                    Ok((Res::Underfull { page:page, delete: levels, merged:0 }, None))
+                    Ok((Res::Underfull { page:page, delete: levels, merged:0, free_value: true }, None))
                 } else {
                     let mut new_levels = [0;N_LEVELS];
                     let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true, true, 0));
@@ -400,11 +400,11 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
             // Find smallest, etc.
             Ok((try!(delete_at_internal_node(rng, txn, page, levels)), None))
         },
-        Some((Res::Underfull { page:child_page, delete, merged }, mut smallest)) => {
+        Some((Res::Underfull { page:child_page, delete, merged, free_value }, mut smallest)) => {
             // Decide which neighbor to merge with.
             debug!("delete: underfull {:?}", child_page);
             let child_page_offset = child_page.page_offset();
-            let (result, rebalanced) = try!(handle_underfull(rng, txn, page, levels, child_page, delete, merged));
+            let (result, rebalanced) = try!(handle_underfull(rng, txn, page, levels, child_page, delete, merged, free_value));
             debug!("underfull done, rebalanced {:?}", rebalanced);
             match smallest {
                 Some(ref mut smallest) if smallest.free_page == child_page_offset => {
@@ -475,12 +475,12 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                 }
                 Ok(true)
             },
-            (Res::Underfull { page, delete, merged }, None) => {
+            (Res::Underfull { page, delete, merged, free_value }, None) => {
                 let mut new_levels = [0;N_LEVELS];
                 let page = try!(cow_pinpointing( rng, txn, page,
                                                  &delete[..],
                                                  &mut new_levels[..],
-                                                 true, true, true,
+                                                 true, free_value, true,
                                                  merged));
                 
                 // If this page is empty, replace with next page.
@@ -527,66 +527,72 @@ fn test_delete_leaf() {
 
     env_logger::init().unwrap_or(());
     let dir = tempdir::TempDir::new("pijul").unwrap();
-    let env = Env::new(dir.path(), 1000).unwrap();
-    let mut txn = env.mut_txn_begin();
+    let tmp = tempdir::TempDir::new("pijul").unwrap();
+    {
+        let tmp_path = tmp.path();
+        let env = Env::new(dir.path(), 1000).unwrap();
+        let mut txn = env.mut_txn_begin();
 
-    let mut page = txn.alloc_page().unwrap();
-    page.init();
-    let mut insertions = Vec::new();
-    for _ in 0..200 {
-        let key_: String = rng
-            .gen_ascii_chars()
-            .take(20)
-            .collect();
-        let value_: String = rng
-            .gen_ascii_chars()
-            .take(20)
-            .collect();
+        let mut page = txn.alloc_page().unwrap();
+        page.init();
+        let mut insertions = Vec::new();
+        for _ in 0..200 {
+            let key_: String = rng
+                .gen_ascii_chars()
+                .take(20)
+                .collect();
+            let value_: String = rng
+                .gen_ascii_chars()
+                .take(20)
+                .collect();
+            {
+                let key = key_.as_bytes();
+                let value = value_.as_bytes();
+                let value = if value.len() > VALUE_SIZE_THRESHOLD {
+                    super::put::alloc_value(&mut txn,value).unwrap()
+                } else {
+                    UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
+                };
+                match insert(&mut rng, &mut txn, Cow::from_mut_page(page), key, value, 0, false) {
+                    Ok(Res::Ok { page:page_ }) => {
+                        page = page_
+                    },
+                    Ok(Res::Underfull { page:page_, .. }) => {
+                        page = page_.unwrap_mut();
+                    },
+                    Ok(Res::Nothing { page:page_ }) => {
+                        page = page_.unwrap_mut()
+                    },
+                    Ok(x) => {
+                        page = root_split(&mut rng, &mut txn, x).unwrap()
+                    },
+                    _ => panic!("")
+                }
+            }
+            insertions.push((key_,value_))
+        }
+        insertions.sort();
+
+        let db = Db { root_num: -1, root: page.page_offset() };
+        txn.debug(&[&db], tmp_path.join("before"), false, false);
+        // Delete the 10th smallest entry.
         {
+            let (ref key_,ref value_) = insertions[10];
             let key = key_.as_bytes();
             let value = value_.as_bytes();
-            let value = if value.len() > VALUE_SIZE_THRESHOLD {
-                super::put::alloc_value(&mut txn,value).unwrap()
-            } else {
-                UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
-            };
-            match insert(&mut rng, &mut txn, Cow::from_mut_page(page), key, value, 0, false) {
-                Ok(Res::Ok { page:page_ }) => {
+            let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
+            match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }) {
+                Ok((Res::Ok { page:page_, .. }, _)) => {
                     page = page_
-                },
-                Ok(Res::Underfull { page:page_, .. }) => {
-                    page = page_.unwrap_mut();
-                },
-                Ok(Res::Nothing { page:page_ }) => {
-                    page = page_.unwrap_mut()
-                },
-                Ok(x) => {
-                    page = root_split(&mut rng, &mut txn, x).unwrap()
                 },
                 _ => panic!("")
             }
         }
-        insertions.push((key_,value_))
+        let db = Db { root_num: -1, root: page.page_offset() };
+        txn.debug(&[&db], tmp_path.join("after"), false, false);
+        println!("tmp: {:?}", tmp_path);
     }
-    insertions.sort();
-
-    let db = Db { root_num: -1, root: page.page_offset() };
-    txn.debug(&[&db], format!("/tmp/before"), false, false);
-    // Delete the 10th smallest entry.
-    {
-        let (ref key_,ref value_) = insertions[10];
-        let key = key_.as_bytes();
-        let value = value_.as_bytes();
-        let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
-        match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }) {
-            Ok((Res::Ok { page:page_, .. }, _)) => {
-                page = page_
-            },
-            _ => panic!("")
-        }
-    }
-    let db = Db { root_num: -1, root: page.page_offset() };
-    txn.debug(&[&db], format!("/tmp/after"), false, false);
+    std::mem::forget(tmp);
 }
 
 
@@ -706,7 +712,7 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
                 .gen_ascii_chars()
                 .take(valuesize)
                 .collect();
-            {
+            let value = {
                 let key = key_.as_bytes();
                 let value = value_.as_bytes();
                 let value = if value.len() > VALUE_SIZE_THRESHOLD {
@@ -730,40 +736,40 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
                         page = root_split(&mut rng, &mut txn, x).unwrap()
                     },
                 }
-            }
+                value
+            };
             debug!("put i = {:?}", i);
             debug!("key = {:?}", key_);
 
             let db = Db { root_num: -1, root: page.page_offset() };
             txn.debug(&[&db], format!("/tmp/before_{}", i), false, false);
 
-            insertions.push((key_,value_))
+            insertions.push((key_,value_, value))
         }
         let db = Db { root_num: -1, root: page.page_offset() };
         txn.debug(&[&db], format!("/tmp/before"), false, false);
 
         match sorted {
             Sorted::No => {},
-            Sorted::Incr => insertions.sort(),
+            Sorted::Incr => {
+                insertions.sort_by(|&(ref a,_,_),&(ref b,_,_)| a.cmp(b))
+            },
             Sorted::Decr => {
-                insertions.sort_by(|a,b| b.cmp(a))
+                insertions.sort_by(|&(ref a,_,_),&(ref b,_,_)| b.cmp(a))
             }
         }
         for i in 0..insertions.len() {
 
-            let (ref key, ref value) = insertions[i];
+            let (ref key, ref value, ref val) = insertions[i];
 
             println!("i = {:?}", i);
             println!("key = {:?}", key);
             debug!("i = {:?}", i);
             debug!("key = {:?}", key);
+            debug!("allocated = {:?}", val);
             let key = key.as_bytes();
             let value = value.as_bytes();
-            let value = if value.len() > VALUE_SIZE_THRESHOLD {
-                super::put::alloc_value(&mut txn,value).unwrap()
-            } else {
-                UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
-            };
+            let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
             match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }).unwrap() {
                 (Res::Ok { page:page_ }, None) => {
                     // If this page is empty, replace with next page.
@@ -775,13 +781,13 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
                         page = page_
                     }
                 },
-                (Res::Underfull { page:page_, delete, merged }, None) => {
+                (Res::Underfull { page:page_, delete, merged, free_value }, None) => {
                     println!("underfull, deleting {:?}", &delete[..]);
                     let mut new_levels = [0;N_LEVELS];
                     let page_ = cow_pinpointing(&mut rng, &mut txn, page_,
                                                 &delete[..],
                                                 &mut new_levels[..],
-                                                true, true, true,
+                                                true, free_value, true,
                                                 merged).unwrap();
 
                     // If this page is empty, replace with next page.

@@ -11,14 +11,14 @@ use super::del::Smallest;
 /// child_page is the next element's right child.
 pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
                                                  replacement:Option<&Smallest>,
-                                                 child_page:Cow, delete:[u16;N_LEVELS], replace_page:u64) -> Result<Res, Error> {
+                                                 child_page:Cow, delete:[u16;N_LEVELS], replace_page:u64, do_free_value:bool) -> Result<Res, Error> {
     // Actually delete and replace in the child.
     let new_child_page = {
         let mut new_delete = [0;N_LEVELS];
         try!(cow_pinpointing(rng, txn, child_page,
                              &delete[..],
                              &mut new_delete[..],
-                             true, true, true,
+                             true, do_free_value, true,
                              replace_page))
     };
     if let Some(repl) = replacement {
@@ -52,14 +52,14 @@ pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
 
 /// child_page is the current element's right child.
 pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
-                                                child_page:Cow, delete:[u16;N_LEVELS], replace_page:u64) -> Result<Res, Error> {
+                                                child_page:Cow, delete:[u16;N_LEVELS], replace_page:u64, do_free_value:bool) -> Result<Res, Error> {
     // Actually delete and replace in the child.
     let new_child_page = {
         let mut new_delete = [0;N_LEVELS];
         try!(cow_pinpointing(rng, txn, child_page,
                              &delete[..],
                              &mut new_delete[..],
-                             true, true, true,
+                             true, do_free_value, true,
                              replace_page))
     };
     let mut new_levels = [0;N_LEVELS];
@@ -80,7 +80,7 @@ pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, 
 /// Assumes the child page is the next element's right child.
 pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
                                  replacement:Option<&Smallest>,
-                                 child_page:&Cow, forgetting:u16, replace_page:u64) -> Result<Res, Error> {
+                                 child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool) -> Result<Res, Error> {
     debug!("rebalance_right");
 
     // First operation: take all elements from one of the sides of the
@@ -175,13 +175,17 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     debug_assert!(middle.is_some());
     {
         let right_left_child = u64::from_le(unsafe { *((child_page.offset(0) as *const u64).offset(2)) });
+        let (key,value) = unsafe { read_key_value(page.offset(next as isize)) };
         let (key,value) =
             if let Some(repl) = replacement {
                 debug!("replacement");
+                if let UnsafeValue::O { offset, len } = value {
+                    try!(free_value(rng, txn, offset, len))
+                }
                 unsafe { (std::slice::from_raw_parts(repl.key_ptr, repl.key_len), repl.value) }
             } else {
                 debug!("original");
-                unsafe { read_key_value(page.offset(next as isize)) }
+                (key, value)
             };
         let next_size = record_size(key.len(),value.len() as usize);
         let off = new_right.can_alloc(next_size);
@@ -203,6 +207,11 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             debug!("key -> right: {:?}", std::str::from_utf8(key));
             unsafe {local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
         } else {
+            if do_free_value {
+                if let UnsafeValue::O { offset, len } = value {
+                    try!(free_value(rng, txn, offset, len))
+                }
+            }
             unsafe { *((last_updated_ptr as *mut u64).offset(2)) = replace_page.to_le(); }
         }
     }
@@ -247,7 +256,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 ///
 /// Assumes `child_page` is the current element's right child.
 pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
-                                child_page:&Cow, forgetting:u16, replace_page:u64) -> Result<Res, Error> {
+                                child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool) -> Result<Res, Error> {
     debug!("rebalance_left");
 
     // First operation: take all elements from one of the sides of the
@@ -318,6 +327,11 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
             left_bytes += next_size;
         } else {
+            if do_free_value {
+                if let UnsafeValue::O { offset, len } = value {
+                    try!(free_value(rng, txn, offset, len))
+                }
+            }
             unsafe { *((last_updated_ptr as *mut u64).offset(2)) = replace_page.to_le() }
         }
     }
