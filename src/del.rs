@@ -258,8 +258,13 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
         (Res::Underfull { page: child_page, delete, merged }, Some(smallest)) => {
 
             debug!("internal: underfull");
-            handle_underfull_replace(rng, txn, page, levels, child_page, &smallest, delete, merged)
-
+            let child_page_offset = child_page.page_offset();
+            let result = handle_underfull_replace(rng, txn, page, levels, child_page, &smallest, delete, merged);
+            try!(free(rng, txn, child_page_offset, false));
+            if smallest.needs_freeing && smallest.free_page != child_page_offset {
+                try!(free(rng, txn, smallest.free_page, false));
+            }
+            result
         },
         (Res::Split { key_len,key_ptr,value, left, right, free_page }, Some(smallest)) => {
 
@@ -299,10 +304,10 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                                levels[0], left.page_offset())
                 }
             };
-            /*try!(free(rng, txn, free_page, false));
-            if smallest.free_page > 0 {
+            try!(free(rng, txn, free_page, false));
+            if smallest.needs_freeing {
                 try!(free(rng, txn, smallest.free_page, false));
-            }*/
+            }
             result
         },
         (Res::Ok { .. }, None) |
@@ -391,7 +396,6 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
                 }
             }
         },
-        // TODO:free
         Some((Res::Nothing { .. }, _)) if eq => {
             // Find smallest, etc.
             Ok((try!(delete_at_internal_node(rng, txn, page, levels)), None))
@@ -401,7 +405,7 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
             debug!("delete: underfull {:?}", child_page);
             let child_page_offset = child_page.page_offset();
             let (result, rebalanced) = try!(handle_underfull(rng, txn, page, levels, child_page, delete, merged));
-            debug!("underfull done");
+            debug!("underfull done, rebalanced {:?}", rebalanced);
             match smallest {
                 Some(ref mut smallest) if smallest.free_page == child_page_offset => {
                     // the child page contains the smallest element. Don't free.

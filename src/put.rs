@@ -69,9 +69,7 @@ pub fn fork_db<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Er
 fn incr_rc<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64)->Result<(),Error> {
     let mut rc = if let Some(rc) = txn.rc() { rc } else { try!(txn.create_db()) };
     let count = txn.get_u64(&rc, off).unwrap_or(1);
-    if count+1 > 1 {
-        //panic!("not during tests")
-    }
+    debug!("incrementing page {:?} to {:?}", off, count+1);
     try!(txn.replace_u64(rng, &mut rc, off, count+1));
     txn.set_rc(rc);
     Ok(())
@@ -127,6 +125,8 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool
             }
         }
         unsafe { transaction::free(&mut txn.txn, off) }
+    } else {
+        panic!("should really free");
     }
     Ok(())
 }
@@ -212,7 +212,9 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut l
 /// Therefore, we might need to copy pages without freeing the
 /// previous one, since their reference count is not yet updated.
 ///
-fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool, forgetting_value:bool, translate_right: u64, rc_children:bool) -> Result<MutPage,Error> {
+fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16], pinpoints:&mut [u16],
+                      forgetting_next: bool, forgetting_value:bool,
+                      translate_right: u64, rc_children:bool) -> Result<MutPage,Error> {
     unsafe {
         // Reset all pinpoints.
         for i in 0.. N_LEVELS {
@@ -242,7 +244,7 @@ fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16]
             };
         *((page.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_page.to_le();
         if rc_children {
-            if right_page > 0 {
+            if right_page > 0 && rc_children {
                 try!(incr_rc(rng, txn, right_page))
             }
         }
@@ -251,7 +253,7 @@ fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16]
             let right = if current == old_levels[0] && translate_right > 0 {
                 translate_right
             } else {
-                if right > 0 {
+                if right > 0 && rc_children {
                     try!(incr_rc(rng, txn, right))
                 }
                 right
@@ -302,7 +304,8 @@ fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16]
 }
 
 /// Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zero offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
-pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16], forgetting_next: bool, forgetting_value:bool, free_page:bool, translate_right:u64) -> Result<MutPage,Error> {
+pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16],
+                                forgetting_next: bool, forgetting_value:bool, free_page:bool, translate_right:u64) -> Result<MutPage,Error> {
     unsafe {
         match page.cow {
             transaction::Cow::Page(p0) => {
@@ -310,7 +313,8 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                 let page_rc = get_rc(txn, p0_offset);
                 let p = Page { page:p0 };
                 
-                let page = try!(copy_page(rng, txn, &p, old_levels, pinpoints, forgetting_next, forgetting_value, translate_right, page_rc > 1));
+                let page = try!(copy_page(rng, txn, &p, old_levels, pinpoints, forgetting_next,
+                                          forgetting_value, translate_right, !free_page));
                 if free_page {
                     if page_rc <= 1 {
                         if page_rc == 1 {

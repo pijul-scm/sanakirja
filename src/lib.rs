@@ -776,7 +776,7 @@ mod tests {
 
 
     #[cfg(test)]
-    pub fn leakproof_put_del(env:&Env, n_insertions:usize, value_size:usize) -> () {
+    pub fn leakproof_put_del(env:&Env, n_insertions:usize, key_size:usize, value_size:usize) -> () {
         extern crate rand;
         use rand::Rng;
         use std::collections::{HashMap};
@@ -787,13 +787,11 @@ mod tests {
 
         let mut random:HashMap<String,String> = HashMap::new();
 
-        let key_len = 50;
-
         for i in 0..n_insertions {
-            println!("i={:?}", i);
+            // println!("i={:?}", i);
             let k0: String = rand::thread_rng()
                 .gen_ascii_chars()
-                .take(key_len)
+                .take(key_size)
                 .collect();
             let v0: String = rand::thread_rng()
                 .gen_ascii_chars()
@@ -810,9 +808,11 @@ mod tests {
             txn.set_root(0, db);
             txn.commit().unwrap();
         }
+        debug!("put done");
+        check_memory(&env, false);
         let mut i = 0;
         for (ref k, ref v) in random.iter() {
-            debug!("i = {:?}, k = {:?}", i, k);
+            debug!("del i = {:?}, k = {:?}", i, k);
             let mut txn = env.mut_txn_begin();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.del(&mut rng, &mut db, k.as_bytes(), Some(v.as_bytes())).unwrap();
@@ -931,7 +931,7 @@ mod tests {
         let dir = tempdir::TempDir::new("pijul").unwrap();
 
         let n_insertions = 1000;
-        let value_size = 50;
+        let value_size = 200;
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
@@ -970,10 +970,11 @@ mod tests {
         let dir = tempdir::TempDir::new("pijul").unwrap();
 
         let n_insertions = 1000;
-        let value_size = 400;
+        let key_size = 200;
+        let value_size = 200;
 
         let env = Env::new(dir.path(), 5000 as u64).unwrap();
-        leakproof_put_del(&env, n_insertions, value_size);
+        leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
         check_memory(&env, true);
     }
@@ -984,10 +985,11 @@ mod tests {
         let dir = tempdir::TempDir::new("pijul").unwrap();
 
         let n_insertions = 1000;
+        let key_size = 200;
         let value_size = 500;
 
         let env = Env::new(dir.path(), 10000 as u64).unwrap();
-        leakproof_put_del(&env, n_insertions, value_size);
+        leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
         check_memory(&env, true);
     }
@@ -998,10 +1000,11 @@ mod tests {
         let dir = tempdir::TempDir::new("pijul").unwrap();
 
         let n_insertions = 100;
+        let key_size = 200;
         let value_size = 8000;
 
         let env = Env::new(dir.path(), 10000 as u64).unwrap();
-        leakproof_put_del(&env, n_insertions, value_size);
+        leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
         check_memory(&env, true);
     }
