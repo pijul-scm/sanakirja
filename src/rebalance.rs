@@ -11,24 +11,33 @@ use super::del::Smallest;
 /// child_page is the next element's right child.
 pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
                                                  replacement:Option<&Smallest>,
-                                                 child_page:Cow, delete:[u16;N_LEVELS], replace_page:u64, do_free_value:bool) -> Result<Res, Error> {
+                                                 child_page:Cow, delete:[u16;N_LEVELS], replace_page:u64, do_free_value:bool, needs_dup:bool) -> Result<Res, Error> {
     // Actually delete and replace in the child.
     let new_child_page = {
         let mut new_delete = [0;N_LEVELS];
-        try!(cow_pinpointing(rng, txn, child_page,
-                             &delete[..],
-                             &mut new_delete[..],
-                             true, do_free_value, true,
-                             replace_page))
+        if needs_dup {
+            try!(copy_page(rng, txn, &child_page.as_page(), &delete, &mut new_delete, true, do_free_value, 0, true))
+        } else {
+            try!(cow_pinpointing(rng, txn, child_page,
+                                 &delete,
+                                 &mut new_delete,
+                                 true, do_free_value, true,
+                                 replace_page))
+        }
     };
     if let Some(repl) = replacement {
         let mut new_levels = [0;N_LEVELS];
         // Delete the next element on this page.
-        let mut page = try!(cow_pinpointing(rng, txn, page,
-                                            &levels[..],
-                                            &mut new_levels[..],
-                                            true, true, true,
-                                            0));
+        let mut page =
+            if needs_dup {
+                try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, true, 0, true))
+            } else {
+                try!(cow_pinpointing(rng, txn, page,
+                                     &levels,
+                                     &mut new_levels,
+                                     true, true, true,
+                                     0))
+            };
         // Reinsert the replacement.
         let key = unsafe { std::slice::from_raw_parts(repl.key_ptr, repl.key_len) };
         let size = record_size(key.len(), repl.value.len() as usize);
@@ -39,11 +48,15 @@ pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
         Ok(Res::Ok { page:page })
     } else {
         let mut new_levels = [0;N_LEVELS];
-        let page = try!(cow_pinpointing(rng, txn, page,
-                                        &levels[..],
-                                        &mut new_levels[..],
-                                        false, false, true,
-                                        0));
+        let page = if needs_dup {
+            try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, false, false, 0, true))
+        } else {
+            try!(cow_pinpointing(rng, txn, page,
+                                 &levels,
+                                 &mut new_levels,
+                                 false, false, true,
+                                 0))
+        };
         let next = u16::from_le(unsafe { *(page.offset(new_levels[0] as isize) as *const u16) });
         unsafe { *((page.offset(next as isize) as *mut u64).offset(2)) = new_child_page.page_offset().to_le() }
         Ok(Res::Ok { page:page })
@@ -52,22 +65,31 @@ pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
 
 /// child_page is the current element's right child.
 pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
-                                                child_page:Cow, delete:[u16;N_LEVELS], replace_page:u64, do_free_value:bool) -> Result<Res, Error> {
+                                                child_page:Cow, delete:[u16;N_LEVELS], replace_page:u64, do_free_value:bool, needs_dup:bool) -> Result<Res, Error> {
     // Actually delete and replace in the child.
     let new_child_page = {
         let mut new_delete = [0;N_LEVELS];
-        try!(cow_pinpointing(rng, txn, child_page,
-                             &delete[..],
-                             &mut new_delete[..],
-                             true, do_free_value, true,
-                             replace_page))
+        if needs_dup {
+            try!(copy_page(rng, txn, &child_page.as_page(), &delete, &mut new_delete, true, do_free_value, replace_page, true))
+        } else {
+            try!(cow_pinpointing(rng, txn, child_page,
+                                 &delete,
+                                 &mut new_delete,
+                                 true, do_free_value, true,
+                                 replace_page))
+        }
     };
     let mut new_levels = [0;N_LEVELS];
-    let page = try!(cow_pinpointing(rng, txn, page,
-                                    &levels[..],
-                                    &mut new_levels[..],
-                                    false, false, true,
-                                    0));
+    let page =
+        if needs_dup {
+            try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, false, false, 0, true))
+        } else {
+            try!(cow_pinpointing(rng, txn, page,
+                                 &levels[..],
+                                 &mut new_levels[..],
+                                 false, false, true,
+                                 0))
+        };
     unsafe { *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = new_child_page.page_offset().to_le() }
     Ok(Res::Ok { page:page })
 }
@@ -80,7 +102,7 @@ pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, 
 /// Assumes the child page is the next element's right child.
 pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
                                  replacement:Option<&Smallest>,
-                                 child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool) -> Result<Res, Error> {
+                                 child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool, needs_dup:bool) -> Result<Res, Error> {
     debug!("rebalance_right");
 
     // First operation: take all elements from one of the sides of the
@@ -137,13 +159,21 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     // sizes. "dependent types lifetimes" would be great here,
     // but raw pointers also do the trick.
     unsafe {
-        *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) =
-            *((left_child.offset(FIRST_HEAD as isize) as *const u64).offset(2));
+        let left_left_child = u64::from_le(*((left_child.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
+        *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left_left_child.to_le();
+        /*if needs_dup && left_left_child > 0 {
+            try!(incr_rc(rng, txn, left_left_child))
+        }*/
     }
     let mut left_bytes = 24;
     let mut left_levels = [0;N_LEVELS];
     let mut right_levels = [0;N_LEVELS];
     for (_, key, value, r) in PI::new(&left_child,0) {
+
+        /*if needs_dup && r > 0 {
+            try!(incr_rc(rng, txn, r))
+        }*/
+
         let next_size = record_size(key.len(),value.len() as usize);
         if middle.is_none() {
             debug!("left_bytes = {:?} {:?} {:?}", left_bytes, size, next_size);
@@ -192,6 +222,9 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         debug_assert!(off > 0);
         debug_assert!(off + next_size <= PAGE_SIZE as u16);
         debug!("key -> right (middle): {:?}", std::str::from_utf8(key));
+        /*if needs_dup && right_left_child > 0 {
+            try!(incr_rc(rng, txn, right_left_child))
+        }*/
         unsafe { local_insert_at(rng, &mut new_right, key, value, right_left_child, off, next_size, &mut right_levels) }
     }
 
@@ -205,6 +238,10 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             debug_assert!(off + next_size <= PAGE_SIZE as u16);
             last_updated_ptr = new_right.offset(off as isize);
             debug!("key -> right: {:?}", std::str::from_utf8(key));
+
+            /*if needs_dup && r > 0 {
+                try!(incr_rc(rng, txn, r))
+            }*/
             unsafe {local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
         } else {
             if do_free_value {
@@ -212,6 +249,9 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
                     try!(free_value(rng, txn, offset, len))
                 }
             }
+            /*if needs_dup && r > 0 {
+                try!(decr_rc(rng, txn, r)) // it will be replaced.
+            }*/
             unsafe { *((last_updated_ptr as *mut u64).offset(2)) = replace_page.to_le(); }
         }
     }
@@ -220,8 +260,12 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     let result = {
         let mut new_levels = [0;N_LEVELS];
         // Delete the current entry, insert the new one instead.
-        let page = try!(cow_pinpointing(rng, txn, page, &mut levels, &mut new_levels, true, false, true, new_left.page_offset()));
-
+        let page =
+            if needs_dup {
+                try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, new_left.page_offset(), true))
+            } else {
+                try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, true, new_left.page_offset()))
+            };
         if let Some((key_ptr,key_len,value,r)) = middle {
 
             unsafe { *((new_right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = r.to_le(); }
@@ -239,7 +283,9 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     debug!("result = {:?}", result);
     //
     debug!("freeing left: {:?}", left_child.page_offset());
-    try!(free(rng, txn, left_child.page_offset(), false));
+    if !needs_dup {
+        try!(free(rng, txn, left_child.page_offset(), false));
+    }
     result
 }
 
@@ -256,7 +302,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 ///
 /// Assumes `child_page` is the current element's right child.
 pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
-                                child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool) -> Result<Res, Error> {
+                                child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool, needs_dup:bool) -> Result<Res, Error> {
     debug!("rebalance_left");
 
     // First operation: take all elements from one of the sides of the
@@ -324,6 +370,10 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             debug_assert!(off > 0);
             debug_assert!(off + next_size <= PAGE_SIZE as u16);
             last_updated_ptr = new_left.offset(off as isize);
+
+            /*if needs_dup && r > 0 {
+                try!(incr_rc(rng, txn, r))
+            }*/
             unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
             left_bytes += next_size;
         } else {
@@ -337,16 +387,27 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     }
     {
         let right_left_child = u64::from_le(unsafe { *((child_page.offset(0) as *const u64).offset(2)) });
+        /*if needs_dup && right_left_child > 0 {
+            try!(incr_rc(rng, txn, right_left_child))
+        }*/
         let (key,value) = unsafe { read_key_value(page.offset(next as isize)) };
         let next_size = record_size(key.len(),value.len() as usize);
         let off = new_left.can_alloc(next_size);
         debug_assert!(off > 0);
         debug_assert!(off + next_size <= PAGE_SIZE as u16);
+        /*if needs_dup && right_left_child > 0 {
+            try!(incr_rc(rng, txn, right_left_child))
+        }*/
         unsafe { local_insert_at(rng, &mut new_left, key, value, right_left_child, off, next_size, &mut left_levels) };
         left_bytes += next_size;
     }
 
     for (_, key, value, r) in PI::new(&right_child,0) {
+
+        /*if needs_dup && r > 0 {
+            try!(incr_rc(rng, txn, r))
+        }*/
+
         let next_size = record_size(key.len(),value.len() as usize);
         if middle.is_none() {
             debug!("left_bytes = {:?} {:?} {:?}", left_bytes, size, next_size);
@@ -376,8 +437,12 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     let result = {
         let mut new_levels = [0;N_LEVELS];
         // Delete the current entry, insert the new one instead.
-        let page = try!(cow_pinpointing(rng, txn, page, &mut levels, &mut new_levels, true, false, true, new_left.page_offset()));
-
+        let page =
+            if needs_dup {
+                try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, new_left.page_offset(), true))
+            } else {
+                try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, true, new_left.page_offset()))
+            };
         if let Some((key_ptr,key_len,value,r)) = middle {
 
             unsafe { *((new_right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = r.to_le(); }
@@ -394,8 +459,10 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     };
     debug!("result = {:?}", result);
     //
-    debug!("freeing left: {:?}", right_child.page_offset());
-    try!(free(rng, txn, right_child.page_offset(), false));
+    if !needs_dup {
+        debug!("freeing left: {:?}", right_child.page_offset());
+        try!(free(rng, txn, right_child.page_offset(), false));
+    }
     result
 }
 

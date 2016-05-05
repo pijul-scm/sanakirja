@@ -47,7 +47,8 @@ pub struct Smallest {
 //
 fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, levels:[u16;N_LEVELS],
                               child_page:Cow,
-                              delete:[u16;N_LEVELS], merged:u64, do_free_value:bool) -> Result<(Res,bool), Error> {
+                              delete:[u16;N_LEVELS], merged:u64,
+                              do_free_value:bool, needs_dup:bool) -> Result<(Res,bool), Error> {
     debug!("handle_underfull");
     let mut new_levels = [0;N_LEVELS];
     unsafe {
@@ -57,7 +58,7 @@ fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, leve
     // First try to merge with our right sibling.
     let next_offset = unsafe { u16::from_le(*(page.offset(levels[0] as isize) as *const u16)) };
     if next_offset != NIL {
-        match try!(merge::merge_children_right(rng, txn, page, levels, &child_page, &delete, merged, do_free_value)) {
+        match try!(merge::merge_children_right(rng, txn, page, levels, &child_page, &delete, merged, do_free_value, needs_dup)) {
 
             Res::Nothing { page:page_ } => {
                 // If we couldn't merge:
@@ -73,9 +74,9 @@ fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, leve
                     unsafe {
                         std::ptr::copy_nonoverlapping(levels.as_ptr(), new_levels.as_mut_ptr(), N_LEVELS)
                     }
-                    match try!(rebalance::rebalance_left(rng, txn, page_, levels, &child_page, forgetting, merged, do_free_value)) {
+                    match try!(rebalance::rebalance_left(rng, txn, page_, levels, &child_page, forgetting, merged, do_free_value, needs_dup)) {
                         Res::Nothing { page:page_ } => {
-                            let result = try!(rebalance::handle_failed_left_rebalancing(rng, txn, page_, levels, child_page, delete, merged, do_free_value));
+                            let result = try!(rebalance::handle_failed_left_rebalancing(rng, txn, page_, levels, child_page, delete, merged, do_free_value, needs_dup));
                             return Ok((result, false))
                         },
                         x => {
@@ -92,20 +93,20 @@ fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, leve
             res => return Ok((res,true))
         }
     }
-    // If we haven't find a solution so far, move to the previous element, and merge the child page with its left sibling.
+    // If we haven't found a solution so far, move to the previous element, and merge the child page with its left sibling.
 
     // Move back by one
     debug!("trying to merge to left");
     set_pred(&page, &mut new_levels);
-    match try!(merge::merge_children_left(rng, txn, page, new_levels, &child_page, &delete, merged, do_free_value)) {
+    match try!(merge::merge_children_left(rng, txn, page, new_levels, &child_page, &delete, merged, do_free_value, needs_dup)) {
         Res::Nothing { page } => {
             // we couldn't merge. rebalance.
             debug!("second case of rebalancing: {:?}", child_page);
             let forgetting = u16::from_le(unsafe { *(child_page.offset(delete[0] as isize) as *const u16) });
-            let result = match try!(rebalance::rebalance_right(rng, txn, page, new_levels, None, &child_page, forgetting, merged, do_free_value)) {
+            let result = match try!(rebalance::rebalance_right(rng, txn, page, new_levels, None, &child_page, forgetting, merged, do_free_value, needs_dup)) {
                 Res::Nothing { page:page_ } => {
                     debug!("failed rebalancing");
-                    Ok((try!(rebalance::handle_failed_right_rebalancing(rng, txn, page_, new_levels, None, child_page, delete, merged, do_free_value)), false))
+                    Ok((try!(rebalance::handle_failed_right_rebalancing(rng, txn, page_, new_levels, None, child_page, delete, merged, do_free_value, needs_dup)), false))
                 },
                 x => Ok((x,true))
             };
@@ -163,21 +164,21 @@ fn set_pred(page:&Cow, levels:&mut [u16]) {
 fn handle_underfull_replace<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
                                      child_page:Cow,
                                      replacement:&Smallest,
-                                     delete:[u16;N_LEVELS], merged:u64) -> Result<Res, Error> {
+                                     delete:[u16;N_LEVELS], merged:u64, needs_dup:bool) -> Result<Res, Error> {
     debug!("handle_underfull_replace");
     // First try to merge with our right sibling.
     match try!(merge::merge_children_replace(
         rng, txn, page, levels, &child_page,
         replacement,
-        &delete, merged)) {
+        &delete, merged, needs_dup)) {
         
         Res::Nothing { page:page_ } => {
             // If we couldn't merge:
             debug!("rebalancing: {:?}", levels[0]);
             let forgetting = u16::from_le(unsafe { *(child_page.offset(delete[0] as isize) as *const u16) });
-            match try!(rebalance::rebalance_right(rng, txn, page_, levels, Some(replacement), &child_page, forgetting, merged, false)) {
+            match try!(rebalance::rebalance_right(rng, txn, page_, levels, Some(replacement), &child_page, forgetting, merged, false, needs_dup)) {
                 Res::Nothing { page:page_} => {
-                    return rebalance::handle_failed_right_rebalancing(rng, txn, page_, levels, Some(replacement), child_page, delete, merged, false)
+                    return rebalance::handle_failed_right_rebalancing(rng, txn, page_, levels, Some(replacement), child_page, delete, merged, false, needs_dup)
                 },
                 x => Ok(x)
             }
@@ -191,7 +192,7 @@ fn handle_underfull_replace<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, 
 
 
 
-fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS]) -> Result<Res,Error> {
+fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS], needs_dup:bool) -> Result<Res,Error> {
     debug!("delete_at_internal_node {:?}", page);
     // Not found below, but we can delete something here.
 
@@ -206,7 +207,7 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
 
     // Delete the smallest element of the current binding's right child.
     debug!("delete smallest, levels = {:?}", &levels[..]);
-    match try!(delete(rng,txn, child_page, C::Smallest)) {
+    match try!(delete(rng,txn, child_page, C::Smallest, needs_dup)) {
         (Res::Ok { page: child_page }, Some(smallest)) => {
             debug!("internal: ok");
             // Set the child page here, regardless of whether a merge is coming after this.
@@ -224,14 +225,17 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
             
             let off = page.can_alloc(size);
             let result = if off > 0 {
-
-
                 let mut new_levels = [0;N_LEVELS];
-                let mut page = if off + size < PAGE_SIZE as u16 {
-                    try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true, true, 0))
-                } else {
-                    try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels, &mut new_levels, true, true, true, 0))
-                };
+                let mut page =
+                    if needs_dup {
+                        try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, true, 0, true))
+                    } else {
+                        if off + size < PAGE_SIZE as u16 {
+                            try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true, true, 0))
+                        } else {
+                            try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels, &mut new_levels, true, true, !needs_dup, 0))
+                        }
+                    };
                 let off = page.can_alloc(size);
 
                 debug_assert!(off + size <= PAGE_SIZE as u16);
@@ -247,20 +251,21 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                                     key, smallest.value, child_page.page_offset(),
                                     next_off, 0))
                 }
-                                
             };
-            println!("freeing {:?}, child={:?}", smallest.free_page, child_page);
+            println!("freeing {:?} {:?}, child={:?}", smallest.free_page, smallest.needs_freeing, child_page);
             if smallest.needs_freeing {
                 try!(free(rng, txn, smallest.free_page, false));
             }
             Ok(result)
         },
-        (Res::Underfull { page: child_page, delete, merged, .. }, Some(smallest)) => {
-
+        (Res::Underfull { page: child_page, delete, merged, needs_dup:needs_dup_, .. }, Some(smallest)) => {
+            let needs_dup = needs_dup || needs_dup_;
             debug!("internal: underfull");
             let child_page_offset = child_page.page_offset();
-            let result = handle_underfull_replace(rng, txn, page, levels, child_page, &smallest, delete, merged);
-            try!(free(rng, txn, child_page_offset, false));
+            let result = handle_underfull_replace(rng, txn, page, levels, child_page, &smallest, delete, merged, needs_dup);
+            if !needs_dup {
+                try!(free(rng, txn, child_page_offset, false));
+            }
             if smallest.needs_freeing && smallest.free_page != child_page_offset {
                 try!(free(rng, txn, smallest.free_page, false));
             }
@@ -283,7 +288,11 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
 
                 let mut new_levels = [0;N_LEVELS];
                 // Delete the current element.
-                let mut page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, true, 0));
+                let mut page = if needs_dup {
+                    try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, 0, true))
+                } else {
+                    try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, true, 0))
+                };
                 // Reinsert the left page with the smallest key.
                 unsafe {
                     local_insert_at(rng, &mut page, middle_key, value, right.page_offset(), middle_off, middle_size, &mut new_levels);
@@ -304,7 +313,9 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                                levels[0], left.page_offset())
                 }
             };
-            try!(free(rng, txn, free_page, false));
+            if !needs_dup {
+                try!(free(rng, txn, free_page, false));
+            }
             if smallest.needs_freeing {
                 try!(free(rng, txn, smallest.free_page, false));
             }
@@ -324,7 +335,7 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
 }
 
 
-fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<(Res,Option<Smallest>), Error> {
+fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C, needs_dup:bool) -> Result<(Res,Option<Smallest>), Error> {
 
     debug!("delete = {:?}", page);
     let mut levels:[u16;N_LEVELS] = [FIRST_HEAD;N_LEVELS];
@@ -336,14 +347,26 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
     }
     let child_page = u64::from_le(unsafe { *((page.offset(levels[0] as isize) as *const u64).offset(2)) });
     debug!("next_page = {:?}, {:?}", child_page, eq);
+    let page_rc = get_rc(txn, page.page_offset());
+    let needs_dup = needs_dup || (page_rc > 1);
+    debug!("needs_dup={:?} {:?}", needs_dup, page_rc);
+
+    // If the reference count of the current page is n > 1, we need to
+    // decrement it, as it will no longer be referenced from its
+    // current reference.
+    if page_rc > 1 {
+        try!(decr_rc(rng, txn, page.page_offset()))
+    }
+
     let del = if child_page > 0 {
         let next_page = txn.load_cow_page(child_page);
-        Some(try!(delete(rng, txn, next_page, comp)))
+        Some(try!(delete(rng, txn, next_page, comp, needs_dup)))
     } else {
         None
     };
     match del {
         None if eq => {
+            debug!("deleting here, rc={:?}", page_rc);
             let (next_key,next_value) = {
                 let cur_ptr = page.offset(levels[0] as isize) as *const u16;
                 let next_off = u16::from_le(unsafe { *cur_ptr });
@@ -364,16 +387,23 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
                             key_len: next_key.len(),
                             value: next_value,
                             free_page: page.page_offset(),
-                            needs_freeing: true
+                            needs_freeing: !needs_dup
                         });
-                    Ok((Res::Underfull { page:page, delete: levels, merged:0, free_value: false }, smallest))
+                    Ok((Res::Underfull { page:page, delete: levels, merged:0, free_value: false,
+                                         needs_dup: needs_dup }, smallest))
                 } else {
                     // Else, we need to actually delete something, but
                     // since we're returning something from this page,
                     // we must not free it.
                     let mut new_levels = [0;N_LEVELS];
                     let former_offset = page.page_offset();
-                    let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, false, 0));
+                    let page =
+                        if needs_dup {
+                            // copy without referencing children (there are no children).
+                            try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, 0, false))
+                        } else {
+                            try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, false, 0))
+                        };
                     let smallest =
                         Some(Smallest {
                             key_ptr: next_key.as_ptr(),
@@ -386,25 +416,35 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
                     Ok((Res::Ok { page:page }, smallest))
                 }
             } else {
-                debug!("{:?} {:?}", will_be_underfull, levels);
+                debug!("will_be_underfull = {:?} {:?}", will_be_underfull, levels);
                 if will_be_underfull {
-                    Ok((Res::Underfull { page:page, delete: levels, merged:0, free_value: true }, None))
+                    Ok((Res::Underfull { page:page, delete: levels, merged:0, free_value: true,
+                                         needs_dup: needs_dup }, None))
                 } else {
                     let mut new_levels = [0;N_LEVELS];
-                    let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true, true, 0));
+                    let page =
+                        if needs_dup {
+                            try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, 0, false))
+                        } else {
+                            try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true, true, 0))
+                        };
+                    debug!("page={:?}", page);
                     Ok((Res::Ok { page:page }, None))
                 }
             }
         },
         Some((Res::Nothing { .. }, _)) if eq => {
             // Find smallest, etc.
-            Ok((try!(delete_at_internal_node(rng, txn, page, levels)), None))
+            Ok((try!(delete_at_internal_node(rng, txn, page, levels, needs_dup)), None))
         },
-        Some((Res::Underfull { page:child_page, delete, merged, free_value }, mut smallest)) => {
+        Some((Res::Underfull { page:child_page, delete, merged, free_value, needs_dup:needs_dup_ }, mut smallest)) => {
+            let needs_dup = needs_dup || needs_dup_;
+
             // Decide which neighbor to merge with.
             debug!("delete: underfull {:?}", child_page);
             let child_page_offset = child_page.page_offset();
-            let (result, rebalanced) = try!(handle_underfull(rng, txn, page, levels, child_page, delete, merged, free_value));
+            let (result, rebalanced) = try!(handle_underfull(rng, txn, page, levels, child_page,
+                                                             delete, merged, free_value, needs_dup));
             debug!("underfull done, rebalanced {:?}", rebalanced);
             match smallest {
                 Some(ref mut smallest) if smallest.free_page == child_page_offset => {
@@ -416,7 +456,7 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
                         smallest.needs_freeing = false
                     }
                 },
-                _ if rebalanced => {
+                _ if rebalanced && !needs_dup => {
                     try!(free(rng, txn, child_page_offset, false))
                 },
                 _ => {}
@@ -427,8 +467,13 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
             debug!("ok, back to page {:?} with child {:?}", page.page_offset(), child_page.page_offset());
             // Update the pointer here
             let mut new_levels = [0;N_LEVELS];
-            let page = try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels,
-                                            false, false, true, child_page.page_offset()));
+            let page =
+                if needs_dup {
+                    try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels,
+                                   false, false, child_page.page_offset(), true))
+                } else {
+                    try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, false, false, true, child_page.page_offset()))
+                };
             Ok((Res::Ok { page:page }, smallest))
         },
         Some((Res::Nothing {.. },_)) | None => {
@@ -439,10 +484,11 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C) -> Result<
             // Now reinsert the element here.
             let key_ = unsafe {std::slice::from_raw_parts(key_ptr, key_len)};
             let result = unsafe {
-                try!(full_local_insert(rng, txn, page, key_, value_, right.page_offset(),
-                                       &mut levels, left.page_offset(), false))
+                try!(full_local_insert(rng, txn, page, key_, value_, right.page_offset(), &mut levels, left.page_offset(), false))
             };
-            try!(free(rng, txn, free_page, false));
+            if !needs_dup {
+                try!(free(rng, txn, free_page, false));
+            }
             Ok((result, smallest))
         },
     }
@@ -462,7 +508,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
     };
     unsafe {
         debug!("root: {:?}", root_page);
-        match try!(delete(rng,txn, root_page, comp)) {
+        match try!(delete(rng,txn, root_page, comp, false)) {
             (Res::Ok { page }, None) => {
                 // Maybe the root is empty. Check
                 let next = u16::from_le(*(page.offset(FIRST_HEAD as isize) as *const u16));
@@ -475,13 +521,25 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                 }
                 Ok(true)
             },
-            (Res::Underfull { page, delete, merged, free_value }, None) => {
+            (Res::Underfull { page, delete, merged, free_value, needs_dup }, None) => {
                 let mut new_levels = [0;N_LEVELS];
-                let page = try!(cow_pinpointing( rng, txn, page,
-                                                 &delete[..],
-                                                 &mut new_levels[..],
-                                                 true, free_value, true,
-                                                 merged));
+
+                let page_rc = get_rc(txn, page.page_offset());
+
+                let page =
+                    if page_rc > 1 || needs_dup {
+                        decr_rc(rng, txn, page.page_offset());
+                        try!(copy_page( rng, txn, &page.as_page(),
+                                        &delete,
+                                        &mut new_levels,
+                                        true, free_value, merged, true))
+                    } else {
+                        try!(cow_pinpointing( rng, txn, page,
+                                              &delete[..],
+                                              &mut new_levels[..],
+                                              true, free_value, true,
+                                              merged))
+                    };
                 
                 // If this page is empty, replace with next page.
                 let next = u16::from_le(*(page.offset(FIRST_HEAD as isize) as *const u16));
@@ -530,6 +588,7 @@ fn test_delete_leaf() {
     let tmp = tempdir::TempDir::new("pijul").unwrap();
     {
         let tmp_path = tmp.path();
+        debug!("tmp_path: {:?}", tmp_path);
         let env = Env::new(dir.path(), 1000).unwrap();
         let mut txn = env.mut_txn_begin();
 
@@ -581,7 +640,7 @@ fn test_delete_leaf() {
             let key = key_.as_bytes();
             let value = value_.as_bytes();
             let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
-            match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }) {
+            match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }, false) {
                 Ok((Res::Ok { page:page_, .. }, _)) => {
                     page = page_
                 },
@@ -613,7 +672,10 @@ fn test_delete_root() {
 
     let mut page = txn.alloc_page().unwrap();
     page.init();
+    let tmp = tempdir::TempDir::new("pijul").unwrap();
     unsafe {
+        let tmp_path = tmp.path();
+        debug!("tmp_path: {:?}", tmp_path);
         let mut insertions = Vec::new();
         for _ in 0..200 {
             //println!("i={:?}", i);
@@ -654,7 +716,7 @@ fn test_delete_root() {
             insertions.push((key_,value_))
         }
         let db = Db { root_num: -1, root: page.page_offset() };
-        txn.debug(&[&db], format!("/tmp/before"), false, false);
+        txn.debug(&[&db], tmp_path.join("before"), false, false);
         // Delete an entry in the root.
         {
             debug!("now deleting from the root page");
@@ -663,7 +725,7 @@ fn test_delete_root() {
             let next = page.offset(next_off as isize);
             let (key,value) = read_key_value(next as *const u8);
             debug!("deleting key {:?}", std::str::from_utf8(key).unwrap());
-            match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }) {
+            match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }, false) {
                 Ok((Res::Ok { page:page_, .. }, None)) => {
                     page = page_
                 },
@@ -671,10 +733,10 @@ fn test_delete_root() {
             }
         }
         debug!("delete done, debugging");
-        
         let db = Db { root_num: -1, root: page.page_offset() };
-        txn.debug(&[&db], format!("/tmp/after"), false, false);
+        txn.debug(&[&db], tmp_path.join("after"), false, false);
     }
+    std::mem::forget(tmp);
 }
 
 #[cfg(test)]
@@ -699,7 +761,10 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
 
     let mut page = txn.alloc_page().unwrap();
     page.init();
+    let tmp = tempdir::TempDir::new("pijul").unwrap();
     unsafe {
+        let tmp_path = tmp.path();
+        debug!("tmp_path: {:?}", tmp_path);
         let mut insertions = Vec::new();
         for i in 0..n {
             //println!("i={:?}", i);
@@ -742,12 +807,12 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
             debug!("key = {:?}", key_);
 
             let db = Db { root_num: -1, root: page.page_offset() };
-            txn.debug(&[&db], format!("/tmp/before_{}", i), false, false);
+            txn.debug(&[&db], tmp_path.join(format!("before_{}", i)), false, false);
 
             insertions.push((key_,value_, value))
         }
         let db = Db { root_num: -1, root: page.page_offset() };
-        txn.debug(&[&db], format!("/tmp/before"), false, false);
+        txn.debug(&[&db], tmp_path.join("before"), false, false);
 
         match sorted {
             Sorted::No => {},
@@ -770,7 +835,7 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
             let key = key.as_bytes();
             let value = value.as_bytes();
             let value = UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 };
-            match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }).unwrap() {
+            match delete(&mut rng, &mut txn, Cow::from_mut_page(page), C::KV { key:key, value:value }, false).unwrap() {
                 (Res::Ok { page:page_ }, None) => {
                     // If this page is empty, replace with next page.
                     let next = u16::from_le(*(page_.offset(FIRST_HEAD as isize) as *const u16));
@@ -781,7 +846,7 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
                         page = page_
                     }
                 },
-                (Res::Underfull { page:page_, delete, merged, free_value }, None) => {
+                (Res::Underfull { page:page_, delete, merged, free_value, needs_dup }, None) => {
                     println!("underfull, deleting {:?}", &delete[..]);
                     let mut new_levels = [0;N_LEVELS];
                     let page_ = cow_pinpointing(&mut rng, &mut txn, page_,
@@ -803,8 +868,7 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
                 (x,_) => page = root_split(&mut rng, &mut txn, x).unwrap(),
             }
             let db = Db { root_num: -1, root: page.page_offset() };
-            txn.debug(&[&db], format!("/tmp/after_{}", i), false, false);
-
+            txn.debug(&[&db], tmp_path.join(format!("after_{}", i)), false, false);
         }
         debug!("delete done, debugging");
         
@@ -815,6 +879,7 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
         }
         //txn.debug(&[&db], format!("/tmp/after"), false, false);
     }
+    std::mem::forget(tmp)
 }
 
 #[test]

@@ -809,7 +809,10 @@ mod tests {
             txn.commit().unwrap();
         }
         debug!("put done");
-        check_memory(&env, false);
+        let txn = env.txn_begin();
+        let db = txn.root(0).unwrap();
+        check_memory(&env, &txn, &[&db], true);
+
         let mut i = 0;
         for (ref k, ref v) in random.iter() {
             debug!("del i = {:?}, k = {:?}", i, k);
@@ -819,46 +822,62 @@ mod tests {
             txn.debug(&[&db], format!("/tmp/after_{}",i), false, false);
             txn.set_root(0, db);
             txn.commit().unwrap();
-            env.statistics();
-            check_memory(&env, false);
+
+            let txn = env.txn_begin();
+            let db = txn.root(0).unwrap();
+            check_memory(&env, &txn, &[&db], true);
+
             i+=1;
         }
     }
 
+    #[cfg(test)]
+    use std::collections::{HashSet,HashMap};
     
     #[cfg(test)]
-    fn check_memory(env:&Env, print:bool) {
-        use std::collections::{HashSet};
+    fn check_rc<T:Transaction>(txn:&T, dbs:&[&Db]) -> (HashMap<u64,usize>, HashMap<u64,usize>) {
+        use std::collections::{HashSet,HashMap};
+        use std::collections::hash_map::Entry;
         use super::txn::{Page,LoadPage,P, read_key_value, UnsafeValue};
+        use super::put::PI;
+        // let txn = env.txn_begin();
+        // let db = txn.root(0).unwrap();
+        fn count_pages<T:Transaction>(txn:&T, page:&Page, pages:&mut HashMap<u64,usize>, value_pages:&mut HashMap<u64,usize>) {
 
-        let txn = env.txn_begin();
-        let db = txn.root(0).unwrap();
-        fn count_pages(txn:&Txn, page:&Page, pages:&mut HashSet<u64>, value_pages:&mut HashSet<u64>) {
-            unsafe {
-                let already = pages.insert(page.page_offset());
-                if already {
-                    let mut current = 0;
-                    while current != 0xffff {
-                        let child = u64::from_le(*(page.offset(current as isize) as *const u64).offset(2));
-                        if child > 0 {
-                            let child = txn.load_page(child);
-                            count_pages(txn, &child, pages, value_pages);
-                        }
-                        if current > 0 {
-                            let (_,value) = read_key_value(page.offset(current as isize));
-                            if let UnsafeValue::O { offset, len } = value {
-                                count_values(txn, offset, len, value_pages);
-                            }
-                        }
-                        current = u16::from_le(*(page.offset(current as isize) as *const u16));
+            let mut follow = false;
+            {
+                let e = pages.entry(page.page_offset()).or_insert(0);
+                if *e == 0 { follow = true }
+                *e += 1;
+                // debug!("count_pages: {:?} {:?}", page.page_offset(), *e);
+            }
+            if follow {
+                {
+                    let child = unsafe {
+                        u64::from_le(*(page.offset(0) as *const u64).offset(2))
+                    };
+                    if child > 0 {
+                        let child = txn.load_page(child);
+                        count_pages(txn, &child, pages, value_pages);
+                    }
+                }
+                for (_,_,value,child) in PI::new(page, 0) {
+                    if child > 0 {
+                        let child = txn.load_page(child);
+                        count_pages(txn, &child, pages, value_pages);
+                    }
+                    if let UnsafeValue::O { offset, len } = value {
+                        count_values(txn, offset, len, value_pages);
                     }
                 }
             }
         }
-        fn count_values(txn:&Txn, mut offset:u64, mut len:u32, pages:&mut HashSet<u64>) {
+        fn count_values<T:Transaction>(txn:&T, mut offset:u64, mut len:u32, pages:&mut HashMap<u64,usize>) {
             loop {
                 //println!("current offset = {:?}", offset);
-                pages.insert(offset);
+                let e = pages.entry(offset).or_insert(0);
+                *e += 1;
+                if *e > 1 { break }
                 if len <= super::transaction::PAGE_SIZE as u32 {
                     break
                 } else {
@@ -871,24 +890,41 @@ mod tests {
                 
             }
         }
-        let mut used_pages = HashSet::new();
-        let mut value_pages = HashSet::new();
-        let cow = txn.load_page(db.root);
-        count_pages(&txn, &cow, &mut used_pages, &mut value_pages);
+        let mut used_pages = HashMap::new();
+        let mut value_pages = HashMap::new();
+        for db in dbs {
+            // debug!("db: {:?}", db);
+            let cow = txn.load_page(db.root);
+            count_pages(txn, &cow, &mut used_pages, &mut value_pages);
+        }
+        (used_pages,value_pages)
+    }
+
+
+    #[cfg(test)]
+    fn check_memory<T:Transaction>(env:&Env, txn:&T, dbs:&[&Db], print:bool) {
+        use std::collections::{HashSet,HashMap};
+        use std::collections::hash_map::Entry;
+        use super::txn::{Page,LoadPage,P, read_key_value, UnsafeValue};
+        use super::put::PI;
+        let (used_pages,value_pages) = check_rc(txn, dbs);
         let statistics = env.statistics();
 
         // Check that no page is referenced and free at the same time.
-        assert!(statistics.free_pages.intersection(&used_pages).next().is_none());
-        assert!(statistics.free_pages.intersection(&value_pages).next().is_none());
-        assert!(value_pages.intersection(&used_pages).next().is_none());
-
+        for p in statistics.free_pages.iter() {
+            assert!(!used_pages.contains_key(p));
+            assert!(!value_pages.contains_key(p));
+        }
+        for (ref p,_) in used_pages.iter() {
+            assert!(!value_pages.contains_key(p));
+        }
         // Check that no page is referenced/free and bookkeeping at the same time.
         for i in statistics.bookkeeping_pages.iter() {
-            if !(used_pages.contains(i) && value_pages.contains(i) && statistics.free_pages.contains(i)) {
+            if !(used_pages.contains_key(i) && value_pages.contains_key(i) && statistics.free_pages.contains(i)) {
                 println!("i={:?}", i)
             }
-            assert!(! used_pages.contains(i));
-            assert!(! value_pages.contains(i));
+            assert!(! used_pages.contains_key(i));
+            assert!(! value_pages.contains_key(i));
             assert!(! statistics.free_pages.contains(i));
         }
         if print {
@@ -909,8 +945,8 @@ mod tests {
         while p < statistics.total_pages*4096 {
             if !(statistics.bookkeeping_pages.contains(&p)
                  || statistics.free_pages.contains(&p)
-                 || used_pages.contains(&p)
-                 || value_pages.contains(&p)) {
+                 || used_pages.contains_key(&p)
+                 || value_pages.contains_key(&p)) {
                 leaking.push(p)
                 }
             p+=4096
@@ -935,7 +971,9 @@ mod tests {
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        check_memory(&env, true);
+        let txn = env.txn_begin();
+        let db = txn.root(0).unwrap();
+        check_memory(&env, &txn, &[&db], true);
     }
 
     #[test]
@@ -948,7 +986,9 @@ mod tests {
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        check_memory(&env, true);
+        let txn = env.txn_begin();
+        let db = txn.root(0).unwrap();
+        check_memory(&env, &txn, &[&db], true);
     }
 
     #[test]
@@ -961,7 +1001,9 @@ mod tests {
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        check_memory(&env, true);
+        let txn = env.txn_begin();
+        let db = txn.root(0).unwrap();
+        check_memory(&env, &txn, &[&db], true);
     }
 
     #[test]
@@ -976,7 +1018,9 @@ mod tests {
         let env = Env::new(dir.path(), 5000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
-        check_memory(&env, true);
+        let txn = env.txn_begin();
+        let db = txn.root(0).unwrap();
+        check_memory(&env, &txn, &[&db], true);
     }
 
     #[test]
@@ -991,7 +1035,9 @@ mod tests {
         let env = Env::new(dir.path(), 10000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
-        check_memory(&env, true);
+        let txn = env.txn_begin();
+        let db = txn.root(0).unwrap();
+        check_memory(&env, &txn, &[&db], true);
     }
 
     #[test]
@@ -1006,7 +1052,9 @@ mod tests {
         let env = Env::new(dir.path(), 10000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
-        check_memory(&env, true);
+        let txn = env.txn_begin();
+        let db = txn.root(0).unwrap();
+        check_memory(&env, &txn, &[&db], true);
     }
 
     #[test]
@@ -1015,6 +1063,8 @@ mod tests {
         extern crate tempdir;
         extern crate rand;
         use super::Transaction;
+        extern crate env_logger;
+        env_logger::init().unwrap_or(());
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
@@ -1054,6 +1104,66 @@ mod tests {
     }
 
     #[test]
+    fn fork_put_del_basic() -> ()
+    {
+        extern crate tempdir;
+        extern crate rand;
+        use super::Transaction;
+        extern crate env_logger;
+        use std;
+        env_logger::init().unwrap_or(());
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let tmp = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
+        let mut txn = env.mut_txn_begin();
+        let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
+        println!("root: {:?}", root);
+
+        let common = b"test_key";
+        let common_value = b"blabla";
+        let common0 = b"test_key 0";
+        let common0_value = b"aasnth, onot !";
+
+        let key0 = b"key 0";
+        let key0_value = b"blibli";
+
+        let key1 = b"key 1";
+        let key1_value = b"blublu";
+
+        txn.put(&mut rng, &mut root, common, common_value).unwrap();
+        txn.put(&mut rng, &mut root, common0, common0_value).unwrap();
+        let mut root2 = txn.fork_db(&mut rng, &root).unwrap();
+        txn.put(&mut rng, &mut root, key0, key0_value).unwrap();
+        txn.put(&mut rng, &mut root2, key1, key1_value).unwrap();
+        txn.del(&mut rng, &mut root2, common0, None).unwrap();
+        txn.set_root(0, root);
+        txn.set_root(1, root2);
+        txn.commit().unwrap();
+        println!("committed");
+
+        let txn = env.txn_begin();
+        let root0 = txn.root(0).unwrap();
+        let root1 = txn.root(1).unwrap();
+
+        txn.debug(&[&root0, &root1], tmp.path().join(format!("after")), false, false);
+        debug!("tmp: {:?}", tmp.path());
+        std::mem::forget(tmp);
+        assert!(txn.get(&root0, common, None).is_some());
+        assert!(txn.get(&root0, common0, None).is_some());
+        assert!(txn.get(&root0, key0, None).is_some());
+        assert!(txn.get(&root0, key1, None).is_none());
+
+        assert!(txn.get(&root1, common, None).is_some());
+        assert!(txn.get(&root1, common0, None).is_none());
+        assert!(txn.get(&root1, key0, None).is_none());
+        assert!(txn.get(&root1, key1, None).is_some());
+    }
+
+
+
+    
+    #[test]
     fn fork_put_many() -> ()
     {
         extern crate tempdir;
@@ -1061,10 +1171,16 @@ mod tests {
         use super::Transaction;
         use rand::Rng;
         use std::collections::HashMap;
+        use std;
+
+        extern crate env_logger;
+        env_logger::init().unwrap_or(());
+
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
 
+        let tmp = tempdir::TempDir::new("pijul").unwrap();
 
         let key_len = 200;
         let value_len = 200;
@@ -1115,18 +1231,105 @@ mod tests {
                 txn.put(&mut rng, &mut root1, k0.as_bytes(), v0.as_bytes()).unwrap();
                 values1.insert(k0,v0);
             }
-            txn.debug(&[&root0, &root1], format!("/tmp/after_{}",j), false, false);
+            txn.debug(&[&root0, &root1], tmp.path().join(format!("after_{}",j)), false, false);
         }
-        txn.debug(&[&root0, &root1], format!("/tmp/forked"), false, false);
+        txn.debug(&[&root0, &root1], tmp.path().join("forked"), false, false);
         txn.set_root(0, root0);
         txn.set_root(1, root1);
 
 
         txn.commit().unwrap();
-
-
+        debug!("tmp: {:?}", tmp.path());
+        std::mem::forget(tmp);
 
     }
-    
 
+    #[test]
+    fn fork_put_del_many() -> ()
+    {
+        extern crate tempdir;
+        extern crate rand;
+        use super::Transaction;
+        use rand::Rng;
+        use std::collections::HashMap;
+        use std;
+
+        extern crate env_logger;
+        env_logger::init().unwrap_or(());
+
+        let mut rng = rand::thread_rng();
+        let dir = tempdir::TempDir::new("pijul").unwrap();
+        let env = Env::new(dir.path(), 100).unwrap();
+
+        let tmp = tempdir::TempDir::new("pijul").unwrap();
+
+        let tmp_path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+
+        let key_len = 200;
+        let value_len = 200;
+        let n_insertions = 20;
+        let n_del = 20;
+
+        let mut values0 = HashMap::new();
+        let mut values1 = HashMap::new();
+        
+        let mut txn = env.mut_txn_begin();
+        let mut root0 = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
+
+        for i in 0..n_insertions {
+            let k0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(key_len)
+                .collect();
+            let v0: String = rand::thread_rng()
+                .gen_ascii_chars()
+                .take(value_len)
+                .collect();
+
+            txn.put(&mut rng, &mut root0, k0.as_bytes(), v0.as_bytes()).unwrap();
+            values0.insert(k0.clone(),v0.clone());
+            values1.insert(k0,v0);
+        }
+
+        let mut root1 = txn.fork_db(&mut rng, &root0).unwrap();
+        txn.debug(&[&root0, &root1], tmp_path.join("before"), false, false);
+
+        let mut j = 0;
+        for (ref u,ref v) in values0.iter() {
+
+            
+            debug!("j = {:?}", j);
+            debug!("deleting {:?}", u);
+            txn.del(&mut rng, &mut root1, u.as_bytes(), None).unwrap();
+            txn.debug(&[&root0, &root1], tmp_path.join(format!("after_{}",j)), false, false);
+            j+=1;
+
+            let (used_pages,value_pages) = check_rc(&txn, &[&root0, &root1]);
+
+            for (u, v) in used_pages.iter() {
+                debug!("page {:?}, actual rc = {:?}, from rc database {:?}", u, v, super::put::get_rc(&txn, *u));
+                assert!(*v == super::put::get_rc(&txn, *u) as usize
+                        || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
+            }
+            
+            debug!("check: {:?} {:?}", used_pages, value_pages);
+
+            if j >= n_del {
+                break
+            }
+        }
+        txn.debug(&[&root0, &root1], tmp_path.join("forked"), false, false);
+
+        txn.set_root(0, root0);
+        txn.set_root(1, root1);
+
+
+        txn.commit().unwrap();
+        debug!("tmp: {:?}", tmp_path);
+        let txn = env.txn_begin();
+        let db0 = txn.root(0).unwrap();
+        let db1 = txn.root(1).unwrap();
+        check_memory(&env, &txn, &[&db0, &db1], true);
+    }
 }

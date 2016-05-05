@@ -787,6 +787,12 @@ impl Cow {
             x => Cow { cow: x }
         }
     }
+    pub fn as_page(self) -> Page {
+        match self.cow {
+            transaction::Cow::Page(p) => Page { page: p },
+            transaction::Cow::MutPage(p) => Page { page: p.as_page() },
+        }
+    }
 }
 
 impl<'env,T> LoadPage for MutTxn<'env,T> {

@@ -14,7 +14,8 @@ pub enum Res {
         page: Cow, // The page where we want to delete something.
         delete: [u16;N_LEVELS], // The binding before the one we want to delete.
         merged: u64, // The updated left child of the deleted binding.
-        free_value: bool
+        free_value: bool,
+        needs_dup: bool
     },
     Split {
         key_ptr:*const u8,
@@ -67,26 +68,30 @@ pub fn fork_db<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Er
 }
 
 /// Increase the reference count of a page.
-fn incr_rc<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64)->Result<(),Error> {
+pub fn incr_rc<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64)->Result<(),Error> {
+    debug!(">>>>>>>>>>>> incr_rc");
     let mut rc = if let Some(rc) = txn.rc() { rc } else { try!(txn.create_db()) };
     let count = txn.get_u64(&rc, off).unwrap_or(1);
     debug!("incrementing page {:?} to {:?}", off, count+1);
     try!(txn.replace_u64(rng, &mut rc, off, count+1));
     txn.set_rc(rc);
+    debug!("<<<<<<<<<<<< incr_rc");
     Ok(())
 }
 
 /// Increase the reference count of a page.
-fn decr_rc<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64)->Result<(),Error> {
+pub fn decr_rc<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64)->Result<(),Error> {
     let mut rc = if let Some(rc) = txn.rc() { rc } else { try!(txn.create_db()) };
     let count = txn.get_u64(&rc, off).unwrap_or(1);
+    debug!(">>>>>>>>>>>> decr_rc {:?} {:?}", off, count);
     try!(txn.replace_u64(rng, &mut rc, off, count-1));
     txn.set_rc(rc);
+    debug!("<<<<<<<<<<<< decr_rc");
     Ok(())
 }
 
 /// Get the reference count of a page. Returns 0 if the page is not reference-counted.
-pub fn get_rc<T>(txn:&mut MutTxn<T>, off:u64) -> u64 {
+pub fn get_rc<T:super::Transaction>(txn:&T, off:u64) -> u64 {
     if let Some(rc) = txn.rc() {
         txn.get_u64(&rc, off).unwrap_or(1)
     } else {
@@ -126,8 +131,6 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool
             }
         }
         unsafe { transaction::free(&mut txn.txn, off) }
-    } else {
-        panic!("should really free");
     }
     Ok(())
 }
@@ -213,9 +216,9 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut l
 /// Therefore, we might need to copy pages without freeing the
 /// previous one, since their reference count is not yet updated.
 ///
-fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16], pinpoints:&mut [u16],
+pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16], pinpoints:&mut [u16],
                       forgetting_next: bool, forgetting_value:bool,
-                      translate_right: u64, rc_children:bool) -> Result<MutPage,Error> {
+                      translate_right: u64, incr_children_rc:bool) -> Result<MutPage,Error> {
     unsafe {
         // Reset all pinpoints.
         for i in 0.. N_LEVELS {
@@ -241,29 +244,31 @@ fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16]
             if old_levels[0]==FIRST_HEAD && translate_right > 0 {
                 translate_right
             } else {
-                u64::from_le(*((p.offset(FIRST_HEAD as isize) as *mut u64).offset(2)))
+                let r = u64::from_le(*((p.offset(FIRST_HEAD as isize) as *mut u64).offset(2)));
+                if incr_children_rc && r > 0 {
+                    try!(incr_rc(rng, txn, r))
+                }
+                r
             };
         *((page.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_page.to_le();
-        if rc_children {
-            if right_page > 0 && rc_children {
-                try!(incr_rc(rng, txn, right_page))
-            }
-        }
+
         for (current, key, value, right) in PI::new(p, 0) {
 
             let right = if current == old_levels[0] && translate_right > 0 {
                 translate_right
             } else {
-                if right > 0 && rc_children {
-                    try!(incr_rc(rng, txn, right))
-                }
                 right
             };
             if current != forget {
+
+                if right > 0 && right != translate_right && incr_children_rc {
+                    try!(incr_rc(rng, txn, right))
+                }
+
                 // Increase count of value if the previous
                 // page is not freed at the end of this
                 // function.
-                if rc_children {
+                if incr_children_rc {
                     if let UnsafeValue::O { offset,.. } = value {
                         try!(incr_rc(rng, txn, offset))
                     }
@@ -291,11 +296,13 @@ fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[u16]
                 if old_levels[0] == current {
                     pinpoints[0] = off
                 }
-            } else if forgetting_value {
-                // Here, maybe we need to forget
-                if let UnsafeValue::O { offset, len } = value {
-                    //println!("cow_pinpointing: freeing value {:?}", offset);
-                    try!(free_value(rng, txn, offset, len))
+            } else {
+                if forgetting_value {
+                    // Here, maybe we need to forget
+                    if let UnsafeValue::O { offset, len } = value {
+                        //println!("cow_pinpointing: freeing value {:?}", offset);
+                        try!(free_value(rng, txn, offset, len))
+                    }
                 }
             }
             n+=1;
