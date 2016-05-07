@@ -1253,7 +1253,7 @@ mod tests {
         use rand::Rng;
         use std::collections::HashMap;
         use std;
-
+        use super::txn::LoadPage;
         extern crate env_logger;
         env_logger::init().unwrap_or(());
 
@@ -1268,8 +1268,8 @@ mod tests {
 
         let key_len = 200;
         let value_len = 200;
-        let n_insertions = 20;
-        let n_del = 20;
+        let n_insertions = 50;
+        let n_del = n_insertions;
 
         let mut values0 = HashMap::new();
         let mut values1 = HashMap::new();
@@ -1330,6 +1330,15 @@ mod tests {
         let txn = env.txn_begin();
         let db0 = txn.root(0).unwrap();
         let db1 = txn.root(1).unwrap();
-        check_memory(&env, &txn, &[&db0, &db1], true);
+
+        let (used_pages,value_pages) = check_rc(&txn, &[&db0, &db1]);
+
+        for (u, v) in used_pages.iter() {
+            debug!("page {:?}, actual rc = {:?}, from rc database {:?}", u, v, super::put::get_rc(&txn, *u));
+            assert!(*v == super::put::get_rc(&txn, *u) as usize
+                    || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
+        }
+        let rc_db = txn.rc().unwrap();
+        check_memory(&env, &txn, &[&db0, &db1, &rc_db], true);
     }
 }

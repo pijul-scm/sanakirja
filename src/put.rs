@@ -130,7 +130,10 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool
                 try!(free(rng, txn, r, true))
             }
         }
-        unsafe { transaction::free(&mut txn.txn, off) }
+        debug!("really freeing {:?}", off);
+        if !cfg!(feature="no_free") {
+            unsafe { transaction::free(&mut txn.txn, off) }
+        }
     }
     Ok(())
 }
@@ -186,7 +189,7 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut l
         } else {
             true
         };
-    if really_free {
+    if (!cfg!(feature="no_free")) && really_free {
         unsafe {
             loop {
                 if len <= PAGE_SIZE as u32 {
@@ -331,7 +334,9 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                             txn.set_rc(rc);
                         }
                         //println!("free cow: {:?}", page_offset);
-                        transaction::free(&mut(txn.txn), p0_offset)
+                        if !cfg!(feature="no_free") {
+                            transaction::free(&mut(txn.txn), p0_offset)
+                        }
                     } else {
                         let mut rc = txn.rc().unwrap();
                         try!(txn.replace_u64(rng, &mut rc, p0_offset, page_rc-1));

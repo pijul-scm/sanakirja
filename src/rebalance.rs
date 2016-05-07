@@ -82,15 +82,16 @@ pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, 
     let mut new_levels = [0;N_LEVELS];
     let page =
         if needs_dup {
-            try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, false, false, 0, true))
+            try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, false, false,
+                           new_child_page.page_offset(), true))
         } else {
             try!(cow_pinpointing(rng, txn, page,
                                  &levels[..],
                                  &mut new_levels[..],
                                  false, false, true,
-                                 0))
+                                 new_child_page.page_offset()))
         };
-    unsafe { *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = new_child_page.page_offset().to_le() }
+    // unsafe { *((page.offset(new_levels[0] as isize) as *mut u64).offset(2)) = new_child_page.page_offset().to_le() }
     Ok(Res::Ok { page:page })
 }
 
@@ -102,7 +103,9 @@ pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, 
 /// Assumes the child page is the next element's right child.
 pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
                                  replacement:Option<&Smallest>,
-                                 child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool, needs_dup:bool) -> Result<Res, Error> {
+                                 child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool,
+                                 needs_dup_below:bool,
+                                 needs_dup:bool) -> Result<Res, Error> {
     debug!("rebalance_right");
 
     // First operation: take all elements from one of the sides of the
@@ -283,7 +286,8 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     debug!("result = {:?}", result);
     //
     debug!("freeing left: {:?}", left_child.page_offset());
-    if !needs_dup {
+    let left_child_rc = get_rc(txn, left_child.page_offset());
+    if !needs_dup || left_child_rc > 1 {
         try!(free(rng, txn, left_child.page_offset(), false));
     }
     result
@@ -302,7 +306,9 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 ///
 /// Assumes `child_page` is the current element's right child.
 pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
-                                child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool, needs_dup:bool) -> Result<Res, Error> {
+                                child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool,
+                                needs_dup_below:bool,
+                                needs_dup:bool) -> Result<Res, Error> {
     debug!("rebalance_left");
 
     // First operation: take all elements from one of the sides of the
@@ -459,8 +465,9 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     };
     debug!("result = {:?}", result);
     //
-    if !needs_dup {
-        debug!("freeing left: {:?}", right_child.page_offset());
+    debug!("freeing left: {:?}", right_child.page_offset());
+    let right_child_rc = get_rc(txn, right_child.page_offset());
+    if !needs_dup || right_child_rc > 1 {
         try!(free(rng, txn, right_child.page_offset(), false));
     }
     result

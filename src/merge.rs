@@ -18,7 +18,7 @@ fn merge_page<R:Rng,T>(
     txn:&mut MutTxn<T>,
     source:&Cow, mut target:&mut MutPage,
     levels:&mut [u16],
-    forgetting:u16, replace_page:u64, do_free_value:bool, needs_dup:bool) -> Result<(),Error> {
+    forgetting:u16, replace_page:u64, do_free_value:bool, needs_dup_below:bool) -> Result<(),Error> {
     unsafe {
         // A pointer to the last inserted value, so we can replace the
         // deleted's left child with `replace_page`
@@ -66,7 +66,7 @@ fn merge_right<R:Rng,T>(
     rng:&mut R,
     txn:&mut MutTxn<T>,
     left:&Cow, right:&mut MutPage, forgetting:u16, replace_page:u64,
-    key:&[u8], value:UnsafeValue, do_free_value:bool, needs_dup:bool) -> Result<(), Error> {
+    key:&[u8], value:UnsafeValue, do_free_value:bool, needs_dup_below:bool) -> Result<(), Error> {
     unsafe {
         debug!("merge right {:?} {:?} {:?}", left.page_offset(), right.page_offset(), std::str::from_utf8(key));
         // Merge the left page into the right page.
@@ -75,7 +75,7 @@ fn merge_right<R:Rng,T>(
         let child = u64::from_le(*((right.offset(0) as *const u64).offset(2)));
         *((right.offset(0) as *mut u64).offset(2)) = *((left.offset(0) as *const u64).offset(2));
 
-        try!(merge_page(rng, txn, left, right, &mut levels, forgetting, replace_page, do_free_value, needs_dup));
+        try!(merge_page(rng, txn, left, right, &mut levels, forgetting, replace_page, do_free_value, needs_dup_below));
 
         let size = record_size(key.len(), value.len() as usize);
         let off = right.can_alloc(size);
@@ -92,7 +92,8 @@ fn merge_left<R:Rng,T>(
     rng:&mut R,
     txn:&mut MutTxn<T>,
     right:&Cow, left:&mut MutPage, forgetting:u16, replace_page:u64,
-    key:&[u8], value:UnsafeValue, do_free_value:bool, needs_dup:bool) -> Result<(), Error> {
+    key:&[u8], value:UnsafeValue, do_free_value:bool,
+    needs_dup_below:bool) -> Result<(), Error> {
     unsafe {
         debug!("merge left {:?} {:?} {:?}", right.page_offset(), left.page_offset(), std::str::from_utf8(key));
         let mut levels = [0;N_LEVELS];
@@ -127,7 +128,7 @@ fn merge_left<R:Rng,T>(
         // Finally, add all elements from `right` to `left`.
         // TODO: compact if necessary.
         let compact={};
-        try!(merge_page(rng, txn, right, left, &mut levels, forgetting, replace_page, do_free_value, needs_dup));
+        try!(merge_page(rng, txn, right, left, &mut levels, forgetting, replace_page, do_free_value, needs_dup_below));
     }
     Ok(())
 }
@@ -138,7 +139,9 @@ fn merge_left<R:Rng,T>(
 pub fn merge_children_right<R:Rng, T>(
     rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
     child_page:&Cow,
-    delete:&[u16], merged:u64, do_free_value:bool, needs_dup:bool) -> Result<Res, Error> {
+    delete:&[u16], merged:u64, do_free_value:bool,
+    needs_dup_below:bool,
+    needs_dup:bool) -> Result<Res, Error> {
 
     let next_offset = unsafe { u16::from_le(*(page.offset(levels[0] as isize) as *const u16)) };
     let next_ptr = page.offset(next_offset as isize);
@@ -172,10 +175,17 @@ pub fn merge_children_right<R:Rng, T>(
         let merged_right_sibling = {
             let levels = [0;N_LEVELS];
             let mut new_levels = [0;N_LEVELS];
+            let right_sibling_rc = get_rc(txn, right_sibling.page_offset());
+            if right_sibling_rc > 1 {
+                // We're not going to reference it anymore, since we need to copy it.
+                try!(decr_rc(rng, txn, right_sibling.page_offset()))
+            }
             let mut right_sibling =
-                if needs_dup {
+                if needs_dup || right_sibling_rc > 1 {
+                    // If another page is pointing to the right sibling, or will be (needs_dup), copy.
                     try!(copy_page(rng, txn, &right_sibling.as_page(), &levels, &mut new_levels, false, false, 0, true))
                 } else {
+                    // Else, just CoW.
                     try!(cow_pinpointing(rng, txn,
                                          if needs_compaction { right_sibling.as_nonmut() } else { right_sibling },
                                          &levels,
@@ -195,6 +205,7 @@ pub fn merge_children_right<R:Rng, T>(
             let mut new_levels = [0;N_LEVELS];
             let page =
                 if needs_dup {
+                    // If there are, or will be, several pointers to the current page, copy it.
                     try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false,
                                    merged_right_sibling.page_offset(), true))
                 } else {
@@ -214,7 +225,9 @@ pub fn merge_children_right<R:Rng, T>(
 pub fn merge_children_left<R:Rng, T>(
     rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
     child_page:&Cow,
-    delete:&[u16], merged:u64, do_free_value:bool, needs_dup:bool) -> Result<Res, Error> {
+    delete:&[u16], merged:u64, do_free_value:bool,
+    needs_dup_below:bool,
+    needs_dup:bool) -> Result<Res, Error> {
 
     debug!("merge_children_left");
     // Load the left sibling and compute its size.
@@ -251,11 +264,16 @@ pub fn merge_children_left<R:Rng, T>(
             off+extra_size > PAGE_SIZE as u16
         };
 
+        let left_sibling_rc = get_rc(txn, left_sibling.page_offset());
+        if left_sibling_rc > 1 {
+            // We're not going to reference it anymore, since we need to copy it.
+            try!(decr_rc(rng, txn, left_sibling.page_offset()))
+        }
         let merged_left_sibling = {
             let levels = [0;N_LEVELS];
             let mut new_levels = [0;N_LEVELS];
             let mut left_sibling =
-                if needs_dup {
+                if needs_dup || left_sibling_rc > 1 {
                     try!(copy_page(rng, txn, &left_sibling.as_page(), &levels, &mut new_levels, false, false, 0, true))
                 } else {
                     try!(cow_pinpointing(rng, txn,
@@ -263,7 +281,7 @@ pub fn merge_children_left<R:Rng, T>(
                                          &levels,
                                          &mut new_levels, false, false, true, 0))
                 };
-            try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value, do_free_value, needs_dup));
+            try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value, do_free_value, needs_dup_below));
             left_sibling
         };
         // Now, delete (next_key, next_value) from the current page.
@@ -277,6 +295,7 @@ pub fn merge_children_left<R:Rng, T>(
             let mut new_levels = [0;N_LEVELS];
             let page =
                 if needs_dup {
+                    // If there are, or will be, several pointers to the current page, copy.
                     try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false,
                                    merged_left_sibling.page_offset(), true))
                 } else {
@@ -305,7 +324,9 @@ pub fn merge_children_replace<R:Rng, T>(
     rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
     child_page:&Cow,
     replacement:&Smallest,
-    delete:&[u16], merged:u64, needs_dup:bool) -> Result<Res, Error> {
+    delete:&[u16], merged:u64,
+    needs_dup_below:bool,
+    needs_dup:bool) -> Result<Res, Error> {
 
     debug!("merge_children_replace");
     // Compute the sizes of (1) the left sibling, (2) the deleted
@@ -344,11 +365,16 @@ pub fn merge_children_replace<R:Rng, T>(
             let off = left_sibling.can_alloc(extra_size);
             off+extra_size > PAGE_SIZE as u16
         };
+        let left_sibling_rc = get_rc(txn, left_sibling.page_offset());
+        if left_sibling_rc > 1 {
+            // We're not going to reference it anymore, since we need to copy it.
+            try!(decr_rc(rng, txn, left_sibling.page_offset()))
+        }
         let merged_left_sibling = {
             let levels = [0;N_LEVELS];
             let mut new_levels = [0;N_LEVELS];
             let mut left_sibling =
-                if needs_dup {
+                if needs_dup || left_sibling_rc > 1 {
                     try!(copy_page(rng, txn,
                                    &left_sibling.as_page(),
                                    &levels, &mut new_levels, false, false, 0, true))
@@ -357,7 +383,8 @@ pub fn merge_children_replace<R:Rng, T>(
                                          if needs_compaction { left_sibling.as_nonmut() } else { left_sibling },
                                          &levels, &mut new_levels, false, false, true, 0))
                 };
-            try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value, false, needs_dup));
+            try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value, false,
+                            needs_dup_below));
             left_sibling
         };
         // Now, delete (next_key, next_value) from the current page.
