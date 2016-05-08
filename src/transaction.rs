@@ -40,7 +40,8 @@ pub const ZERO_HEADER: isize = 16; // size of the header on page 0, in bytes.
 #[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
-    NotEnoughSpace
+    NotEnoughSpace,
+    Poison
 }
 
 impl std::fmt::Display for Error {
@@ -48,6 +49,7 @@ impl std::fmt::Display for Error {
         match *self {
             Error::IO(ref err) => write!(f, "IO error: {}", err),
             Error::NotEnoughSpace => write!(f, "Not enough space. Try opening the environment with a larger size."),
+            Error::Poison => write!(f, "Not enough space. Try opening the environment with a larger size."),
         }
     }
 }
@@ -56,13 +58,15 @@ impl std::error::Error for Error {
     fn description(&self) -> &str {
         match *self {
             Error::IO(ref err) => err.description(),
-            Error::NotEnoughSpace => "Not enough space. Try opening the environment with a larger size."
+            Error::NotEnoughSpace => "Not enough space. Try opening the environment with a larger size.",
+            Error::Poison => "Poison error"
         }
     }
     fn cause(&self) -> Option<&std::error::Error> {
         match *self {
             Error::IO(ref err) => Some(err),
-            Error::NotEnoughSpace => None
+            Error::NotEnoughSpace => None,
+            Error::Poison => None
 
         }
     }
@@ -72,6 +76,13 @@ impl From<std::io::Error> for Error {
         Error::IO(e)
     }
 }
+
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(e: std::sync::PoisonError<T>) -> Error {
+        Error::Poison
+    }
+}
+
 // Lock order: first take thread locks, then process locks.
 
 // Why are there two synchronization mechanisms?
@@ -113,14 +124,14 @@ pub struct MutTxn<'env,T> {
 
 impl<'env> Drop for Txn<'env> {
     fn drop(&mut self) {
-        self.env.lock_file.unlock().unwrap();
+        self.env.lock_file.unlock(); // .unwrap();
         *self.guard;
     }
 }
 impl<'env,T> Drop for MutTxn<'env,T> {
     fn drop(&mut self) {
         debug!("dropping transaction");
-        self.env.mutable_file.unlock().unwrap();
+        self.env.mutable_file.unlock(); // .unwrap();
         if let Some(ref mut guard) = self.mutable {
             debug!("dropping guard");
             **guard
@@ -143,6 +154,7 @@ impl Env {
     pub fn new<P: AsRef<Path>>(path: P, length: u64) -> Result<Env, Error> {
         //let length = (1 as u64).shl(log_length);
         let db_path = path.as_ref().join("db");
+        let db_exists = std::fs::metadata(&db_path).is_ok();
         let file = try!(
             OpenOptions::new()
                 .read(true)
@@ -155,11 +167,16 @@ impl Env {
         let mut mmap = try!(memmap::Mmap::open(&file, memmap::Protection::ReadWrite));
         let lock_file = try!(File::create(path.as_ref()
                                           .join("db")
-                                          .with_extension(".lock")));
+                                          .with_extension("lock")));
         let mutable_file = try!(File::create(path.as_ref()
                                              .join("db")
-                                             .with_extension(".mut")));
+                                             .with_extension("mut")));
         let map = mmap.mut_ptr();
+        if !db_exists {
+            unsafe {
+                std::ptr::write_bytes(map, 0, PAGE_SIZE)
+            }
+        }
         let env = Env {
             length: length,
             mmap: mmap,
@@ -172,25 +189,25 @@ impl Env {
         Ok(env)
     }
     /// Start a read-only transaction.
-    pub fn txn_begin<'env>(&'env self) -> Txn<'env> {
-        let read = self.lock.read().unwrap();
-        self.lock_file.lock_shared().unwrap();
-        Txn {
+    pub fn txn_begin<'env>(&'env self) -> Result<Txn<'env>,Error> {
+        let read = try!(self.lock.read());
+        try!(self.lock_file.lock_shared());
+        Ok(Txn {
             env: self,
             guard: read,
-        }
+        })
     }
 
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
-    pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env,()> {
+    pub fn mut_txn_begin<'env>(&'env self) -> Result<MutTxn<'env,()>, Error> {
         unsafe {
             let last_page = u64::from_le(*(self.map as *const u64));
             let current_list_page = u64::from_le(*((self.map as *const u64).offset(1)));
 
             debug!("map header = {:?}, {:?}", last_page ,current_list_page);
-            let guard = self.mutable.lock().unwrap();
+            let guard = try!(self.mutable.lock());
             debug!("taking file lock");
-            self.mutable_file.lock_exclusive().unwrap();
+            try!(self.mutable_file.lock_exclusive());
             debug!("lock ok");
             let current_list_page = Page {
                 data: self.map.offset(current_list_page as isize),
@@ -201,7 +218,7 @@ impl Env {
             } else {
                 u64::from_le(*((current_list_page.data as *const u64).offset(1)))
             };
-            MutTxn {
+            Ok(MutTxn {
                 env: self,
                 mutable: Some(guard),
                 parent:(),
@@ -217,7 +234,7 @@ impl Env {
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
                 roots: HashMap::new(),
-            }
+            })
         }
     }
 
@@ -291,7 +308,7 @@ pub unsafe fn free<T>(txn: &mut MutTxn<T>, offset: u64) {
 impl<'env> Txn<'env> {
     /// Find the appropriate map segment
     pub fn load_page(&self, off: u64) -> Page {
-        //println!("load_page: off={:?}, length = {:?}", off, self.env.length);
+        debug!("load_page: off={:?}, length = {:?}", off, self.env.length);
         assert!(off < self.env.length);
         unsafe {
             Page {
@@ -315,7 +332,7 @@ pub enum Cow {
 }
 
 impl<'env,T> MutTxn<'env,T> {
-    pub fn mut_txn_begin<'txn>(&'txn mut self) -> MutTxn<'env,&'txn mut MutTxn<'env,T>> {
+    pub fn mut_txn_begin<'txn>(&'txn mut self) -> Result<MutTxn<'env,&'txn mut MutTxn<'env,T>>, Error> {
         unsafe {
             let mut txn = MutTxn {
                 env: self.env,
@@ -333,7 +350,7 @@ impl<'env,T> MutTxn<'env,T> {
                 //reference_counts:self.reference_counts
             };
             txn.parent = self;
-            txn
+            Ok(txn)
         }
     }
     pub fn load_page(&self, off: u64) -> Page {

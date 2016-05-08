@@ -15,7 +15,7 @@ pub enum Res {
         delete: [u16;N_LEVELS], // The binding before the one we want to delete.
         merged: u64, // The updated left child of the deleted binding.
         free_value: bool,
-        needs_dup: bool
+        can_be_freed: bool
     },
     Split {
         key_ptr:*const u8,
@@ -130,8 +130,8 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool
                 try!(free(rng, txn, r, true))
             }
         }
-        debug!("really freeing {:?}", off);
         if !cfg!(feature="no_free") {
+            debug!("really freeing {:?}", off);
             unsafe { transaction::free(&mut txn.txn, off) }
         }
     }
@@ -397,7 +397,7 @@ fn test_insert(value_size:usize) {
     env_logger::init().unwrap_or(());
     let dir = tempdir::TempDir::new("pijul").unwrap();
     let env = Env::new(dir.path(), 1000).unwrap();
-    let mut txn = env.mut_txn_begin();
+    let mut txn = env.mut_txn_begin().unwrap();
 
     let mut page = txn.alloc_page().unwrap();
     page.init();
@@ -545,7 +545,7 @@ pub fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:O
 
 
 
-pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, needs_dup:bool) -> Result<Res,Error> {
+pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, parent_will_be_dup:bool) -> Result<Res,Error> {
 
     let mut eq = false;
     let mut levels = [0;N_LEVELS];
@@ -557,14 +557,14 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
         let child_page = unsafe {
             u64::from_le(*((page.offset(levels[0] as isize) as *const u64).offset(2)))
         };
+        let page_rc = get_rc(txn, page.page_offset());
+        let page_will_be_dup = parent_will_be_dup || (page_rc > 1);
         if child_page > 0 && right_page == 0 {
             debug!("inserting in child page {:?}", child_page);
             // Insert in the page below.
             let next_page = txn.load_cow_page(child_page);
-            let page_rc = get_rc(txn, page.page_offset());
-            let needs_dup = needs_dup || (page_rc > 1);
 
-            match try!(insert(rng, txn, next_page, key, value, right_page, needs_dup)) {
+            match try!(insert(rng, txn, next_page, key, value, right_page, page_will_be_dup)) {
                 Res::Nothing{..} => Ok(Res::Nothing { page:page }),
                 Res::Ok { page:next_page } => {
                     debug!("Child returned ok: {:?}", next_page);
@@ -572,13 +572,13 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                     // The page below was updated. Update the reference in the current page
                     let mut new_levels = [0;N_LEVELS];
                     
-                    if !needs_dup {
+                    if !page_will_be_dup {
                         let page = try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], false, false, true,
                                                         next_page.page_offset()));
                         Ok(Res::Ok { page:page })
                     } else {
-                        // If several pages reference this one, force a copy.
-                        if page_rc > 1 {
+                        // Decrement the counter for the first page with RC>1 on the path from the root.
+                        if !parent_will_be_dup && page_rc > 1 {
                             try!(decr_rc(rng, txn, page.page_offset()))
                         }
                         let page = txn.load_page(page.page_offset());
@@ -599,7 +599,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                     let key_ = unsafe {std::slice::from_raw_parts(key_ptr, key_len)};
                     let result = unsafe {
                         full_local_insert(rng, txn, page, key_, value_, right.page_offset(),
-                                          &mut levels, left.page_offset(), needs_dup)
+                                          &mut levels, left.page_offset(), page_will_be_dup)
                     };
                     try!(free(rng, txn, free_page, false));
                     result
@@ -610,16 +610,16 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
             debug!("inserting here");
             // No child page, insert on this page.
             unsafe {
-                full_local_insert(rng, txn, page, key, value, right_page, &mut levels, 0, needs_dup)
+                full_local_insert(rng, txn, page, key, value, right_page, &mut levels, 0, page_will_be_dup)
             }
         }
     }
 }
 
-pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16], left_page:u64, needs_dup:bool) -> Result<Res, Error> {
+pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16], left_page:u64, page_will_be_dup:bool) -> Result<Res, Error> {
     let size = record_size(key.len(), value.len() as usize);
     let mut new_levels = [0;N_LEVELS];
-    if !needs_dup {
+    if !page_will_be_dup {
 
         let off = page.can_alloc(size);
         if off > 0 {

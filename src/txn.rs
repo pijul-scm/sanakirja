@@ -88,6 +88,11 @@ impl<'env,T> MutTxn<'env,T> {
     pub fn debug<P: AsRef<Path>>(&self, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
         debug(self, db, p, keys_hex, values_hex)
     }
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_concise<P: AsRef<Path>>(&self, db: &[&Db], p: P) {
+        debug_concise(self, db, p)
+    }
 }
 
 impl<'env> Txn<'env> {
@@ -95,6 +100,11 @@ impl<'env> Txn<'env> {
     #[doc(hidden)]
     pub fn debug<P: AsRef<Path>>(&self, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
         debug(self, db, p, keys_hex, values_hex)
+    }
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_concise<P: AsRef<Path>>(&self, db: &[&Db], p: P) {
+        debug_concise(self, db, p)
     }
 }
 
@@ -303,6 +313,7 @@ pub trait LoadPage:Sized {
     }
 
     unsafe fn get_(&self, page:Page, key: &[u8], value:Option<UnsafeValue>) -> Option<UnsafeValue> {
+        debug!("sanakirja::get_");
         //println!("get from page {:?}", page);
         let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
@@ -312,12 +323,14 @@ pub trait LoadPage:Sized {
         loop {
             // advance in the list until there's nothing more to do.
             loop {
+                debug!("current = {:?}", current);
                 let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
                 if next == NIL {
                     break
                 } else {
                     let next_ptr = page.offset(next as isize);
                     let (next_key,next_value) = read_key_value(next_ptr);
+                    debug!("next_value={:?}", next_value);
                     /*println!("cmp {:?} {:?}",
                     std::str::from_utf8_unchecked(key),
                     std::str::from_utf8_unchecked(next_key));*/
@@ -354,6 +367,7 @@ pub trait LoadPage:Sized {
                 level -= 1
             }
         }
+        debug!("next_page = {:?}", next_page);
         if next_page > 0 {
             let next_page_ = self.load_page(next_page);
             self.get_(next_page_, key, value).or(equal)
@@ -996,6 +1010,95 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &[&Db], p: P, keys_hex:bool, va
     }
     writeln!(&mut buf, "}}").unwrap();
 }
+
+
+
+
+
+
+
+#[cfg(debug_assertions)]
+fn debug_concise<P: AsRef<Path>, T: LoadPage>(t: &T, db: &[&Db], p: P) {
+    let f = File::create(p.as_ref()).unwrap();
+    let mut buf = BufWriter::new(f);
+    writeln!(&mut buf, "digraph{{").unwrap();
+    let mut h = HashSet::new();
+    fn print_page<T: LoadPage>(txn: &T,
+                               pages: &mut HashSet<u64>,
+                               buf: &mut BufWriter<File>,
+                               p: &Page) {
+        if !pages.contains(&p.page.offset) {
+            pages.insert(p.page.offset);
+            let rc = if let Some(rc) = txn.rc() {
+                txn.get_u64(&rc, p.page.offset).unwrap_or(1)
+            } else {
+                0
+            };
+            writeln!(buf,
+                     "page_{}[label=\"{}, ff {}, occ {}, rc {}\"];",
+                     p.page.offset,
+                     p.page.offset,
+                     p.first_free(),
+                     p.occupied(),
+                     rc
+            ).unwrap();
+
+            let root = FIRST_HEAD;
+            //debug!("print_page: page {:?}", p.page.offset);
+            let mut h = Vec::new();
+            let mut edges = Vec::new();
+            let mut hh = HashSet::new();
+            print_tree(txn, &mut hh, &mut edges, buf, &mut h, p, root);
+            for edge in edges.iter() {
+                writeln!(buf, "{}", edge);
+            }
+            for p in h.iter() {
+                print_page(txn, pages, buf, p)
+            }
+        }
+    }
+
+    fn print_tree<T: LoadPage>(txn: &T,
+                               nodes: &mut HashSet<u16>,
+                               edges:&mut Vec<String>,
+                               buf: &mut BufWriter<File>,
+                               pages: &mut Vec<Page>,
+                               p: &Page,
+                               off: u16) {
+        unsafe {
+            //debug!("print tree:{:?}, off={:?}",p, off);
+            let ptr = p.offset(off as isize) as *const u32;
+            //debug!("key,value={:?},{:?}",key,value);
+            if !nodes.contains(&off) {
+                let next_page = u64::from_le(*((ptr as *const u64).offset(2)));
+                if next_page>0 {
+                    //debug!("print_tree, page = {:?}, next_page = {:?}", p.page.offset, next_page);
+                    pages.push(txn.load_page(next_page));
+                    edges.push(format!(
+                        "page_{}->page_{}[color=\"red\"];",
+                        p.page.offset,
+                        next_page))
+                };
+                nodes.insert(off);
+                let next = u16::from_le(*((ptr as *const u16).offset(0)));
+                //debug!("{:?}",((ptr as *const u16).offset(i)));
+                if next != NIL {
+                    print_tree(txn, nodes, edges, buf, pages, p, next)
+                }
+            }
+            //debug!("/print tree:{:?}",p);
+        }
+    }
+    for db in db {
+        let page = t.load_page(db.root);
+        print_page(t, &mut h, &mut buf, &page);
+    }
+    writeln!(&mut buf, "}}").unwrap();
+}
+
+
+
+
 
 pub fn record_size(key: usize, value: usize) -> u16 {
     if value < VALUE_SIZE_THRESHOLD {

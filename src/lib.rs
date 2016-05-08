@@ -54,7 +54,7 @@
 //!    txn.set_root(0,root);
 //!    txn.commit().unwrap();
 //!
-//!    let txn = env.txn_begin();
+//!    let txn = env.txn_begin().unwrap();
 //!    let root = txn.root(0).unwrap();
 //!    assert!(txn.get(&root, b"test key",None).and_then(|mut x| x.next()) == Some(b"test value"))
 //! }
@@ -100,24 +100,24 @@ impl Env {
     }
 
     /// Start an immutable transaction.
-    pub fn txn_begin<'env>(&'env self) -> Txn<'env> {
-        Txn {
-            txn: self.env.txn_begin()
-        }
+    pub fn txn_begin<'env>(&'env self) -> Result<Txn<'env>,Error> {
+        Ok(Txn {
+            txn: try!(self.env.txn_begin())
+        })
     }
 
     /// Start a mutable transaction.
 
-    pub fn mut_txn_begin<'env>(&'env self) -> MutTxn<'env,()> {
-        let txn = self.env.mut_txn_begin();
-        MutTxn {
+    pub fn mut_txn_begin<'env>(&'env self) -> Result<MutTxn<'env,()>,Error> {
+        let txn = try!(self.env.mut_txn_begin());
+        Ok(MutTxn {
             txn: txn,
-        }
+        })
     }
     /// Returns statistics about pages.
-    pub fn statistics(&self) -> Statistics {
+    pub fn statistics(&self) -> Result<Statistics,Error> {
         let mut stats = self.env.statistics();
-        let txn = self.mut_txn_begin();
+        let txn = try!(self.txn_begin());
         if let Some(db) = txn.rc() {
             txn.iterate(&db, &[], None, |key,mut value| {
                 unsafe {
@@ -128,7 +128,7 @@ impl Env {
                 true
             })
         }
-        stats
+        Ok(stats)
     }
 
 }
@@ -210,10 +210,9 @@ impl<'env,T> MutTxn<'env,T> {
     }
 
     /// Create a child transaction, which can be either committed to its parent (but not to the file), or aborted independently from its parent.
-    pub fn mut_txn_begin<'txn>(&'txn mut self) -> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
-        MutTxn {
-            txn: self.txn.mut_txn_begin()
-        }
+    pub fn mut_txn_begin<'txn>(&'txn mut self) -> Result<MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>>,Error> {
+        let txn = try!(self.txn.mut_txn_begin());
+        Ok(MutTxn { txn: txn })
     }
     pub fn abort(self) {
 
@@ -229,6 +228,7 @@ pub trait Transaction:LoadPage {
     fn get<'a>(&'a self, db: &Db, key: &[u8], value:Option<&[u8]>) -> Option<Value<'a,Self>> {
         unsafe {
             let page = self.load_page(db.root);
+            debug!("page = {:?}", page);
             let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
             self.get_(page, key, value).map(|x| Value::from_unsafe(&x, self))
         }
@@ -301,7 +301,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
-        let mut txn = env.mut_txn_begin();
+        let mut txn = env.mut_txn_begin().unwrap();
         let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
         println!("root: {:?}", root);
         txn.put(&mut rng, &mut root, b"test key", b"test value").unwrap();
@@ -309,7 +309,7 @@ mod tests {
         println!("committing");
         txn.commit().unwrap();
 
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let root = txn.root(0);
         println!("root = {:?}", root);
         let root = root.unwrap();
@@ -329,7 +329,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
-        let mut txn = env.mut_txn_begin();
+        let mut txn = env.mut_txn_begin().unwrap();
         let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
 
         let mut random = Vec::new();
@@ -351,7 +351,7 @@ mod tests {
         txn.commit().unwrap();
 
         random.sort();
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let root = txn.root(0).unwrap();
         txn.debug(&[&root], "/tmp/iter", false, false);
         let mut ws = Vec::new();
@@ -390,7 +390,7 @@ mod tests {
         env_logger::init().unwrap_or(());
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 1000).unwrap();
-        let mut txn = env.mut_txn_begin();
+        let mut txn = env.mut_txn_begin().unwrap();
         let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
 
         let mut bindings = Vec::new();
@@ -437,23 +437,23 @@ mod tests {
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
-        let mut txn = env.mut_txn_begin();
+        let mut txn = env.mut_txn_begin().unwrap();
         {
-            let mut child_txn = txn.mut_txn_begin();
+            let mut child_txn = txn.mut_txn_begin().unwrap();
             let mut root = child_txn.root(0).unwrap_or_else(|| child_txn.create_db().unwrap());
             child_txn.put(&mut rng, &mut root, b"A", b"Value for A").unwrap();
             child_txn.set_root(0, root);
             child_txn.commit().unwrap();
         }
         {
-            let mut child_txn = txn.mut_txn_begin();
+            let mut child_txn = txn.mut_txn_begin().unwrap();
             let mut root = child_txn.root(0).unwrap();
             child_txn.put(&mut rng, &mut root, b"B", b"Value for B").unwrap();
             child_txn.set_root(0, root);
             //child_txn.abort();
         }
         {
-            let mut child_txn = txn.mut_txn_begin();
+            let mut child_txn = txn.mut_txn_begin().unwrap();
             let mut root = child_txn.root(0).unwrap_or_else(|| child_txn.create_db().unwrap());
             child_txn.put(&mut rng, &mut root, b"C", b"Value for C").unwrap();
             child_txn.set_root(0, root);
@@ -461,7 +461,7 @@ mod tests {
         }
         txn.commit().unwrap();
 
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let root = txn.root(0).unwrap();
         assert!(txn.get(&root, b"A",None).and_then(|mut x| x.next()) == Some(b"Value for A"));
         assert!(txn.get(&root, b"B",None).is_none());
@@ -481,7 +481,7 @@ mod tests {
         let mut random = Vec::new();
         {
             let len = 32;
-            let mut txn = env.mut_txn_begin();
+            let mut txn = env.mut_txn_begin().unwrap();
             loop {
                 let n_root: usize = rng.gen_range(0, 10);
                 let mut root = txn.root(n_root as isize).unwrap_or_else(|| txn.create_db().unwrap());
@@ -504,7 +504,7 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         for &(ref db_name, ref k, ref v) in random.iter() {
             let db = txn.root(*db_name as isize).unwrap();
             assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| x.next()) == Some(v.as_bytes()));
@@ -527,7 +527,7 @@ mod tests {
         let mut random = Vec::new();
         {
             let len = 32;
-            let mut txn = env.mut_txn_begin();
+            let mut txn = env.mut_txn_begin().unwrap();
             let mut root = txn.root(42).unwrap_or_else(|| txn.create_db().unwrap());
             for ref name in db_names.iter() {
                 let mut db = txn.open_db(&root, &name[..]).unwrap_or(txn.create_db().unwrap());
@@ -552,7 +552,7 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let root = txn.root(42).unwrap();
         for &(ref db_name, ref k, ref v) in random.iter() {
             let db = txn.open_db(&root, &db_name[..]).unwrap();
@@ -584,7 +584,7 @@ mod tests {
         {
             for i in 0..40 {
                 println!("i = {:?}", i);
-                let mut txn = env.mut_txn_begin();
+                let mut txn = env.mut_txn_begin().unwrap();
                 let mut db = txn.root(0).unwrap_or_else(|| {
                     //println!("create db");
                     txn.create_db().unwrap()
@@ -642,7 +642,7 @@ mod tests {
                 println!("{:?}", env.statistics());
             }
         }
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         for &(ref k, ref v) in random.iter() {
             assert!(txn.get(&db, k.as_bytes(), None).and_then(|x| {
@@ -702,7 +702,7 @@ mod tests {
             .take(short_len)
             .collect();
         {
-            let mut txn = env.mut_txn_begin();
+            let mut txn = env.mut_txn_begin().unwrap();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes()).unwrap();
             txn.put(&mut rng, &mut db, k1.as_bytes(), v1.as_bytes()).unwrap();
@@ -711,7 +711,7 @@ mod tests {
         }
 
         {
-            let mut txn = env.mut_txn_begin();
+            let mut txn = env.mut_txn_begin().unwrap();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             //txn.debug(&db,"/tmp/before");
             txn.del(&mut rng, &mut db, k0.as_bytes(), Some(v0.as_bytes())).unwrap();
@@ -721,7 +721,7 @@ mod tests {
         }
 
         random.push((k1,v1));
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         for &(ref k, ref v) in random.iter() {
             assert!(txn.get(&db, k.as_bytes(), None).and_then(|x| {
@@ -762,7 +762,7 @@ mod tests {
                 .take(value_size)
                 .collect();
 
-            let mut txn = env.mut_txn_begin();
+            let mut txn = env.mut_txn_begin().unwrap();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes()).unwrap();
 
@@ -798,7 +798,7 @@ mod tests {
                 .take(value_size)
                 .collect();
 
-            let mut txn = env.mut_txn_begin();
+            let mut txn = env.mut_txn_begin().unwrap();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.put(&mut rng, &mut db, k0.as_bytes(), v0.as_bytes()).unwrap();
 
@@ -809,21 +809,21 @@ mod tests {
             txn.commit().unwrap();
         }
         debug!("put done");
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         check_memory(&env, &txn, &[&db], true);
 
         let mut i = 0;
         for (ref k, ref v) in random.iter() {
             debug!("del i = {:?}, k = {:?}", i, k);
-            let mut txn = env.mut_txn_begin();
+            let mut txn = env.mut_txn_begin().unwrap();
             let mut db = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
             txn.del(&mut rng, &mut db, k.as_bytes(), Some(v.as_bytes())).unwrap();
             txn.debug(&[&db], format!("/tmp/after_{}",i), false, false);
             txn.set_root(0, db);
             txn.commit().unwrap();
 
-            let txn = env.txn_begin();
+            let txn = env.txn_begin().unwrap();
             let db = txn.root(0).unwrap();
             check_memory(&env, &txn, &[&db], true);
 
@@ -908,7 +908,7 @@ mod tests {
         use super::txn::{Page,LoadPage,P, read_key_value, UnsafeValue};
         use super::put::PI;
         let (used_pages,value_pages) = check_rc(txn, dbs);
-        let statistics = env.statistics();
+        let statistics = env.statistics().unwrap();
 
         // Check that no page is referenced and free at the same time.
         for p in statistics.free_pages.iter() {
@@ -971,7 +971,7 @@ mod tests {
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         check_memory(&env, &txn, &[&db], true);
     }
@@ -986,7 +986,7 @@ mod tests {
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         check_memory(&env, &txn, &[&db], true);
     }
@@ -1001,7 +1001,7 @@ mod tests {
 
         let env = Env::new(dir.path(), 5000).unwrap();
         leakproof_put(&env, n_insertions, value_size);
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         check_memory(&env, &txn, &[&db], true);
     }
@@ -1018,7 +1018,7 @@ mod tests {
         let env = Env::new(dir.path(), 5000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         check_memory(&env, &txn, &[&db], true);
     }
@@ -1035,7 +1035,7 @@ mod tests {
         let env = Env::new(dir.path(), 10000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         check_memory(&env, &txn, &[&db], true);
     }
@@ -1052,7 +1052,7 @@ mod tests {
         let env = Env::new(dir.path(), 10000 as u64).unwrap();
         leakproof_put_del(&env, n_insertions, key_size, value_size);
         println!("checking");
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db = txn.root(0).unwrap();
         check_memory(&env, &txn, &[&db], true);
     }
@@ -1068,7 +1068,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
-        let mut txn = env.mut_txn_begin();
+        let mut txn = env.mut_txn_begin().unwrap();
         let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
         println!("root: {:?}", root);
 
@@ -1090,7 +1090,7 @@ mod tests {
         txn.commit().unwrap();
         println!("committed");
 
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let root0 = txn.root(0).unwrap();
         let root1 = txn.root(1).unwrap();
 
@@ -1116,7 +1116,7 @@ mod tests {
         let dir = tempdir::TempDir::new("pijul").unwrap();
         let tmp = tempdir::TempDir::new("pijul").unwrap();
         let env = Env::new(dir.path(), 100).unwrap();
-        let mut txn = env.mut_txn_begin();
+        let mut txn = env.mut_txn_begin().unwrap();
         let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
         println!("root: {:?}", root);
 
@@ -1142,7 +1142,7 @@ mod tests {
         txn.commit().unwrap();
         println!("committed");
 
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let root0 = txn.root(0).unwrap();
         let root1 = txn.root(1).unwrap();
 
@@ -1189,7 +1189,7 @@ mod tests {
         let mut values0 = HashMap::new();
         let mut values1 = HashMap::new();
         
-        let mut txn = env.mut_txn_begin();
+        let mut txn = env.mut_txn_begin().unwrap();
         let mut root0 = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
 
         for i in 0..n_insertions {
@@ -1259,7 +1259,7 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path(), 100).unwrap();
+        let env = Env::new(dir.path(), 1000).unwrap();
 
         let tmp = tempdir::TempDir::new("pijul").unwrap();
 
@@ -1268,13 +1268,13 @@ mod tests {
 
         let key_len = 200;
         let value_len = 200;
-        let n_insertions = 50;
+        let n_insertions = 200;
         let n_del = n_insertions;
 
         let mut values0 = HashMap::new();
         let mut values1 = HashMap::new();
         
-        let mut txn = env.mut_txn_begin();
+        let mut txn = env.mut_txn_begin().unwrap();
         let mut root0 = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
 
         for i in 0..n_insertions {
@@ -1302,6 +1302,7 @@ mod tests {
             debug!("j = {:?}", j);
             debug!("deleting {:?}", u);
             txn.del(&mut rng, &mut root1, u.as_bytes(), None).unwrap();
+            //txn.debug_concise(&[&root0, &root1], tmp_path.join(format!("after_{}",j)));
             txn.debug(&[&root0, &root1], tmp_path.join(format!("after_{}",j)), false, false);
             j+=1;
 
@@ -1319,7 +1320,7 @@ mod tests {
                 break
             }
         }
-        txn.debug(&[&root0, &root1], tmp_path.join("forked"), false, false);
+        txn.debug_concise(&[&root0, &root1], tmp_path.join("forked"));
 
         txn.set_root(0, root0);
         txn.set_root(1, root1);
@@ -1327,7 +1328,7 @@ mod tests {
 
         txn.commit().unwrap();
         debug!("tmp: {:?}", tmp_path);
-        let txn = env.txn_begin();
+        let txn = env.txn_begin().unwrap();
         let db0 = txn.root(0).unwrap();
         let db1 = txn.root(1).unwrap();
 
