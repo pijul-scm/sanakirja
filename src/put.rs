@@ -84,7 +84,11 @@ pub fn decr_rc<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64)->Result<(),Erro
     let mut rc = if let Some(rc) = txn.rc() { rc } else { try!(txn.create_db()) };
     let count = txn.get_u64(&rc, off).unwrap_or(1);
     debug!(">>>>>>>>>>>> decr_rc {:?} {:?}", off, count);
-    try!(txn.replace_u64(rng, &mut rc, off, count-1));
+    if count-1 <= 1 {
+        try!(txn.del_u64(rng, &mut rc, off));
+    } else {
+        try!(txn.replace_u64(rng, &mut rc, off, count-1));
+    }
     txn.set_rc(rc);
     debug!("<<<<<<<<<<<< decr_rc");
     Ok(())
@@ -316,7 +320,8 @@ pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[
 
 /// Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zero offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
 pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16],
-                                forgetting_next: bool, forgetting_value:bool, free_page:bool, translate_right:u64) -> Result<MutPage,Error> {
+                                forgetting_next: bool, forgetting_value:bool,
+                                free_page:bool, translate_right:u64) -> Result<MutPage,Error> {
     unsafe {
         match page.cow {
             transaction::Cow::Page(p0) => {
@@ -469,7 +474,6 @@ fn test_insert_large() {
 
 
 
-
 /// Changes the value of levels and eq, so that all items in levels are offsets to the largest entry in the list strictly smaller than (key,value).
 pub fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:Option<UnsafeValue>, levels:&mut [u16], eq:&mut bool) {
     let mut level = N_LEVELS-1;
@@ -546,7 +550,7 @@ pub fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:O
 
 
 pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, parent_will_be_dup:bool) -> Result<Res,Error> {
-
+    debug!("insert page = {:?}", page.page_offset());
     let mut eq = false;
     let mut levels = [0;N_LEVELS];
     set_levels(txn, &page, key, Some(value), &mut levels[..], &mut eq);
@@ -559,6 +563,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
         };
         let page_rc = get_rc(txn, page.page_offset());
         let page_will_be_dup = parent_will_be_dup || (page_rc > 1);
+        debug!("page_rc = {:?} {:?}", parent_will_be_dup, page_rc);
         if child_page > 0 && right_page == 0 {
             debug!("inserting in child page {:?}", child_page);
             // Insert in the page below.
@@ -581,15 +586,14 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                         if !parent_will_be_dup && page_rc > 1 {
                             try!(decr_rc(rng, txn, page.page_offset()))
                         }
-                        let page = txn.load_page(page.page_offset());
                         let page =
-                            try!(copy_page(rng, txn, &page, &levels[..], &mut new_levels[..], false, false,
+                            try!(copy_page(rng, txn, &page.as_page(), &levels[..], &mut new_levels[..], false, false,
                                            next_page.page_offset(), true));
                         Ok(Res::Ok { page: page })
                     }
                 },
                 Res::Split { key_ptr,key_len,value:value_,left,right,free_page } => {
-                    debug_assert!(free_page == child_page);
+                    debug_assert!(free_page == child_page || free_page == 0);
                     // The page below split. Update the child to the
                     // left half of the split, and insert the middle
                     // element returned by the split in the current
@@ -599,9 +603,12 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                     let key_ = unsafe {std::slice::from_raw_parts(key_ptr, key_len)};
                     let result = unsafe {
                         full_local_insert(rng, txn, page, key_, value_, right.page_offset(),
-                                          &mut levels, left.page_offset(), page_will_be_dup)
+                                          &mut levels, left.page_offset(), parent_will_be_dup,
+                                          page_will_be_dup)
                     };
-                    try!(free(rng, txn, free_page, false));
+                    if !page_will_be_dup && free_page > 0 {
+                        try!(free(rng, txn, free_page, false));
+                    }
                     result
                 },
                 Res::Underfull {..} => unreachable!()
@@ -610,13 +617,13 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
             debug!("inserting here");
             // No child page, insert on this page.
             unsafe {
-                full_local_insert(rng, txn, page, key, value, right_page, &mut levels, 0, page_will_be_dup)
+                full_local_insert(rng, txn, page, key, value, right_page, &mut levels, 0, parent_will_be_dup, page_will_be_dup)
             }
         }
     }
 }
 
-pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16], left_page:u64, page_will_be_dup:bool) -> Result<Res, Error> {
+pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16], left_page:u64, parent_will_be_dup: bool, page_will_be_dup:bool) -> Result<Res, Error> {
     let size = record_size(key.len(), value.len() as usize);
     let mut new_levels = [0;N_LEVELS];
     if !page_will_be_dup {
@@ -645,27 +652,29 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
         } else {
             debug!("splitting, key = {:?}", std::str::from_utf8(key));
             if left_page > 0 {
-                Ok(try!(split_page(rng, txn, &page, key, value, right_page, levels[0], left_page)))
+                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, levels[0], left_page)))
             } else {
-                Ok(try!(split_page(rng, txn, &page, key, value, right_page, NIL, 0)))
+                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, NIL, 0)))
             }
         }
 
     } else {
-        // If several pages reference this one, force a copy.
+        if !parent_will_be_dup {
+            try!(decr_rc(rng, txn, page.page_offset()))
+        }
         let off = page.can_alloc(size);
         if off > 0 {
             let p = txn.load_page(page.page_offset());
-            let mut page = try!(copy_page(rng, txn, &p, levels, &mut new_levels, false, false, left_page, false));
+            let mut page = try!(copy_page(rng, txn, &p, levels, &mut new_levels, false, false, left_page, true));
             local_insert_at(rng, &mut page, key, value, right_page,
                             off, size, &mut new_levels[..]);
             Ok(Res::Ok { page:page })
         } else {
             debug!("splitting, key = {:?}", std::str::from_utf8(key));
             if left_page > 0 {
-                Ok(try!(split_page(rng, txn, &page, key, value, right_page, levels[0], left_page)))
+                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, levels[0], left_page)))
             } else {
-                Ok(try!(split_page(rng, txn, &page, key, value, right_page, NIL, 0)))
+                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, NIL, 0)))
             }
         }
     }
@@ -718,21 +727,24 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                               // translate_right_page are meant for this
                               // purpose: the pointer to the page that
                               // split is "translated" to a pointer to the
-                              // left page of the split.
+                                  // left page of the split.
+                                  page_will_be_dup:bool,
                                   translate_index:u16, translate_right_page:u64)->Result<Res,Error> {
 
-    debug!("split {:?}", page.page_offset());
+    debug!("split {:?} {:?}", page.page_offset(), page_will_be_dup);
     debug!("split {:?}", std::str::from_utf8(key));
     let mut left = try!(txn.alloc_page());
     left.init();
     let mut right = try!(txn.alloc_page());
     right.init();
-
+    debug!("split allocated {:?} {:?}", left.page_offset(), right.page_offset());
     *((left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) =
         if translate_index == 0 {
             translate_right_page.to_le()
         } else {
-            *((page.offset(FIRST_HEAD as isize) as *const u64).offset(2))
+            let r = u64::from_le(*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
+            if page_will_be_dup && r > 0 { try!(incr_rc(rng, txn, r)) }
+            r.to_le()
         };
 
     // Loop through the values of the page, in order, and insert them to left in order.
@@ -759,6 +771,9 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                 translate_right_page
             }
         } else {
+            if page_will_be_dup && r > 0 {
+                try!(incr_rc(rng, txn, r))
+            }
             r
         };
         let next_size = record_size(key_.len(),value_.len() as usize);
@@ -837,7 +852,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
             value: value_,
             left: left,
             right: right,
-            free_page: page.page_offset()
+            free_page: if page_will_be_dup { 0 } else { page.page_offset() }
         })
     } else {
         unreachable!()

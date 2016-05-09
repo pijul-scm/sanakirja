@@ -301,7 +301,8 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             // The following call might split.
             unsafe {
                 check_alloc_local_insert(rng, txn, Cow::from_mut_page(page),
-                                         key, value, new_right.page_offset(), &mut new_levels)
+                                         key, value, new_left.page_offset(), new_right.page_offset(), &mut new_levels,
+                                         page_will_be_dup)
             }
         } else {
             unreachable!()
@@ -472,12 +473,6 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     let result = {
         let mut new_levels = [0;N_LEVELS];
         // Delete the current entry, insert the new one instead.
-        let page =
-            if page_will_be_dup {
-                try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, new_left.page_offset(), true))
-            } else {
-                try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, true, new_left.page_offset()))
-            };
         if let Some((key_ptr,key_len,value,r)) = middle {
 
             unsafe { *((new_right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = r.to_le(); }
@@ -485,8 +480,9 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             debug!("middle = {:?}", std::str::from_utf8(key));
             // The following call might split.
             unsafe {
-                check_alloc_local_insert(rng, txn, Cow::from_mut_page(page),
-                                         key, value, new_right.page_offset(), &mut new_levels)
+                check_alloc_local_insert(rng, txn, page,
+                                         key, value, new_left.page_offset(), new_right.page_offset(), &mut new_levels,
+                                         page_will_be_dup)
             }
         } else {
             unreachable!()
@@ -508,26 +504,36 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
 /// If the levels have already been found, compact or split the page
 /// if necessary, and inserts the input (key, value) into the result,
 /// at the input levels.
-unsafe fn check_alloc_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, right_page:u64, levels:&mut [u16]) -> Result<Res, Error> {
-
+unsafe fn check_alloc_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], value:UnsafeValue, left_page: u64, right_page:u64, levels:&mut [u16], page_will_be_dup:bool) -> Result<Res, Error> {
+    debug!("check_alloc_local_insert");
     let size = record_size(key.len(), value.len() as usize);
     let mut new_levels = [0;N_LEVELS];
     let off = page.can_alloc(size);
     if off > 0 {
-        let (mut page,off) =
-            if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
-                // No need to copy nor compact the page, the value can be written right away.
-                (try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, false, false, true, 0)), off)
+
+        debug!("check_alloc_local_insert: non-split");
+        let mut page =
+            if page_will_be_dup {
+                try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, left_page, true))
             } else {
-                // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
-                let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, &mut new_levels, false, false, true, 0));
-                let off = page.can_alloc(size);
-                (page,off)
+                debug_assert!(get_rc(txn, page.page_offset()) <= 1);
+                if off + size < PAGE_SIZE as u16 {
+                    // No need to copy nor compact the page, the value can be written right away.
+                    try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false, true, left_page))
+                } else {
+                    // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
+                    let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, &mut new_levels, true, false, true, left_page));
+                    let off = page.can_alloc(size);
+                    page
+                }
             };
+        let off = page.can_alloc(size);
+        debug_assert!(off+size < PAGE_SIZE as u16);
         local_insert_at(rng, &mut page, key, value, right_page, off, size, &mut new_levels);
         std::ptr::copy_nonoverlapping(new_levels.as_ptr(), levels.as_mut_ptr(), N_LEVELS);
         Ok(Res::Ok { page:page })
     } else {
-        Ok(try!(split_page(rng, txn, &page, key, value, right_page, NIL, 0)))
+        debug!("check_alloc_local_insert: split");
+        Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, levels[0], left_page)))
     }
 }

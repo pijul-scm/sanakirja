@@ -1169,6 +1169,7 @@ mod tests {
         extern crate tempdir;
         extern crate rand;
         use super::Transaction;
+        use super::txn::LoadPage;
         use rand::Rng;
         use std::collections::HashMap;
         use std;
@@ -1178,13 +1179,15 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path(), 100).unwrap();
+        let env = Env::new(dir.path(), 1000).unwrap();
 
         let tmp = tempdir::TempDir::new("pijul").unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
 
         let key_len = 200;
         let value_len = 200;
-        let n_insertions = 200;
+        let n_insertions = 1000;
 
         let mut values0 = HashMap::new();
         let mut values1 = HashMap::new();
@@ -1204,6 +1207,7 @@ mod tests {
                 .collect();
 
             txn.put(&mut rng, &mut root0, k0.as_bytes(), v0.as_bytes()).unwrap();
+
             values0.insert(k0.clone(),v0.clone());
             values1.insert(k0,v0);
         }
@@ -1211,12 +1215,13 @@ mod tests {
         let mut root1 = txn.fork_db(&mut rng, &root0).unwrap();
         txn.debug(&[&root0, &root1], format!("/tmp/before"), false, false);
         for j in 0..(n_insertions / 20) {
-            println!("j = {:?}", j);
-
+            debug!("j = {:?}", j);
+            
             let k0: String = rand::thread_rng()
                 .gen_ascii_chars()
                 .take(key_len)
                 .collect();
+            debug!("k0 = {:?}", k0);
             let v0: String = rand::thread_rng()
                 .gen_ascii_chars()
                 .take(value_len)
@@ -1231,16 +1236,32 @@ mod tests {
                 txn.put(&mut rng, &mut root1, k0.as_bytes(), v0.as_bytes()).unwrap();
                 values1.insert(k0,v0);
             }
-            txn.debug(&[&root0, &root1], tmp.path().join(format!("after_{}",j)), false, false);
+
+            debug!("tmp: {:?}", tmp_path);
+            // txn.debug(&[&root0, &root1], (&tmp_path).join(format!("after_{}",j)), false, false);
+            let (used_pages,value_pages) = check_rc(&txn, &[&root0, &root1]);
+
+            for (u, v) in used_pages.iter() {
+                debug!("page {:?}, actual rc = {:?}, from rc database {:?}", u, v, super::put::get_rc(&txn, *u));
+                assert!(*v == super::put::get_rc(&txn, *u) as usize
+                        || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
+            }
+            
+            debug!("check: {:?} {:?}", used_pages, value_pages);
+
         }
-        txn.debug(&[&root0, &root1], tmp.path().join("forked"), false, false);
+        txn.debug(&[&root0, &root1], tmp_path.join("forked"), false, false);
+
         txn.set_root(0, root0);
         txn.set_root(1, root1);
 
-
         txn.commit().unwrap();
-        debug!("tmp: {:?}", tmp.path());
-        std::mem::forget(tmp);
+
+        let txn = env.txn_begin().unwrap();
+        let rc_db = txn.rc().unwrap();
+        let db0 = txn.root(0).unwrap();
+        let db1 = txn.root(1).unwrap();
+        check_memory(&env, &txn, &[&db0, &db1, &rc_db], true);
 
     }
 
@@ -1268,7 +1289,7 @@ mod tests {
 
         let key_len = 200;
         let value_len = 200;
-        let n_insertions = 200;
+        let n_insertions = 50;
         let n_del = n_insertions;
 
         let mut values0 = HashMap::new();
