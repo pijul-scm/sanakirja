@@ -204,9 +204,8 @@ impl<'env,T> MutTxn<'env,T> {
     }
 
     /// Set the root database, consuming it.
-    pub fn set_root(&mut self, num:isize, db:Db) {
-        assert!(num>=0);
-        self.txn.set_root(num+1, db.root)
+    pub fn set_root(&mut self, num:usize, db:Db) {
+        self.txn.set_root((num+1) as isize, db.root)
     }
 
     /// Create a child transaction, which can be either committed to its parent (but not to the file), or aborted independently from its parent.
@@ -221,8 +220,8 @@ impl<'env,T> MutTxn<'env,T> {
 
 pub trait Transaction:LoadPage {
     /// Load the root database, if there's one.
-    fn root(&self, num:isize) -> Option<Db> {
-        self.root_db_(num+1)
+    fn root(&self, num:usize) -> Option<Db> {
+        self.root_db_((num+1) as isize)
     }
     /// get the smallest value corresponding to a key (or to a key and a value). The return type is an iterator outputting byte slices.
     fn get<'a>(&'a self, db: &Db, key: &[u8], value:Option<&[u8]>) -> Option<Value<'a,Self>> {
@@ -484,7 +483,7 @@ mod tests {
             let mut txn = env.mut_txn_begin().unwrap();
             loop {
                 let n_root: usize = rng.gen_range(0, 10);
-                let mut root = txn.root(n_root as isize).unwrap_or_else(|| txn.create_db().unwrap());
+                let mut root = txn.root(n_root).unwrap_or_else(|| txn.create_db().unwrap());
 
                 let k: String = rand::thread_rng()
                     .gen_iter::<char>()
@@ -497,7 +496,7 @@ mod tests {
                 txn.put(&mut rng, &mut root, k.as_bytes(), v.as_bytes()).unwrap();
                 random.push((n_root, k, v));
                 
-                txn.set_root(n_root as isize, root);
+                txn.set_root(n_root, root);
                 let r:u8 = rng.gen();
                 if r > 200 { break }
             }
@@ -506,7 +505,7 @@ mod tests {
 
         let txn = env.txn_begin().unwrap();
         for &(ref db_name, ref k, ref v) in random.iter() {
-            let db = txn.root(*db_name as isize).unwrap();
+            let db = txn.root(*db_name).unwrap();
             assert!(txn.get(&db, k.as_bytes(), None).and_then(|mut x| x.next()) == Some(v.as_bytes()));
             assert!(txn.get(&db, k.as_bytes(), Some(v.as_bytes())).and_then(|mut x| x.next()) == Some(v.as_bytes()))
         }
@@ -912,10 +911,12 @@ mod tests {
 
         // Check that no page is referenced and free at the same time.
         for p in statistics.free_pages.iter() {
+            debug!("check p={:?}", p);
             assert!(!used_pages.contains_key(p));
             assert!(!value_pages.contains_key(p));
         }
         for (ref p,_) in used_pages.iter() {
+            debug!("check p={:?}", p);
             assert!(!value_pages.contains_key(p));
         }
         // Check that no page is referenced/free and bookkeeping at the same time.
@@ -1289,7 +1290,7 @@ mod tests {
 
         let key_len = 200;
         let value_len = 200;
-        let n_insertions = 50;
+        let n_insertions = 200;
         let n_del = n_insertions;
 
         let mut values0 = HashMap::new();

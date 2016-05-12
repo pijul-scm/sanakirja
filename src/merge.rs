@@ -146,8 +146,9 @@ fn merge_left<R:Rng,T>(
 /// Assuming `child_page` is the right child of the binding given by
 /// `levels`, merge it into its right sibling.
 pub fn merge_children_right<R:Rng, T>(
-    rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
-    child_page:&Cow,
+    rng:&mut R, txn:&mut MutTxn<T>, page:Cow,
+    levels:[u16;N_LEVELS],
+    child_page:&Cow, child_will_be_dup:bool,
     delete:&[u16], merged:u64, do_free_value:bool,
     page_will_be_dup:bool) -> Result<Res, Error> {
 
@@ -189,7 +190,7 @@ pub fn merge_children_right<R:Rng, T>(
                 try!(decr_rc(rng, txn, right_sibling.page_offset()))
             }
             let mut right_sibling =
-                if page_will_be_dup || right_sibling_rc > 1 {
+                if page_will_be_dup || right_sibling_rc > 1 || child_will_be_dup {
                     // If another page is pointing to the right sibling, or will be (needs_dup), copy.
                     try!(copy_page(rng, txn, &right_sibling.as_page(), &levels, &mut new_levels, false, false, 0, true))
                 } else {
@@ -203,6 +204,8 @@ pub fn merge_children_right<R:Rng, T>(
                              next_value, do_free_value, page_will_be_dup || right_sibling_rc > 1));
             right_sibling
         };
+
+        debug!("page_will_be_dup: {:?} {:?}", child_page.page_offset(), page_will_be_dup);
         if !page_will_be_dup {
             // If the page is not duplicated, we lose one reference to
             // the child. The right sibling is unchanged, though (or
@@ -212,10 +215,10 @@ pub fn merge_children_right<R:Rng, T>(
         // Now, delete (next_key, next_value) from the current page.
         if page.occupied() - next_record_size < (PAGE_SIZE as u16)/2 {
 
-            let page_rc = get_rc(txn, page.page_offset());
+            // let page_rc = get_rc(txn, page.page_offset());
             Ok(Res::Underfull { page:page, delete:levels, merged:merged_right_sibling.page_offset(),
                                 free_value: false,
-                                can_be_freed: page_rc <= 1 })
+                                must_be_dup: page_will_be_dup })
 
         } else {
             let mut new_levels = [0;N_LEVELS];
@@ -240,11 +243,11 @@ pub fn merge_children_right<R:Rng, T>(
 /// Assuming `child_page` is the right child of the *next* binding, merge it into its left sibling.
 pub fn merge_children_left<R:Rng, T>(
     rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
-    child_page:&Cow,
+    child_page:&Cow, child_will_be_dup:bool,
     delete:&[u16], merged:u64, do_free_value:bool,
     page_will_be_dup:bool) -> Result<Res, Error> {
 
-    debug!("merge_children_left");
+    debug!("merge_children_left {:?}", page_will_be_dup);
     // Load the left sibling and compute its size.
     let left_sibling = {
         let current_ptr = page.offset(levels[0] as isize);
@@ -298,10 +301,10 @@ pub fn merge_children_left<R:Rng, T>(
                 };
             try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value,
                             do_free_value,
-                            page_will_be_dup || left_sibling_rc > 1));
+                            page_will_be_dup || left_sibling_rc > 1 || child_will_be_dup));
             left_sibling
         };
-
+        debug!("page_will_be_dup: {:?} {:?}", child_page.page_offset(), page_will_be_dup);
         if !page_will_be_dup {
             // If the page is not duplicated, we lose one reference to
             // the child. The right sibling is unchanged, though (or
@@ -311,10 +314,10 @@ pub fn merge_children_left<R:Rng, T>(
 
         // Now, delete (next_key, next_value) from the current page.
         if page.occupied() - next_record_size < (PAGE_SIZE as u16)/2 {
-            let page_rc = get_rc(txn, page.page_offset());
+            //let page_rc = get_rc(txn, page.page_offset());
             Ok(Res::Underfull { page:page, delete:levels, merged:merged_left_sibling.page_offset(),
                                 free_value: false,
-                                can_be_freed: page_rc <= 1 })
+                                must_be_dup: page_will_be_dup })
 
         } else {
             let mut new_levels = [0;N_LEVELS];
@@ -347,7 +350,7 @@ pub fn merge_children_left<R:Rng, T>(
 // `child_page` to its left sibling if possible, and return `Res::Nothing{..}` else.
 pub fn merge_children_replace<R:Rng, T>(
     rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
-    child_page:&Cow,
+    child_page:&Cow, child_will_be_dup:bool,
     replacement:&Smallest,
     delete:&[u16], merged:u64,
     page_will_be_dup:bool) -> Result<Res, Error> {
@@ -375,6 +378,7 @@ pub fn merge_children_replace<R:Rng, T>(
         let key = unsafe { std::slice::from_raw_parts(replacement.key_ptr, replacement.key_len) };
         (key, replacement.value)
     };
+    debug!("replacement = {:?}",std::str::from_utf8(next_key));
     let next_record_size = record_size(next_key.len(), next_value.len() as usize);
     // (4)
     let child_page_size = child_page.occupied();
@@ -412,18 +416,17 @@ pub fn merge_children_replace<R:Rng, T>(
                             page_will_be_dup || left_sibling_rc > 1));
             left_sibling
         };
-        if !page_will_be_dup {
-            try!(free(rng, txn, child_page.page_offset(), false))
-        }
         // Now, delete (next_key, next_value) from the current page.
         let result = if page.occupied() - next_record_size < (PAGE_SIZE as u16)/2 {
             // If this makes the current page underfull.
-            let page_rc = get_rc(txn, page.page_offset());
+            // let page_rc = get_rc(txn, page.page_offset());
+            debug!("underfull");
             Ok(Res::Underfull { page:page, delete:levels, merged:merged_left_sibling.page_offset(),
                                 free_value: true,
-                                can_be_freed: page_rc <= 1 })
+                                must_be_dup: page_will_be_dup })
         } else {
             // Else, just delete.
+            debug!("not underfull");
             let mut new_levels = [0;N_LEVELS];
             let page =
                 if page_will_be_dup {
@@ -438,6 +441,12 @@ pub fn merge_children_replace<R:Rng, T>(
                 };
             Ok(Res::Ok { page:page })
         };
+        if !page_will_be_dup {
+            try!(free(rng, txn, child_page.page_offset(), false));
+        }
+        /*if replacement.needs_freeing {
+            try!(free(rng, txn, replacement.free_page, false))
+        }*/
         result
     } else {
         Ok(Res::Nothing { page:page })

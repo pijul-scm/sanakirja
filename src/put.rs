@@ -15,7 +15,7 @@ pub enum Res {
         delete: [u16;N_LEVELS], // The binding before the one we want to delete.
         merged: u64, // The updated left child of the deleted binding.
         free_value: bool,
-        can_be_freed: bool
+        must_be_dup: bool
     },
     Split {
         key_ptr:*const u8,
@@ -23,7 +23,7 @@ pub enum Res {
         value: UnsafeValue,
         left: MutPage,
         right: MutPage,
-        free_page: u64,
+        free_page: u64, // Former version of the page, before the split. Free after the split is performed.
     },
     Nothing { page:Cow }
 }
@@ -112,7 +112,11 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool
             if let Some(count) = txn.get_u64(&rc, off) {
                 if count>1 {
                     debug!("rc: {:?}, off: {:?}, count: {:?}", rc, off, rc);
-                    try!(txn.replace_u64(rng, &mut rc, off, count-1));
+                    if count > 2 {
+                        try!(txn.replace_u64(rng, &mut rc, off, count-1));
+                    } else {
+                        try!(txn.del_u64(rng, &mut rc, off));
+                    };
                     txn.set_rc(rc);
                     false
                 } else {
@@ -242,10 +246,7 @@ pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[
         let mut page = try!(txn.alloc_page());
         page.init();
         let mut n = 0;
-        let mut levels:[*mut u16;N_LEVELS] = [std::ptr::null_mut();N_LEVELS];
-        for level in 0..N_LEVELS {
-            levels[level] = (page.data() as *mut u16).offset(level as isize)
-        }
+        let mut levels:[u16;N_LEVELS] = [FIRST_HEAD;N_LEVELS];
         
         let right_page =
             if old_levels[0]==FIRST_HEAD && translate_right > 0 {
@@ -269,6 +270,7 @@ pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[
             if current != forget {
 
                 if right > 0 && right != translate_right && incr_children_rc {
+                    debug!("copy, incr {:?}", right);
                     try!(incr_rc(rng, txn, right))
                 }
 
@@ -280,19 +282,20 @@ pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[
                         try!(incr_rc(rng, txn, offset))
                     }
                 }
-                //debug!("PINPOINT: {:?}", std::str::from_utf8(key).unwrap());
+                debug!("copy_page: {:?}", std::str::from_utf8(key));
                 let size = record_size(key.len(), value.len() as usize);
                 let off = page.can_alloc(size);
+                debug!("size={:?}, off = {:?}", size, off);
+                debug_assert!(off > 0);
                 page.reset_pointers(off);
                 page.alloc_key_value(off, size, key.as_ptr(), key.len(), value);
                 *((page.offset(off as isize) as *mut u64).offset(2)) = right.to_le();
 
-                let ptr = page.offset(off as isize) as *mut u16;
                 for level in 0..N_LEVELS {
-                    *(ptr.offset(level as isize)) = NIL;
-                    if n & ((1 << level)-1) == 0 {
-                        *(levels[level]) = off.to_le();
-                        levels[level] = ptr.offset(level as isize);
+                    if n & ((1 << level)-1) == 0 { // always true for level = 0
+                        debug!("link from {:?} to {:?} at level {:?}", levels[level], off, level);
+                        *((page.offset(levels[level] as isize) as *mut u16).offset(level as isize)) = off.to_le();
+                        levels[level] = off;
                         // If the pinpointed offset has not passed yet, update the pinpoint at this level.
                         if pinpoints[0] == FIRST_HEAD && level > 0 && old_levels[0] != FIRST_HEAD {
                             pinpoints[level] = off
@@ -304,6 +307,7 @@ pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[
                     pinpoints[0] = off
                 }
             } else {
+                debug!("copy: forgetting");
                 if forgetting_value {
                     // Here, maybe we need to forget
                     if let UnsafeValue::O { offset, len } = value {
@@ -355,6 +359,8 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                 std::ptr::copy_nonoverlapping(old_levels.as_ptr(), pinpoints.as_mut_ptr(), old_levels.len());
                 if forgetting_next {
                     let next = u16::from_le(*(p.offset(old_levels[0] as isize) as *const u16));
+                    debug!("next = {:?}", next);
+                    debug_assert!(next > 0);
                     // We forget an entry, register the freed memory.
                     let (key,value) = read_key_value(p.offset(next as isize));
                     if forgetting_value {
@@ -370,11 +376,21 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
 
                     // Now, really delete!
                     for l in 0..N_LEVELS {
+                        debug_assert!(old_levels[l] != NIL);
                         let next_l = u16::from_le(*((p.offset(old_levels[l] as isize) as *const u16).offset(l as isize)));
-                        if next_l == next {
+                        if next_l == next && next != NIL {
                             // Replace the next one with the next-next-one, at this level.
+                            let next_next =  u16::from_le(*((p.offset(next_l as isize) as *const u16).offset(l as isize)));
+                            debug!("copy {:?}, creating {:?} -> {:?} at level {:?}",
+                                   p.page_offset(),
+                                   old_levels[l],
+                                   next_next, l);
                             *((p.offset(old_levels[l] as isize) as *mut u16).offset(l as isize)) =
-                                *((p.offset(next_l as isize) as *const u16).offset(l as isize));
+                                next_next.to_le()
+                        } else {
+                            debug!("copy {:?}, no link at level {:?}, old_levels[l]={:?}, next_l={:?}, next={:?}",
+                                   p.page_offset(),
+                                   l, old_levels[l], next_l, next);
                         }
                     }
                 }
@@ -652,9 +668,9 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
         } else {
             debug!("splitting, key = {:?}", std::str::from_utf8(key));
             if left_page > 0 {
-                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, levels[0], left_page)))
+                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, NIL, levels[0], left_page)))
             } else {
-                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, NIL, 0)))
+                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, NIL, NIL, 0)))
             }
         }
 
@@ -672,9 +688,9 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
         } else {
             debug!("splitting, key = {:?}", std::str::from_utf8(key));
             if left_page > 0 {
-                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, levels[0], left_page)))
+                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, NIL, levels[0], left_page)))
             } else {
-                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, NIL, 0)))
+                Ok(try!(split_page(rng, txn, &page, key, value, right_page, page_will_be_dup, NIL, NIL, 0)))
             }
         }
     }
@@ -687,11 +703,14 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
 /// updates the lists on the page, and update the levels accordingly.
 pub unsafe fn local_insert_at<R:Rng>(rng:&mut R, page:&mut MutPage, key:&[u8], value:UnsafeValue, right_page:u64, off:u16, size:u16, levels:&mut [u16]) {
     debug!("entering local_insert_at");
+    debug_assert!(off + size <= PAGE_SIZE as u16);
     page.reset_pointers(off);
     page.alloc_key_value(off, size, key.as_ptr(), key.len(), value);
     *((page.offset(off as isize) as *mut u64).offset(2)) = right_page.to_le();
     for i in 0..N_LEVELS {
         let next = *((page.offset(levels[i] as isize) as *const u16).offset(i as isize));
+        debug!("{:?} levels[{:?}]={:?}, next={:?}", page.page_offset(), i, levels[i], next);
+        // debug_assert!(next != 0);
         *((page.offset(off as isize) as *mut u16).offset(i as isize)) = next;
         *((page.offset(levels[i] as isize) as *mut u16).offset(i as isize)) = off.to_le();
         debug!("local_insert_at: link from {:?}.{:?} to {:?}, at level {:?}", page.page_offset(), levels[i], off, i);
@@ -729,6 +748,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
                               // split is "translated" to a pointer to the
                                   // left page of the split.
                                   page_will_be_dup:bool,
+                                  forgetting:u16,
                                   translate_index:u16, translate_right_page:u64)->Result<Res,Error> {
 
     debug!("split {:?} {:?}", page.page_offset(), page_will_be_dup);
@@ -759,17 +779,14 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
     
     for (current, key_, value_, r) in PI::new(page,0) {
         debug!("split key_ = {:?}", std::str::from_utf8(key_));
-        let r = if current == translate_index {
-            if translate_right_page == 0 {
-                // This means "forget about translate_right_page"
-                // We must free the associated value, since this feature is only called where value freeing is needed.
-                if let UnsafeValue::O { offset, len } = value {
-                    try!(free_value(rng, txn, offset, len));
-                }
-                continue
-            } else {
-                translate_right_page
+        if current == forgetting {
+            if let UnsafeValue::O { offset, len } = value {
+                try!(free_value(rng, txn, offset, len));
             }
+            continue
+        }
+        let r = if current == translate_index {
+            translate_right_page
         } else {
             if page_will_be_dup && r > 0 {
                 try!(incr_rc(rng, txn, r))

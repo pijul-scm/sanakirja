@@ -765,6 +765,8 @@ impl MutPage {
         }
     }
     pub unsafe fn reset_pointers(&mut self, off_ptr:u16) {
+        assert!(off_ptr + 24 < PAGE_SIZE as u16);
+        // println!("resetting pointers for {:?} at {:?}", self.page_offset(), off_ptr);
         let ptr = self.offset(off_ptr as isize) as *mut u8;
         *(ptr as *mut u16) = NIL;
         *((ptr as *mut u16).offset(1)) = NIL;
