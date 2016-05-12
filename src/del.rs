@@ -80,7 +80,7 @@ fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, leve
                     unsafe {
                         std::ptr::copy_nonoverlapping(levels.as_ptr(), new_levels.as_mut_ptr(), N_LEVELS)
                     }
-                    match try!(rebalance::rebalance_left(rng, txn, page_, levels, &child_page,
+                    match try!(rebalance::rebalance_left(rng, txn, page_, levels, &child_page, child_must_be_dup,
                                                          forgetting, merged,
                                                          do_free_value,
                                                          page_will_be_dup)) {
@@ -115,7 +115,9 @@ fn handle_underfull<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, mut page:Cow, leve
             // we couldn't merge. rebalance.
             debug!("second case of rebalancing: {:?}", child_page);
             let forgetting = u16::from_le(unsafe { *(child_page.offset(delete[0] as isize) as *const u16) });
-            let result = match try!(rebalance::rebalance_right(rng, txn, page, new_levels, None, &child_page, forgetting, merged,
+            let result = match try!(rebalance::rebalance_right(rng, txn, page, new_levels, None, &child_page,
+                                                               child_must_be_dup,
+                                                               forgetting, merged,
                                                                do_free_value,
                                                                page_will_be_dup)) {
                 Res::Nothing { page:page_ } => {
@@ -196,7 +198,9 @@ fn handle_underfull_replace<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, 
             // If we couldn't merge:
             debug!("rebalancing: {:?}", levels[0]);
             let forgetting = u16::from_le(unsafe { *(child_page.offset(delete[0] as isize) as *const u16) });
-            match try!(rebalance::rebalance_right(rng, txn, page_, levels, Some(replacement), &child_page, forgetting, merged, false,
+            match try!(rebalance::rebalance_right(rng, txn, page_, levels, Some(replacement), &child_page,
+                                                  child_must_be_dup,
+                                                  forgetting, merged, false,
                                                   page_will_be_dup)) {
                 Res::Nothing { page:page_} => {
                     return rebalance::handle_failed_right_rebalancing(rng, txn, page_, levels, Some(replacement), child_page,

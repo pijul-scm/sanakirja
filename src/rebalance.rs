@@ -128,7 +128,8 @@ pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, 
 /// Assumes the child page is the next element's right child.
 pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
                                  replacement:Option<&Smallest>,
-                                 child_page:&Cow, forgetting:u16, replace_page:u64, do_free_value:bool,
+                                 child_page:&Cow, child_must_dup:bool,
+                                 forgetting:u16, replace_page:u64, do_free_value:bool,
                                  page_will_be_dup:bool) -> Result<Res, Error> {
     debug!("rebalance_right {:?}, levels {:?}", page.page_offset(), &levels[..]);
 
@@ -185,7 +186,6 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     debug!("allocated {:?} and {:?}", new_left.page_offset(), new_right.page_offset());
 
     let left_rc = get_rc(txn, left_child.page_offset());
-    let child_rc = get_rc(txn, child_page.page_offset());
 
     unsafe {
         let left_left_child = u64::from_le(*((left_child.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
@@ -261,8 +261,8 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         let off = new_right.can_alloc(next_size);
         debug_assert!(off > 0);
         debug_assert!(off + next_size <= PAGE_SIZE as u16);
-        debug!("key -> right (middle): {:?} {:?} {:?} {:?}", std::str::from_utf8(key), right_left_child, page_will_be_dup, child_rc);
-        if (page_will_be_dup || child_rc > 1) && right_left_child > 0 {
+        debug!("key -> right (middle): {:?} {:?} {:?} {:?}", std::str::from_utf8(key), right_left_child, page_will_be_dup, child_must_dup);
+        if (page_will_be_dup || child_must_dup) && right_left_child > 0 {
             // If the child is still alive after this call, increment
             // the grandchild's RC
             try!(incr_rc(rng, txn, right_left_child))
@@ -274,7 +274,9 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     let forgotten_page = unsafe {
         u64::from_le(*((child_page.offset(forgetting as isize) as *const u64).offset(2)))
     };
+    debug!("forgetting:{:?}, forgotten_page:{:?}", forgetting, forgotten_page);
     for (cur, key, value, r) in PI::new(child_page,0) {
+        debug!("cur:{:?}, r:{:?}", cur, r);
         if cur != forgetting {
             let next_size = record_size(key.len(),value.len() as usize);
             // insert in right page.
@@ -284,7 +286,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             last_updated_ptr = new_right.offset(off as isize);
             debug!("key -> right: {:?} {:?}", std::str::from_utf8(key), r);
 
-            if (page_will_be_dup || child_rc > 1) && r > 0 && r != forgotten_page {
+            if (page_will_be_dup || child_must_dup) && r > 0 && r != forgotten_page {
                 try!(incr_rc(rng, txn, r))
             }
             unsafe {local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
@@ -350,7 +352,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 ///
 /// Assumes `child_page` is the current element's right child.
 pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
-                                child_page:&Cow,
+                                child_page:&Cow, child_must_dup:bool,
                                 forgetting:u16, replace_page:u64, do_free_value:bool,
                                 page_will_be_dup:bool) -> Result<Res, Error> {
     debug!("rebalance_left");
@@ -398,11 +400,10 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     new_right.init();
     let mut middle = None;
     debug!("allocated {:?} and {:?}", new_left.page_offset(), new_right.page_offset());
-    let child_rc = get_rc(txn, child_page.page_offset());
     unsafe {
         let left_left_child = u64::from_le(*((child_page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
         *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left_left_child.to_le();
-        if (page_will_be_dup || child_rc > 1) && left_left_child > 0 {
+        if (page_will_be_dup || child_must_dup) && left_left_child > 0 {
             debug!("incr left_left {:?}", left_left_child);
             try!(incr_rc(rng, txn, left_left_child))
         }
@@ -426,7 +427,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             last_updated_ptr = new_left.offset(off as isize);
 
             debug!("key -> left: {:?} {:?}", std::str::from_utf8(key), r);
-            if (page_will_be_dup || child_rc > 1) && r > 0 && r != forgotten_page {
+            if (page_will_be_dup || child_must_dup) && r > 0 && r != forgotten_page {
                 try!(incr_rc(rng, txn, r))
             }
             unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
@@ -448,7 +449,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
         debug_assert!(off > 0);
         debug_assert!(off + next_size <= PAGE_SIZE as u16);
         debug!("key -> left: {:?} {:?}", std::str::from_utf8(key), right_left_child);
-        if (page_will_be_dup || child_rc > 1) && right_left_child > 0 {
+        if (page_will_be_dup || child_must_dup) && right_left_child > 0 {
             debug!("incr right_left {:?}", right_left_child);
             try!(incr_rc(rng, txn, right_left_child))
         }

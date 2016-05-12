@@ -201,7 +201,7 @@ pub fn merge_children_right<R:Rng, T>(
                                          &mut new_levels, false, false, true, 0))
                 };
             try!(merge_right(rng, txn, &child_page, &mut right_sibling, forgetting, merged, next_key,
-                             next_value, do_free_value, page_will_be_dup || right_sibling_rc > 1));
+                             next_value, do_free_value, page_will_be_dup || right_sibling_rc > 1 || child_will_be_dup));
             right_sibling
         };
 
@@ -444,9 +444,6 @@ pub fn merge_children_replace<R:Rng, T>(
         if !page_will_be_dup {
             try!(free(rng, txn, child_page.page_offset(), false));
         }
-        /*if replacement.needs_freeing {
-            try!(free(rng, txn, replacement.free_page, false))
-        }*/
         result
     } else {
         Ok(Res::Nothing { page:page })
