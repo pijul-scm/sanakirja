@@ -136,6 +136,7 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Error
     };
     if really_free {
         if txn.protected_page == off {
+            debug!("deprotecting {:?}", off);
             txn.free_protected = true
         } else {
             debug!("really freeing {:?}", off);

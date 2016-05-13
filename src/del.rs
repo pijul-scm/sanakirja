@@ -210,7 +210,6 @@ fn get_smallest_binding<T>(txn:&mut MutTxn<T>, mut current:u64) -> Smallest {
         let page = txn.load_page(current);
         current = unsafe { u64::from_le(*(page.offset(FIRST_HEAD as isize + 16) as *const u64)) };
         if current == 0 {
-
             let (next_key,next_value) = {
                 let cur_ptr = page.offset(0) as *const u16;
                 let next_off = u16::from_le(unsafe { *cur_ptr });
@@ -244,6 +243,7 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
 
     // First get the smallest binding, replace here.
     let smallest = get_smallest_binding(txn, child_page.page_offset());
+    debug!("protecting {:?}", smallest.page);
     txn.protected_page = smallest.page;
     txn.free_protected = false;
 
@@ -375,10 +375,12 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
             }
         }
     };
+    debug!("protected: {:?}", txn.free_protected);
     if txn.free_protected {
-        txn.protected_page = 0;
-        unsafe { super::transaction::free(&mut txn.txn, smallest.page) }
+        debug!("freeing previously protected {:?}", smallest.page);
+        unsafe { super::transaction::free(&mut txn.txn, txn.protected_page) }
     }
+    txn.protected_page = 0;
     result
 }
 
