@@ -353,7 +353,7 @@ pub fn merge_children_left<R:Rng, T>(
 
 // Assuming we've just deleted an internal node (and thus `levels` is
 // set to the element just before the deleted node), merge
-// `child_page` to its left sibling if possible, and return `Res::Nothing{..}` else.
+// `child_page` into its left sibling if possible, and return `Res::Nothing{..}` else.
 pub fn merge_children_replace<R:Rng, T>(
     rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
     child_page:&Cow, child_will_be_dup:bool,
@@ -419,7 +419,7 @@ pub fn merge_children_replace<R:Rng, T>(
                 };
             try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value,
                             false,
-                            page_will_be_dup || left_sibling_rc > 1));
+                            page_will_be_dup || child_will_be_dup));
             left_sibling
         };
         // Now, delete (next_key, next_value) from the current page.

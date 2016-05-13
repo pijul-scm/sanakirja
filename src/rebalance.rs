@@ -552,7 +552,6 @@ unsafe fn check_alloc_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, pag
                     // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
                     debug!("check_alloc, compaction, levels={:?}", levels);
                     let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, &mut new_levels, true, false, left_page));
-                    let off = page.can_alloc(size);
                     page
                 }
             };
