@@ -258,7 +258,8 @@ pub unsafe fn read_key_value<'a>(p: *const u8) -> (&'a [u8], UnsafeValue) {
     let val_len = u32::from_le(*(p as *const u32).offset(3));
 
     if (val_len as usize) < VALUE_SIZE_THRESHOLD {
-        (std::slice::from_raw_parts((p as *const u8).offset(24 + val_len as isize), key_len as usize),
+        let padding = ((8 - (val_len & 7)) & 7);
+        (std::slice::from_raw_parts((p as *const u8).offset((24 + val_len + padding) as isize), key_len as usize),
          UnsafeValue::S { p:(p as *const u8).offset(24), len:val_len })
     } else {
         (std::slice::from_raw_parts((p as *const u8).offset(32), key_len as usize),
@@ -725,7 +726,7 @@ impl MutPage {
     /// offset).
     pub fn alloc(&mut self, first_free: u16, size: u16) {
         unsafe {
-            debug_assert!(size & 7 == 0); // 32 bits aligned.
+            debug_assert!(size & 7 == 0); // 64 bits aligned.
             *(self.p_first_free()) = (first_free + size).to_le();
         }
     }
@@ -757,7 +758,9 @@ impl MutPage {
                     debug_assert!(len < VALUE_SIZE_THRESHOLD as u32);
                     *((ptr as *mut u32).offset(3)) = len.to_le();
                     copy_nonoverlapping(p,(ptr as *mut u8).offset(24), len as usize);
-                    (ptr as *mut u8).offset(24 + len as isize)
+
+                    let padding = ((8 - (len & 7)) & 7);
+                    (ptr as *mut u8).offset((24 + len + padding) as isize)
                 },
                 UnsafeValue::O { offset,len } => {
                     debug!("write_key_value: {:?}", offset);
@@ -1109,10 +1112,11 @@ fn debug_concise<P: AsRef<Path>, T: LoadPage>(t: &T, db: &[&Db], p: P) {
 
 pub fn record_size(key: usize, value: usize) -> u16 {
     if value < VALUE_SIZE_THRESHOLD {
-        let size = 24 + key as u16 + value as u16;
-        size + ((8 - (size & 7)) & 7) // 64-bit alignment.
+        let key_padding = (8 - (key & 7)) & 7;
+        let value_padding = (8 - (value & 7)) & 7;
+        (24 + key + key_padding + value + value_padding) as u16
     } else {
-        let size = 24 + key as u16 + 8;
-        size + ((8 - (size & 7)) & 7)
+        let key_padding = (8 - (key & 7)) & 7;
+        (24 + key + 8 + key_padding) as u16
     }
 }
