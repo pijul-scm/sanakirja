@@ -205,7 +205,7 @@ pub fn merge_children_right<R:Rng, T>(
                                          &mut new_levels, false, false, 0))
                 };
             try!(merge_right(rng, txn, &child_page, &mut right_sibling, forgetting, merged, next_key,
-                             next_value, do_free_value, page_will_be_dup || right_sibling_rc > 1 || child_will_be_dup));
+                             next_value, do_free_value, page_will_be_dup || child_will_be_dup));
             right_sibling
         };
 
@@ -306,7 +306,7 @@ pub fn merge_children_left<R:Rng, T>(
                 };
             try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value,
                             do_free_value,
-                            page_will_be_dup || left_sibling_rc > 1 || child_will_be_dup));
+                            page_will_be_dup || child_will_be_dup));
             left_sibling
         };
         debug!("page_will_be_dup: {:?} {:?}", child_page.page_offset(), page_will_be_dup);
