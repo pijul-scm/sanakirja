@@ -33,7 +33,11 @@ fn merge_page<R:Rng,T>(
                 debug_assert!(off + size <= PAGE_SIZE as u16);
                 current_ptr = target.offset(off as isize);
                 debug!("merge_page: off={:?}", off);
-                if increment_children && r > 0 {
+                let page_will_be_forgotten = unsafe {
+                    // If the next one is going to be forgotten, we'll replace its page.
+                    u16::from_le(*(source.offset(current as isize) as *const u16)) == forgetting
+                };
+                if increment_children && r > 0 && !page_will_be_forgotten {
                     try!(incr_rc(rng, txn, r))
                 }
                 local_insert_at(rng, target, key, value, r, off, size, levels);
@@ -190,7 +194,7 @@ pub fn merge_children_right<R:Rng, T>(
                 try!(decr_rc(rng, txn, right_sibling.page_offset()))
             }
             let mut right_sibling =
-                if page_will_be_dup || right_sibling_rc > 1 || child_will_be_dup {
+                if page_will_be_dup || right_sibling_rc > 1 {
                     // If another page is pointing to the right sibling, or will be (needs_dup), copy.
                     try!(copy_page(rng, txn, &right_sibling.as_page(), &levels, &mut new_levels, false, false, 0, true))
                 } else {
@@ -198,7 +202,7 @@ pub fn merge_children_right<R:Rng, T>(
                     try!(cow_pinpointing(rng, txn,
                                          if needs_compaction { right_sibling.as_nonmut() } else { right_sibling },
                                          &levels,
-                                         &mut new_levels, false, false, true, 0))
+                                         &mut new_levels, false, false, 0))
                 };
             try!(merge_right(rng, txn, &child_page, &mut right_sibling, forgetting, merged, next_key,
                              next_value, do_free_value, page_will_be_dup || right_sibling_rc > 1 || child_will_be_dup));
@@ -229,12 +233,13 @@ pub fn merge_children_right<R:Rng, T>(
                                    merged_right_sibling.page_offset(), true))
                 } else {
                     try!(cow_pinpointing(rng, txn, page, &levels,
-                                         &mut new_levels, true, false, true,
+                                         &mut new_levels, true, false,
                                          merged_right_sibling.page_offset()))
                 };
             Ok(Res::Ok { page:page })
         }
     } else {
+        debug!("giving up merge");
         Ok(Res::Nothing { page:page })
     }
 }
@@ -297,7 +302,7 @@ pub fn merge_children_left<R:Rng, T>(
                     try!(cow_pinpointing(rng, txn,
                                          if needs_compaction { left_sibling.as_nonmut() } else { left_sibling },
                                          &levels,
-                                         &mut new_levels, false, false, true, 0))
+                                         &mut new_levels, false, false, 0))
                 };
             try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value,
                             do_free_value,
@@ -328,12 +333,13 @@ pub fn merge_children_left<R:Rng, T>(
                                    merged_left_sibling.page_offset(), true))
                 } else {
                     try!(cow_pinpointing(rng, txn, page, &levels,
-                                         &mut new_levels, true, false, true,
+                                         &mut new_levels, true, false,
                                          merged_left_sibling.page_offset()))
                 };
             Ok(Res::Ok { page:page })
         }
     } else {
+        debug!("giving up merge");
         Ok(Res::Nothing { page:page })
     }
 }
@@ -409,7 +415,7 @@ pub fn merge_children_replace<R:Rng, T>(
                 } else {
                     try!(cow_pinpointing(rng, txn,
                                          if needs_compaction { left_sibling.as_nonmut() } else { left_sibling },
-                                         &levels, &mut new_levels, false, false, true, 0))
+                                         &levels, &mut new_levels, false, false, 0))
                 };
             try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value,
                             false,
@@ -436,7 +442,7 @@ pub fn merge_children_replace<R:Rng, T>(
                                    merged_left_sibling.page_offset(), true))
                 } else {
                     try!(cow_pinpointing(rng, txn, page, &levels,
-                                         &mut new_levels, true, true, true,
+                                         &mut new_levels, true, true,
                                          merged_left_sibling.page_offset()))
                 };
             Ok(Res::Ok { page:page })
@@ -446,6 +452,7 @@ pub fn merge_children_replace<R:Rng, T>(
         }
         result
     } else {
+        debug!("giving up merge");
         Ok(Res::Nothing { page:page })
     }
 }

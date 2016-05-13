@@ -26,7 +26,7 @@ pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
             try!(cow_pinpointing(rng, txn, child_page,
                                  &delete,
                                  &mut new_delete,
-                                 true, do_free_value, true,
+                                 true, do_free_value,
                                  replace_page))
         }
     };
@@ -44,7 +44,7 @@ pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
                 try!(cow_pinpointing(rng, txn, page,
                                      &levels,
                                      &mut new_levels,
-                                     true, true, true,
+                                     true, true,
                                      0))
             };
         // Reinsert the replacement.
@@ -66,7 +66,7 @@ pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
             try!(cow_pinpointing(rng, txn, page,
                                  &levels,
                                  &mut new_levels,
-                                 false, false, true,
+                                 false, false,
                                  0))
         };
         let next = u16::from_le(unsafe { *(page.offset(new_levels[0] as isize) as *const u16) });
@@ -93,7 +93,7 @@ pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, 
             try!(cow_pinpointing(rng, txn, child_page,
                                  &delete,
                                  &mut new_delete,
-                                 true, do_free_value, true,
+                                 true, do_free_value,
                                  replace_page))
         }
     };
@@ -107,7 +107,7 @@ pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, 
             try!(cow_pinpointing(rng, txn, page,
                                  &levels[..],
                                  &mut new_levels[..],
-                                 false, false, true,
+                                 false, false,
                                  new_child_page.page_offset()))
         };
     if child_must_be_dup && !page_will_be_dup {
@@ -262,7 +262,10 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         debug_assert!(off > 0);
         debug_assert!(off + next_size <= PAGE_SIZE as u16);
         debug!("key -> right (middle): {:?} {:?} {:?} {:?}", std::str::from_utf8(key), right_left_child, page_will_be_dup, child_must_dup);
-        if (page_will_be_dup || child_must_dup) && right_left_child > 0 {
+        let page_will_be_forgotten = unsafe {
+            u16::from_le(*(child_page.offset(FIRST_HEAD as isize) as *const u16)) == forgetting
+        };
+        if (page_will_be_dup || child_must_dup) && right_left_child > 0 && !page_will_be_forgotten {
             // If the child is still alive after this call, increment
             // the grandchild's RC
             try!(incr_rc(rng, txn, right_left_child))
@@ -271,10 +274,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     }
 
     let mut last_updated_ptr = new_right.offset(right_levels[0] as isize);
-    let forgotten_page = unsafe {
-        u64::from_le(*((child_page.offset(forgetting as isize) as *const u64).offset(2)))
-    };
-    debug!("forgetting:{:?}, forgotten_page:{:?}", forgetting, forgotten_page);
+    debug!("forgetting:{:?}", forgetting);
     for (cur, key, value, r) in PI::new(child_page,0) {
         debug!("cur:{:?}, r:{:?}", cur, r);
         if cur != forgetting {
@@ -286,7 +286,10 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             last_updated_ptr = new_right.offset(off as isize);
             debug!("key -> right: {:?} {:?}", std::str::from_utf8(key), r);
 
-            if (page_will_be_dup || child_must_dup) && r > 0 && r != forgotten_page {
+            let page_will_be_forgotten = unsafe {
+                u16::from_le(*(child_page.offset(cur as isize) as *const u16)) == forgetting
+            };
+            if (page_will_be_dup || child_must_dup) && r > 0 && !page_will_be_forgotten {
                 try!(incr_rc(rng, txn, r))
             }
             unsafe {local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
@@ -330,12 +333,6 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         debug!("freeing child: {:?}", child_page.page_offset());
         try!(free(rng, txn, child_page.page_offset(), false));
     }
-    /*
-    if replacement_free > 0 {
-        debug!("freeing replacement: {:?}", replacement_free);
-        try!(free(rng, txn, replacement_free, false));
-    }
-     */
     result
 }
 
@@ -403,7 +400,12 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     unsafe {
         let left_left_child = u64::from_le(*((child_page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
         *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left_left_child.to_le();
-        if (page_will_be_dup || child_must_dup) && left_left_child > 0 {
+
+        let page_will_be_forgotten = unsafe {
+            u16::from_le(*(child_page.offset(FIRST_HEAD as isize) as *const u16)) == forgetting
+        };
+
+        if (page_will_be_dup || child_must_dup) && left_left_child > 0 && !page_will_be_forgotten {
             debug!("incr left_left {:?}", left_left_child);
             try!(incr_rc(rng, txn, left_left_child))
         }
@@ -413,9 +415,6 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     let mut left_levels = [0;N_LEVELS];
     let mut right_levels = [0;N_LEVELS];
 
-    let forgotten_page = unsafe {
-        u64::from_le(*((child_page.offset(forgetting as isize) as *const u64).offset(2)))
-    };
     let mut last_updated_ptr = new_left.offset(0);
     for (cur, key, value, r) in PI::new(child_page,0) {
         if cur != forgetting {
@@ -427,7 +426,10 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             last_updated_ptr = new_left.offset(off as isize);
 
             debug!("key -> left: {:?} {:?}", std::str::from_utf8(key), r);
-            if (page_will_be_dup || child_must_dup) && r > 0 && r != forgotten_page {
+            let page_will_be_forgotten = unsafe {
+                u16::from_le(*(child_page.offset(cur as isize) as *const u16)) == forgetting
+            };
+            if (page_will_be_dup || child_must_dup) && r > 0 && !page_will_be_forgotten {
                 try!(incr_rc(rng, txn, r))
             }
             unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
@@ -514,9 +516,10 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     };
     debug!("result = {:?}", result);
     //
-    debug!("freeing left: {:?}", right_child.page_offset());
+    debug!("freeing right: {:?}", right_child.page_offset());
     if !page_will_be_dup {
         try!(free(rng, txn, right_child.page_offset(), false));
+        debug!("freeing child: {:?}", child_page.page_offset());
         try!(free(rng, txn, child_page.page_offset(), false));
     }
     result
@@ -544,11 +547,11 @@ unsafe fn check_alloc_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, pag
                 if off + size < PAGE_SIZE as u16 {
                     // No need to copy nor compact the page, the value can be written right away.
                     debug!("check_alloc, no compaction, levels={:?}", levels);
-                    try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false, true, left_page))
+                    try!(cow_pinpointing(rng, txn, page, levels, &mut new_levels, true, false, left_page))
                 } else {
                     // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
                     debug!("check_alloc, compaction, levels={:?}", levels);
-                    let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, &mut new_levels, true, false, true, left_page));
+                    let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(), levels, &mut new_levels, true, false, left_page));
                     let off = page.can_alloc(size);
                     page
                 }

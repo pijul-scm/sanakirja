@@ -325,7 +325,7 @@ pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[
 /// Turn a Cow into a MutPage, copying it if it's not already mutable. In the case a copy is needed, and argument 'pinpoint' is non-zero, a non-zero offset (in bytes) to the equivalent element in the new page is returned. This can happen for instance because of compaction.
 pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_levels:&[u16], pinpoints:&mut [u16],
                                 forgetting_next: bool, forgetting_value:bool,
-                                free_page:bool, translate_right:u64) -> Result<MutPage,Error> {
+                                translate_right:u64) -> Result<MutPage,Error> {
     unsafe {
         match page.cow {
             transaction::Cow::Page(p0) => {
@@ -335,22 +335,20 @@ pub fn cow_pinpointing<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, old_le
                 
                 let page = try!(copy_page(rng, txn, &p, old_levels, pinpoints, forgetting_next,
                                           forgetting_value, translate_right, false)); // never increase the counter of child pages
-                if free_page {
-                    if page_rc <= 1 {
-                        if page_rc == 1 {
-                            let mut rc = txn.rc().unwrap();
-                            try!(txn.del_u64(rng, &mut rc, p0_offset));
-                            txn.set_rc(rc);
-                        }
-                        //println!("free cow: {:?}", page_offset);
-                        if !cfg!(feature="no_free") {
-                            transaction::free(&mut(txn.txn), p0_offset)
-                        }
-                    } else {
+                if page_rc <= 1 {
+                    if page_rc == 1 {
                         let mut rc = txn.rc().unwrap();
-                        try!(txn.replace_u64(rng, &mut rc, p0_offset, page_rc-1));
+                        try!(txn.del_u64(rng, &mut rc, p0_offset));
                         txn.set_rc(rc);
                     }
+                    //println!("free cow: {:?}", page_offset);
+                    if !cfg!(feature="no_free") {
+                        transaction::free(&mut(txn.txn), p0_offset)
+                    }
+                } else {
+                    let mut rc = txn.rc().unwrap();
+                    try!(txn.replace_u64(rng, &mut rc, p0_offset, page_rc-1));
+                    txn.set_rc(rc);
                 }
                 Ok(page)
             }
@@ -594,7 +592,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                     let mut new_levels = [0;N_LEVELS];
                     
                     if !page_will_be_dup {
-                        let page = try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], false, false, true,
+                        let page = try!(cow_pinpointing(rng, txn, page, &levels[..], &mut new_levels[..], false, false,
                                                         next_page.page_offset()));
                         Ok(Res::Ok { page:page })
                     } else {
@@ -650,14 +648,14 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
                 if off + size < PAGE_SIZE as u16 && get_rc(txn, page.page_offset()) <= 1 {
                     // No need to copy nor compact the page, the value can be written right away.
                     (try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels,
-                                          false, false, true, left_page)),
+                                          false, false, left_page)),
                      off)
                 } else {
                     // Here, we need to compact the page, which is equivalent to considering it non mutable and CoW it.
 
                     let page = try!(cow_pinpointing(rng, txn, page.as_nonmut(),
                                                     &levels[..],
-                                                    &mut new_levels[..], false, false, true,
+                                                    &mut new_levels[..], false, false,
                                                     left_page));
                     let off = page.can_alloc(size);
                     (page, off)
