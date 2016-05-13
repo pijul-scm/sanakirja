@@ -213,7 +213,7 @@ pub fn merge_children_right<R:Rng, T>(
             // If the page is not duplicated, we lose one reference to
             // the child. The right sibling is unchanged, though (or
             // was already duplicated).
-            try!(free(rng, txn, child_page.page_offset(), false))
+            try!(free(rng, txn, child_page.page_offset()))
         }
         // Now, delete (next_key, next_value) from the current page.
         if page.occupied() - next_record_size < (PAGE_SIZE as u16)/2 {
@@ -313,7 +313,7 @@ pub fn merge_children_left<R:Rng, T>(
             // If the page is not duplicated, we lose one reference to
             // the child. The right sibling is unchanged, though (or
             // was already duplicated).
-            try!(free(rng, txn, child_page.page_offset(), false))
+            try!(free(rng, txn, child_page.page_offset()))
         }
 
         // Now, delete (next_key, next_value) from the current page.
@@ -447,7 +447,7 @@ pub fn merge_children_replace<R:Rng, T>(
             Ok(Res::Ok { page:page })
         };
         if !page_will_be_dup {
-            try!(free(rng, txn, child_page.page_offset(), false));
+            try!(free(rng, txn, child_page.page_offset()));
         }
         result
     } else {

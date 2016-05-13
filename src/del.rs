@@ -23,6 +23,7 @@ pub struct Smallest {
     pub key_ptr:*const u8,
     pub key_len:usize,
     pub value:UnsafeValue,
+    pub page:u64
 }
 
 
@@ -221,6 +222,7 @@ fn get_smallest_binding<T>(txn:&mut MutTxn<T>, mut current:u64) -> Smallest {
                 key_ptr: next_key.as_ptr(),
                 key_len: next_key.len(),
                 value: next_value,
+                page: current
             }
         }
     }
@@ -242,8 +244,11 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
 
     // First get the smallest binding, replace here.
     let smallest = get_smallest_binding(txn, child_page.page_offset());
+    txn.protected_page = smallest.page;
+    txn.free_protected = false;
+
     debug!("smallest: {:?}", smallest);
-    match try!(delete(rng,txn, child_page, C::Smallest, page_will_be_dup)) {
+    let result = match try!(delete(rng,txn, child_page, C::Smallest, page_will_be_dup)) {
         Res::Ok { page: child_page } => {
             debug!("internal: ok");
             // Set the child page here, regardless of whether a merge is coming after this.
@@ -312,25 +317,34 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
             let smallest_size = record_size(smallest.key_len, smallest.value.len() as usize);
 
             // We need to insert middle_key -> right and smallest_key -> left to the page.
+            let deleted_size = unsafe {
+                let next = u16::from_le(*(page.offset(levels[0] as isize) as *const u16));
+                let (key,value) = read_key_value(page.offset(next as isize));
+                record_size(key.len(), value.len() as usize)
+            };
 
-            let result = if page.occupied() + middle_size + smallest_size <= PAGE_SIZE as u16 {
-                let middle_off = page.can_alloc(middle_size);
-                debug_assert!(middle_off + middle_size <= PAGE_SIZE as u16);
+            let result = if (page.occupied() + middle_size + smallest_size) - deleted_size <= PAGE_SIZE as u16 {
 
                 let mut new_levels = [0;N_LEVELS];
                 // Delete the current element.
                 let mut page = if page_will_be_dup {
                     try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, 0, true))
                 } else {
-                    try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, 0))
+                    if page.first_free() + middle_size + smallest_size <= PAGE_SIZE as u16 {
+                        try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, false, 0))
+                    } else {
+                        try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels, &mut new_levels, true, false, 0))
+                    }
                 };
                 // Reinsert the left page with the smallest key.
+                let middle_off = page.can_alloc(middle_size);
+                debug_assert!(middle_off + middle_size <= PAGE_SIZE as u16);
                 unsafe {
                     local_insert_at(rng, &mut page, middle_key, value, right.page_offset(), middle_off, middle_size, &mut new_levels);
                 }
 
                 let smallest_off = page.can_alloc(smallest_size);
-                debug_assert!(smallest_off + smallest_size <= PAGE_SIZE as u16); // TODO: compact in the call to cow_pinpointing above, if necessary.
+                debug_assert!(smallest_off + smallest_size <= PAGE_SIZE as u16);
                 unsafe {
                     local_insert_at(rng, &mut page, smallest_key, smallest.value, left.page_offset(), smallest_off, smallest_size, &mut new_levels);
                 }
@@ -346,7 +360,7 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                 }
             };
             if !page_will_be_dup && free_page > 0 {
-                try!(free(rng, txn, free_page, false));
+                try!(free(rng, txn, free_page));
             }
             result
         },
@@ -357,7 +371,12 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                 unreachable!()
             }
         }
+    };
+    if txn.free_protected {
+        txn.protected_page = 0;
+        unsafe { super::transaction::free(&mut txn.txn, smallest.page) }
     }
+    result
 }
 
 
@@ -497,7 +516,7 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C,
                                        this_will_be_dup))
             };
             if !this_will_be_dup && free_page > 0 {
-                try!(free(rng, txn, free_page, false));
+                try!(free(rng, txn, free_page));
             }
             Ok(result)
         },
@@ -525,7 +544,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                 let next_page = u64::from_le(*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
                 if next == NIL && next_page != 0 {
                     db.root = next_page;
-                    try!(free(rng, txn, page.page_offset(), false));
+                    try!(free(rng, txn, page.page_offset()));
                 } else {
                     db.root = page.page_offset();
                 }
@@ -555,7 +574,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                 let next_page = u64::from_le(*((page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
                 if next == NIL && next_page != 0 {
                     db.root = next_page;
-                    try!(free(rng, txn, page.page_offset(), false));
+                    try!(free(rng, txn, page.page_offset()));
                 } else {
                     db.root = page.page_offset();
                 }
@@ -578,6 +597,42 @@ pub fn replace<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8]
     try!(del(rng,txn,db,key,None));
     try!(put(rng,txn,db,key,value));
     Ok(())
+}
+
+
+fn drop_page<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, page:u64)->Result<(),Error> {
+    let page = txn.load_page(page);
+    for (_ , _, value, r) in PI::new(&page,0) {
+        try!(drop_page(rng, txn, r))
+    }
+    try!(free(rng, txn, page.page_offset()));
+    Ok(())
+}
+
+
+pub fn drop<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: Db)->Result<(),Error> {
+    drop_page(rng, txn, db.root)
+}
+
+pub fn clear<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db)->Result<(),Error> {
+    if get_rc(txn, db.root) > 1 {
+        decr_rc(rng, txn, db.root)
+    } else {
+        let page = txn.load_cow_page(db.root);
+        for (_ , _, value, r) in PI::new(&page,0) {
+            try!(drop_page(rng, txn, r))
+        }
+        match page.cow {
+            super::transaction::Cow::Page(p0) => {
+                unsafe { super::transaction::free(&mut txn.txn, p0.offset) }
+                db.root = try!(txn.alloc_page()).page_offset();
+            }
+            super::transaction::Cow::MutPage(p0) => {
+                (MutPage { page:p0 }).init()
+            }
+        }
+        Ok(())
+    }
 }
 
 

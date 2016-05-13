@@ -112,6 +112,8 @@ impl Env {
         let txn = try!(self.env.mut_txn_begin());
         Ok(MutTxn {
             txn: txn,
+            protected_page: 0,
+            free_protected: false
         })
     }
     /// Returns statistics about pages.
@@ -157,6 +159,17 @@ impl<'env,T> MutTxn<'env,T> {
         //self.txn.set_root(db.root_num, db.root);
         Ok(())
     }
+
+    /// Drops a database.
+    pub fn drop<R:Rng>(&mut self, rng:&mut R, db: Db)->Result<(),Error> {
+        del::drop(rng, self, db)
+    }
+
+    /// Empties a database, without dropping it.
+    pub fn clear<R:Rng>(&mut self, rng:&mut R, db: &mut Db)->Result<(),Error> {
+        del::clear(rng, self, db)
+    }
+
 
     /// Add a binding to a B tree.
     pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8])->Result<bool,Error> {
@@ -211,7 +224,7 @@ impl<'env,T> MutTxn<'env,T> {
     /// Create a child transaction, which can be either committed to its parent (but not to the file), or aborted independently from its parent.
     pub fn mut_txn_begin<'txn>(&'txn mut self) -> Result<MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>>,Error> {
         let txn = try!(self.txn.mut_txn_begin());
-        Ok(MutTxn { txn: txn })
+        Ok(MutTxn { txn: txn, protected_page: 0, free_protected:false })
     }
     pub fn abort(self) {
 

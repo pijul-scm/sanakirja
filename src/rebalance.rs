@@ -325,10 +325,10 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 
     if !page_will_be_dup {
         // Decrease the reference counter of the left child.
-        try!(free(rng, txn, left_child.page_offset(), false));
+        try!(free(rng, txn, left_child.page_offset()));
         // Decrease the reference counter of the child.
         debug!("freeing child: {:?}", child_page.page_offset());
-        try!(free(rng, txn, child_page.page_offset(), false));
+        try!(free(rng, txn, child_page.page_offset()));
     }
     result
 }
@@ -513,9 +513,9 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     //
     debug!("freeing right: {:?}", right_child.page_offset());
     if !page_will_be_dup {
-        try!(free(rng, txn, right_child.page_offset(), false));
+        try!(free(rng, txn, right_child.page_offset()));
         debug!("freeing child: {:?}", child_page.page_offset());
-        try!(free(rng, txn, child_page.page_offset(), false));
+        try!(free(rng, txn, child_page.page_offset()));
     }
     result
 }

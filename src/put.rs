@@ -107,8 +107,9 @@ pub fn get_rc<T:super::Transaction>(txn:&T, off:u64) -> u64 {
 
 
 /// Decrease the reference count of a page, freeing it if it's no longer referenced.
-pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool) -> Result<(),Error> {
+pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Error> {
     //println!("freeing {:?}", off);
+    debug_assert!(off != 0);
     let really_free = {
         if let Some(mut rc) = txn.rc() {
             if let Some(count) = txn.get_u64(&rc, off) {
@@ -134,13 +135,9 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64, free_children:bool
         }
     };
     if really_free {
-        if free_children {
-            let p = txn.load_cow_page(off);
-            for (_,_,_,r) in PI::new(&p,0) {
-                try!(free(rng, txn, r, true))
-            }
-        }
-        if !cfg!(feature="no_free") {
+        if txn.protected_page == off {
+            txn.free_protected = true
+        } else {
             debug!("really freeing {:?}", off);
             unsafe { transaction::free(&mut txn.txn, off) }
         }
@@ -623,7 +620,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
                                           page_will_be_dup)
                     };
                     if !page_will_be_dup && free_page > 0 {
-                        try!(free(rng, txn, free_page, false));
+                        try!(free(rng, txn, free_page));
                     }
                     result
                 },
@@ -892,7 +889,7 @@ pub fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Res) -> Result<Mut
             let key = std::slice::from_raw_parts(key_ptr, key_len);
             local_insert_at(rng, &mut page, key, value, right.page_offset(), off, size, &mut levels);
             debug!("root split, freeing {:?}", free_page);
-            try!(free(rng, txn, free_page, false));
+            try!(free(rng, txn, free_page));
             Ok(page)
         }
     } else {

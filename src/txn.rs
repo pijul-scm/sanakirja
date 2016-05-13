@@ -42,10 +42,15 @@ impl Db {
     }
 }
 
+
 /// Mutable transaction
 pub struct MutTxn<'env,T> {
     #[doc(hidden)]
     pub txn: transaction::MutTxn<'env,T>,
+    #[doc(hidden)]
+    pub protected_page: u64,
+    #[doc(hidden)]
+    pub free_protected: bool
 }
 
 impl<'env,T> Drop for MutTxn<'env,T> {
