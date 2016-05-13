@@ -505,7 +505,7 @@ pub fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:O
                 debug_assert!(next!=0);
                 let next_ptr = page.offset(next as isize);
                 let (next_key,next_value) = unsafe { read_key_value(next_ptr) };
-                //println!("compare: {:?} {:?}", std::str::from_utf8_unchecked(key), std::str::from_utf8_unchecked(next_key));
+                // debug!("compare: {:?} {:?}", std::str::from_utf8(key), std::str::from_utf8(next_key));
                 match key.cmp(next_key) {
                     Ordering::Less => break,
                     Ordering::Equal =>
@@ -775,7 +775,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
     let mut extra_on_lhs = false;
     
     for (current, key_, value_, r) in PI::new(page,0) {
-        debug!("split key_ = {:?}", std::str::from_utf8(key_));
+        debug!("split key_ = {:?} {:?}", current, std::str::from_utf8(key_));
         if current == forgetting {
             if let UnsafeValue::O { offset, len } = value {
                 try!(free_value(rng, txn, offset, len));

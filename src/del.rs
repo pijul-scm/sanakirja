@@ -222,7 +222,7 @@ fn get_smallest_binding<T>(txn:&mut MutTxn<T>, mut current:u64) -> Smallest {
                 key_ptr: next_key.as_ptr(),
                 key_len: next_key.len(),
                 value: next_value,
-                page: current
+                page: page.page_offset()
             }
         }
     }
@@ -247,7 +247,10 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
     txn.protected_page = smallest.page;
     txn.free_protected = false;
 
-    debug!("smallest: {:?}", smallest);
+    {
+        let key = unsafe { std::slice::from_raw_parts(smallest.key_ptr, smallest.key_len) };
+        debug!("smallest: {:?} {:?}", std::str::from_utf8(key), smallest.page);
+    }
     let result = match try!(delete(rng,txn, child_page, C::Smallest, page_will_be_dup)) {
         Res::Ok { page: child_page } => {
             debug!("internal: ok");
@@ -827,8 +830,9 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
     let mut page = txn.alloc_page().unwrap();
     page.init();
     let tmp = tempdir::TempDir::new("pijul").unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
     unsafe {
-        let tmp_path = tmp.path();
         debug!("tmp_path: {:?}", tmp_path);
         let mut insertions = Vec::new();
         for i in 0..n {
@@ -872,12 +876,12 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
             debug!("key = {:?}", key_);
 
             let db = Db { root_num: -1, root: page.page_offset() };
-            txn.debug(&[&db], tmp_path.join(format!("before_{}", i)), false, false);
+            txn.debug(&[&db], (&tmp_path).join(format!("before_{}", i)), false, false);
 
             insertions.push((key_,value_, value))
         }
         let db = Db { root_num: -1, root: page.page_offset() };
-        txn.debug(&[&db], tmp_path.join("before"), false, false);
+        txn.debug(&[&db], (&tmp_path).join("before"), false, false);
 
         match sorted {
             Sorted::No => {},
@@ -933,7 +937,7 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
                 x => page = root_split(&mut rng, &mut txn, x).unwrap(),
             }
             let db = Db { root_num: -1, root: page.page_offset() };
-            txn.debug(&[&db], tmp_path.join(format!("after_{}", i)), false, false);
+            txn.debug(&[&db], (&tmp_path).join(format!("after_{}", i)), false, false);
         }
         debug!("delete done, debugging");
         
@@ -944,7 +948,6 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
         }
         //txn.debug(&[&db], format!("/tmp/after"), false, false);
     }
-    std::mem::forget(tmp)
 }
 
 #[test]
@@ -975,7 +978,7 @@ fn test_delete_all_unsorted_200() {
 
 #[test]
 fn test_delete_all_unsorted_1000() {
-    test_delete_all(1000, 200, 200, Sorted::No)
+    test_delete_all(800, 200, 200, Sorted::No)
 }
 
 
