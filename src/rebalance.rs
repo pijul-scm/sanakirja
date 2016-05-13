@@ -54,9 +54,6 @@ pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
         unsafe {
             local_insert_at(rng, &mut page, key, repl.value, new_child_page.page_offset(), off, size, &mut new_levels)
         }
-        /*if repl.needs_freeing {
-            try!(free(rng, txn, repl.free_page, false))
-        }*/
         Ok(Res::Ok { page:page })
     } else {
         let mut new_levels = [0;N_LEVELS];
@@ -401,9 +398,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
         let left_left_child = u64::from_le(*((child_page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
         *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left_left_child.to_le();
 
-        let page_will_be_forgotten = unsafe {
-            u16::from_le(*(child_page.offset(FIRST_HEAD as isize) as *const u16)) == forgetting
-        };
+        let page_will_be_forgotten = u16::from_le(*(child_page.offset(FIRST_HEAD as isize) as *const u16)) == forgetting;
 
         if (page_will_be_dup || child_must_dup) && left_left_child > 0 && !page_will_be_forgotten {
             debug!("incr left_left {:?}", left_left_child);

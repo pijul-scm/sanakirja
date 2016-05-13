@@ -33,10 +33,9 @@ fn merge_page<R:Rng,T>(
                 debug_assert!(off + size <= PAGE_SIZE as u16);
                 current_ptr = target.offset(off as isize);
                 debug!("merge_page: off={:?}", off);
-                let page_will_be_forgotten = unsafe {
-                    // If the next one is going to be forgotten, we'll replace its page.
-                    u16::from_le(*(source.offset(current as isize) as *const u16)) == forgetting
-                };
+                let page_will_be_forgotten = // If the next one is going to be forgotten, we'll replace its page.
+                    u16::from_le(*(source.offset(current as isize) as *const u16)) == forgetting;
+
                 if increment_children && r > 0 && !page_will_be_forgotten {
                     try!(incr_rc(rng, txn, r))
                 }

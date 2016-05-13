@@ -1290,7 +1290,7 @@ mod tests {
 
         let key_len = 200;
         let value_len = 200;
-        let n_insertions = 200;
+        let n_insertions = 2000;
         let n_del = n_insertions;
 
         let mut values0 = HashMap::new();
@@ -1324,8 +1324,8 @@ mod tests {
             debug!("j = {:?}", j);
             debug!("deleting {:?}", u);
             txn.del(&mut rng, &mut root1, u.as_bytes(), None).unwrap();
-            //txn.debug_concise(&[&root0, &root1], tmp_path.join(format!("after_{}",j)));
-            txn.debug(&[&root0, &root1], tmp_path.join(format!("after_{}",j)), false, false);
+            // txn.debug_concise(&[&root0, &root1], tmp_path.join(format!("after_{}",j)));
+            // txn.debug(&[&root0, &root1], tmp_path.join(format!("after_{}",j)), false, false);
             j+=1;
 
             let (used_pages,value_pages) = check_rc(&txn, &[&root0, &root1]);

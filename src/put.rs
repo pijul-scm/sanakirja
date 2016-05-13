@@ -15,7 +15,7 @@ pub enum Res {
         delete: [u16;N_LEVELS], // The binding before the one we want to delete.
         merged: u64, // The updated left child of the deleted binding.
         free_value: bool,
-        must_be_dup: bool
+        must_be_dup: bool // This page is referenced at least twice (used when rebalancing fails)
     },
     Split {
         key_ptr:*const u8,
@@ -23,7 +23,9 @@ pub enum Res {
         value: UnsafeValue,
         left: MutPage,
         right: MutPage,
-        free_page: u64, // Former version of the page, before the split. Free after the split is performed.
+        free_page: u64, // Former version of the page, before the
+ // split. Free after the split is performed. Might be 0 if no page
+ // needs to be freed / decremented.
     },
     Nothing { page:Cow }
 }

@@ -16,14 +16,6 @@ enum C<'a> {
     K { key:&'a[u8] }, // delete the smallest binding of that key.
     Smallest // delete the smallest element of a B-tree (used to replace the root of a B-tree).
 }
-impl<'a> C<'a> {
-    fn is_smallest(&self)->bool {
-        match self {
-            &C::Smallest => true,
-            _ => false
-        }
-    }
-}
 
 // Return type of the smallest (key,value).
 #[derive(Debug)]
@@ -31,9 +23,6 @@ pub struct Smallest {
     pub key_ptr:*const u8,
     pub key_len:usize,
     pub value:UnsafeValue,
-
-    pub free_page: u64,
-    pub needs_freeing: bool // This page is no longer referenced and should be freed after copying the smallest value.
 }
 
 
@@ -232,8 +221,6 @@ fn get_smallest_binding<T>(txn:&mut MutTxn<T>, mut current:u64) -> Smallest {
                 key_ptr: next_key.as_ptr(),
                 key_len: next_key.len(),
                 value: next_value,
-                free_page: page.page_offset(),
-                needs_freeing: true
             }
         }
     }
@@ -265,28 +252,30 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
             let key = unsafe { std::slice::from_raw_parts(smallest.key_ptr, smallest.key_len) };
             let size = record_size(smallest.key_len, smallest.value.len() as usize);
 
-            // TODO: take the deleted size into account.
             let deleted_size = unsafe {
                 let next = u16::from_le(*(page.offset(levels[0] as isize) as *const u16));
                 let (key,value) = read_key_value(page.offset(next as isize));
                 record_size(key.len(), value.len() as usize)
             };
-            
-            let off = page.can_alloc(size);
-            let result = if off > 0 {
+            let result = if (page.occupied() + size) - deleted_size <= PAGE_SIZE as u16 {
                 let mut new_levels = [0;N_LEVELS];
                 let mut page =
                     if page_will_be_dup {
+                        debug!("copying");
                         try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, true, 0, true))
                     } else {
-                        if off + size < PAGE_SIZE as u16 {
+                        let off = page.can_alloc(size);
+                        debug!("off = {:?}", off);
+                        if off > 0 && off + size <= PAGE_SIZE as u16 {
+                            debug!("pinpointing, levels[0]={:?}", levels[0]);
                             try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true, 0))
                         } else {
+                            debug!("compacting");
                             try!(cow_pinpointing(rng, txn, page.as_nonmut(), &levels, &mut new_levels, true, true, 0))
                         }
                     };
                 let off = page.can_alloc(size);
-
+                debug!("off = {:?}, size={:?}", off, size);
                 debug_assert!(off + size <= PAGE_SIZE as u16);
                 unsafe {
                     local_insert_at(rng, &mut page, key, smallest.value, child_page.page_offset(), off, size, &mut new_levels)
@@ -302,10 +291,6 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                                     NIL, 0))
                 }
             };
-            /*debug!("considering freeing {:?} {:?}, child={:?}", smallest.free_page, smallest.needs_freeing, child_page);
-            if smallest.needs_freeing && !page_will_be_dup && smallest.free_page != child_page.page_offset() {
-                try!(free(rng, txn, smallest.free_page, false));
-            }*/
             Ok(result)
         },
         Res::Underfull { page: child_page, delete, merged, must_be_dup, .. } => {
@@ -360,12 +345,9 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                                levels[0], left.page_offset())
                 }
             };
-            if !page_will_be_dup {
+            if !page_will_be_dup && free_page > 0 {
                 try!(free(rng, txn, free_page, false));
             }
-            /*if smallest.needs_freeing {
-                try!(free(rng, txn, smallest.free_page, false));
-            }*/
             result
         },
         Res::Nothing { .. } => {
@@ -466,7 +448,6 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C,
         Some(Res::Underfull { page:child_page, delete, merged, free_value, must_be_dup }) => {
 
             debug!("delete: underfull {:?}", child_page);
-            let child_page_offset = child_page.page_offset();
             let page_offset = page.page_offset();
             let result = try!(handle_underfull(rng, txn, page, levels, child_page,
                                                must_be_dup,
@@ -515,7 +496,7 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C,
                                        parent_will_be_dup,
                                        this_will_be_dup))
             };
-            if !this_will_be_dup {
+            if !this_will_be_dup && free_page > 0 {
                 try!(free(rng, txn, free_page, false));
             }
             Ok(result)
@@ -556,7 +537,7 @@ pub fn del<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, db:&mut Db, key:&[u8], value
                 debug!("del: must_be_dup = {:?}", must_be_dup);
                 let page =
                     if must_be_dup {
-                        decr_rc(rng, txn, page.page_offset());
+                        try!(decr_rc(rng, txn, page.page_offset()));
                         try!(copy_page( rng, txn, &page.as_page(),
                                         &delete,
                                         &mut new_levels,

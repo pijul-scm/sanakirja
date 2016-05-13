@@ -1052,7 +1052,7 @@ fn debug_concise<P: AsRef<Path>, T: LoadPage>(t: &T, db: &[&Db], p: P) {
             let mut hh = HashSet::new();
             print_tree(txn, &mut hh, &mut edges, buf, &mut h, p, root);
             for edge in edges.iter() {
-                writeln!(buf, "{}", edge);
+                writeln!(buf, "{}", edge).unwrap();
             }
             for p in h.iter() {
                 print_page(txn, pages, buf, p)
