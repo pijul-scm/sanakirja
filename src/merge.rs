@@ -49,9 +49,7 @@ fn merge_page<R:Rng,T>(
                         try!(free_value(rng, txn, offset, len))
                     }
                 }
-                if replace_page > 0 {
-                    *((current_ptr as *mut u64).offset(2)) = replace_page.to_le()
-                }
+                *((current_ptr as *mut u64).offset(2)) = replace_page.to_le()
             }
         }
     }
@@ -75,11 +73,10 @@ fn merge_right<R:Rng,T>(
         let left_left_child = *((left.offset(0) as *const u64).offset(2));
         *((right.offset(0) as *mut u64).offset(2)) = left_left_child.to_le();
 
-        if increment_children && left_left_child > 0 {
-            let first_left = u16::from_le(*(left.offset(FIRST_HEAD as isize) as *const u16));
-            if first_left != forgetting {
-                try!(incr_rc(rng, txn, left_left_child))
-            }
+        let page_will_be_forgotten = u16::from_le(*(left.offset(FIRST_HEAD as isize) as *const u16)) == forgetting;
+        debug!("page_will_be_forgotten = {:?}", page_will_be_forgotten);
+        if increment_children && left_left_child > 0 && !page_will_be_forgotten {
+            try!(incr_rc(rng, txn, left_left_child))
         }
 
         try!(merge_page(rng, txn, left, right, &mut levels, forgetting, replace_page, do_free_value, increment_children));
@@ -87,9 +84,10 @@ fn merge_right<R:Rng,T>(
         let size = record_size(key.len(), value.len() as usize);
         let off = right.can_alloc(size);
         debug_assert!(off + size <= PAGE_SIZE as u16);
-        if increment_children && right_left_child > 0 {
+        // Already incremented by the caller (when they copied "right").
+        /*if increment_children && right_left_child > 0 {
             try!(incr_rc(rng, txn, right_left_child))
-        }
+        }*/
         local_insert_at(rng, right, key, value, right_left_child, off, size, &mut levels);
     }
     Ok(())
@@ -128,12 +126,14 @@ fn merge_left<R:Rng,T>(
         // Then, insert the separator, with child page the leftmost child of `right`.
         debug!("levels={:?}", levels);
         {
-            let child = u64::from_le(*((right.offset(0) as *const u64).offset(2)));
+            let child = u64::from_le(*((right.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
             let size = record_size(key.len(), value.len() as usize);
             let off = left.can_alloc(size);
             // TODO: compact if necessary.
             debug_assert!(off + size <= PAGE_SIZE as u16);
-            if increment_children && child > 0 {
+            let page_will_be_forgotten = u16::from_le(*(right.offset(FIRST_HEAD as isize) as *const u16)) == forgetting;
+            debug!("page_will_be_forgotten = {:?}", page_will_be_forgotten);
+            if increment_children && child > 0 && !page_will_be_forgotten {
                 try!(incr_rc(rng, txn, child))
             }
             local_insert_at(rng, left, key, value, child, off, size, &mut levels);
