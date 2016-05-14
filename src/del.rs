@@ -443,9 +443,19 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C,
 
                 let page =
                     if parent_will_be_dup || page_rc > 1 {
-                        try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, 0, false))
+                        // After this page is copied, if we're in case
+                        // C::Smallest, there will be one more
+                        // reference to the value.
+                        if let (C::Smallest, UnsafeValue::O { offset, .. }) = (comp, next_value) {
+                            try!(incr_rc(rng, txn, offset))
+                        }
+                        try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, true, 0, true))
                     } else {
-                        try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, true, 0))
+                        let free_value = match comp {
+                            C::Smallest => false,
+                            _ => true
+                        };
+                        try!(cow_pinpointing(rng, txn, page, &levels, &mut new_levels, true, free_value, 0))
                     };
                 debug!("page={:?}", page);
                 Ok(Res::Ok { page:page })
@@ -453,9 +463,6 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C,
         },
         Some(Res::Nothing { .. }) if eq => {
             // Find smallest, etc.
-            /*if page_rc > 1 && !parent_will_be_dup {
-                try!(decr_rc(rng, txn, page.page_offset()))
-            }*/
             let page_offset = page.page_offset();
             let result = try!(delete_at_internal_node(rng, txn, page, levels, this_will_be_dup));
             match result {
@@ -608,6 +615,9 @@ pub fn replace<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8]
 fn drop_page<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, page:u64)->Result<(),Error> {
     let page = txn.load_page(page);
     for (_ , _, value, r) in PI::new(&page,0) {
+        if let UnsafeValue::O { offset, len } = value {
+            try!(free_value(rng, txn, offset, len))
+        }
         try!(drop_page(rng, txn, r))
     }
     try!(free(rng, txn, page.page_offset()));
@@ -625,6 +635,9 @@ pub fn clear<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db)->Result<(),E
     } else {
         let page = txn.load_cow_page(db.root);
         for (_ , _, value, r) in PI::new(&page,0) {
+            if let UnsafeValue::O { offset, len } = value {
+                try!(free_value(rng, txn, offset, len))
+            }
             try!(drop_page(rng, txn, r))
         }
         match page.cow {

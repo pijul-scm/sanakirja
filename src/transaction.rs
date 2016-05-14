@@ -78,7 +78,7 @@ impl From<std::io::Error> for Error {
 }
 
 impl<T> From<std::sync::PoisonError<T>> for Error {
-    fn from(e: std::sync::PoisonError<T>) -> Error {
+    fn from(_: std::sync::PoisonError<T>) -> Error {
         Error::Poison
     }
 }
@@ -124,14 +124,14 @@ pub struct MutTxn<'env,T> {
 
 impl<'env> Drop for Txn<'env> {
     fn drop(&mut self) {
-        self.env.lock_file.unlock(); // .unwrap();
+        self.env.lock_file.unlock().unwrap();
         *self.guard;
     }
 }
 impl<'env,T> Drop for MutTxn<'env,T> {
     fn drop(&mut self) {
         debug!("dropping transaction");
-        self.env.mutable_file.unlock(); // .unwrap();
+        self.env.mutable_file.unlock().unwrap();
         if let Some(ref mut guard) = self.mutable {
             debug!("dropping guard");
             **guard

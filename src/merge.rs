@@ -77,7 +77,6 @@ fn merge_right<R:Rng,T>(
         if increment_children && left_left_child > 0 && !page_will_be_forgotten {
             try!(incr_rc(rng, txn, left_left_child))
         }
-
         try!(merge_page(rng, txn, left, right, &mut levels, forgetting, replace_page, do_free_value, increment_children));
 
         let size = record_size(key.len(), value.len() as usize);
@@ -138,8 +137,6 @@ fn merge_left<R:Rng,T>(
             local_insert_at(rng, left, key, value, child, off, size, &mut levels);
         }
         // Finally, add all elements from `right` to `left`.
-        // TODO: compact if necessary.
-        let compact={};
         try!(merge_page(rng, txn, right, left, &mut levels, forgetting, replace_page, do_free_value, increment_children));
     }
     Ok(())

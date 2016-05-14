@@ -48,7 +48,7 @@
 //!    let mut rng = rand::thread_rng();
 //!    let dir = tempdir::TempDir::new("pijul").unwrap();
 //!    let env = sanakirja::Env::new(dir.path(),100).unwrap();
-//!    let mut txn = env.mut_txn_begin();
+//!    let mut txn = env.mut_txn_begin().unwrap();
 //!    let mut root = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
 //!    txn.put(&mut rng, &mut root, b"test key", b"test value").unwrap();
 //!    txn.set_root(0,root);
@@ -80,7 +80,7 @@ pub use transaction::{Statistics,Error};
 use transaction::Commit;
 mod txn;
 pub use txn::{MutTxn, Txn, Value, Db, Iter};
-use txn::{P, LoadPage}; // , MAIN_ROOT};
+use txn::{P, LoadPage};
 mod put;
 
 mod merge;
@@ -821,10 +821,11 @@ mod tests {
             txn.commit().unwrap();
         }
         debug!("put done");
-        let txn = env.txn_begin().unwrap();
-        let db = txn.root(0).unwrap();
-        check_memory(&env, &txn, &[&db], true);
-
+        {
+            let txn = env.txn_begin().unwrap();
+            let db = txn.root(0).unwrap();
+            check_memory(&env, &txn, &[&db], true);
+        }
         let mut i = 0;
         for (ref k, ref v) in random.iter() {
             debug!("del i = {:?}, k = {:?}", i, k);
@@ -844,13 +845,12 @@ mod tests {
     }
 
     #[cfg(test)]
-    use std::collections::{HashSet,HashMap};
+    use std::collections::{HashMap};
     
     #[cfg(test)]
     fn check_rc<T:Transaction>(txn:&T, dbs:&[&Db]) -> (HashMap<u64,usize>, HashMap<u64,usize>) {
-        use std::collections::{HashSet,HashMap};
-        use std::collections::hash_map::Entry;
-        use super::txn::{Page,LoadPage,P, read_key_value, UnsafeValue};
+        use std::collections::{HashMap};
+        use super::txn::{Page,LoadPage,P, UnsafeValue};
         use super::put::PI;
         // let txn = env.txn_begin();
         // let db = txn.root(0).unwrap();
@@ -915,10 +915,6 @@ mod tests {
 
     #[cfg(test)]
     fn check_memory<T:Transaction>(env:&Env, txn:&T, dbs:&[&Db], print:bool) {
-        use std::collections::{HashSet,HashMap};
-        use std::collections::hash_map::Entry;
-        use super::txn::{Page,LoadPage,P, read_key_value, UnsafeValue};
-        use super::put::PI;
         let (used_pages,value_pages) = check_rc(txn, dbs);
         let statistics = env.statistics().unwrap();
 
@@ -1312,7 +1308,7 @@ mod tests {
         let mut txn = env.mut_txn_begin().unwrap();
         let mut root0 = txn.root(0).unwrap_or_else(|| txn.create_db().unwrap());
 
-        for i in 0..n_insertions {
+        for _ in 0..n_insertions {
             let k0: String = rand::thread_rng()
                 .gen_ascii_chars()
                 .take(key_len)
@@ -1331,7 +1327,7 @@ mod tests {
         txn.debug(&[&root0, &root1], tmp_path.join("before"), false, false);
 
         let mut j = 0;
-        for (ref u,ref v) in values0.iter() {
+        for (ref u,_) in values0.iter() {
 
             
             debug!("j = {:?}", j);
@@ -1367,9 +1363,14 @@ mod tests {
         let db0 = txn.root(0).unwrap();
         let db1 = txn.root(1).unwrap();
 
-        let (used_pages,value_pages) = check_rc(&txn, &[&db0, &db1]);
+        let (used_pages, value_pages) = check_rc(&txn, &[&db0, &db1]);
 
         for (u, v) in used_pages.iter() {
+            debug!("page {:?}, actual rc = {:?}, from rc database {:?}", u, v, super::put::get_rc(&txn, *u));
+            assert!(*v == super::put::get_rc(&txn, *u) as usize
+                    || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
+        }
+        for (u, v) in value_pages.iter() {
             debug!("page {:?}, actual rc = {:?}, from rc database {:?}", u, v, super::put::get_rc(&txn, *u));
             assert!(*v == super::put::get_rc(&txn, *u) as usize
                     || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
