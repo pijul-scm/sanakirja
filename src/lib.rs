@@ -73,7 +73,7 @@ extern crate memmap;
 
 use rand::Rng;
 use std::path::Path;
-
+use std::collections::HashMap;
 pub mod transaction;
 
 pub use transaction::{Statistics,Error};
@@ -112,8 +112,8 @@ impl Env {
         let txn = try!(self.env.mut_txn_begin());
         Ok(MutTxn {
             txn: txn,
-            protected_page: 0,
-            free_protected: false
+            protected_pages: [0;2],
+            free_protected: [false;2]
         })
     }
     /// Returns statistics about pages.
@@ -224,7 +224,7 @@ impl<'env,T> MutTxn<'env,T> {
     /// Create a child transaction, which can be either committed to its parent (but not to the file), or aborted independently from its parent.
     pub fn mut_txn_begin<'txn>(&'txn mut self) -> Result<MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>>,Error> {
         let txn = try!(self.txn.mut_txn_begin());
-        Ok(MutTxn { txn: txn, protected_page: 0, free_protected:false })
+        Ok(MutTxn { txn: txn, protected_pages: [0;2], free_protected:[false;2] })
     }
     pub fn abort(self) {
 
@@ -1248,7 +1248,7 @@ mod tests {
             }
 
             debug!("tmp: {:?}", tmp_path);
-            // txn.debug(&[&root0, &root1], (&tmp_path).join(format!("after_{}",j)), false, false);
+            //txn.debug(&[&root0, &root1], (&tmp_path).join(format!("after_{}",j)), false, false);
             let (used_pages,value_pages) = check_rc(&txn, &[&root0, &root1]);
 
             for (u, v) in used_pages.iter() {
@@ -1275,8 +1275,72 @@ mod tests {
 
     }
 
+
     #[test]
-    fn fork_put_del_many() -> ()
+    fn fork_put_del_200() {
+        let key_len = 200;
+        let value_len = 200;
+        let n_insertions = 200;
+        let n_del = n_insertions;
+        fork_put_del_many(n_insertions, n_del, key_len, value_len)
+    }
+    #[test]
+    fn fork_put_del_2000() {
+        let key_len = 200;
+        let value_len = 200;
+        let n_insertions = 2000;
+        let n_del = n_insertions;
+        fork_put_del_many(n_insertions, n_del, key_len, value_len)
+    }
+
+    #[test]
+    fn fork_put_del_large_20_() {
+        let key_len = 200;
+        let value_len = 2000;
+        let n_insertions = 20;
+        let n_del = n_insertions;
+        fork_put_del_many(n_insertions, n_del, key_len, value_len)
+    }
+
+    #[test]
+    fn fork_put_del_large_200_() {
+        let key_len = 200;
+        let value_len = 2000;
+        let n_insertions = 200;
+        let n_del = n_insertions;
+        fork_put_del_many(n_insertions, n_del, key_len, value_len)
+    }
+
+    #[test]
+    fn fork_put_del_large_2000() {
+        let key_len = 200;
+        let value_len = 2000;
+        let n_insertions = 2000;
+        let n_del = n_insertions;
+        fork_put_del_many(n_insertions, n_del, key_len, value_len)
+    }
+
+    #[test]
+    fn fork_put_del_really_large_200_() {
+        let key_len = 200;
+        let value_len = 8000;
+        let n_insertions = 200;
+        let n_del = n_insertions;
+        fork_put_del_many(n_insertions, n_del, key_len, value_len)
+    }
+
+    #[test]
+    fn fork_put_del_really_large_2000() {
+        let key_len = 200;
+        let value_len = 8000;
+        let n_insertions = 2000;
+        let n_del = n_insertions;
+        fork_put_del_many(n_insertions, n_del, key_len, value_len)
+    }
+
+
+    
+    fn fork_put_del_many(n_insertions:usize, n_deletions:usize, key_len:usize, value_len:usize) -> ()
     {
         extern crate tempdir;
         extern crate rand;
@@ -1290,17 +1354,12 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let dir = tempdir::TempDir::new("pijul").unwrap();
-        let env = Env::new(dir.path(), 1000).unwrap();
+        let env = Env::new(dir.path(), 10000).unwrap();
 
         let tmp = tempdir::TempDir::new("pijul").unwrap();
 
         let tmp_path = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-
-        let key_len = 200;
-        let value_len = 200;
-        let n_insertions = 2000;
-        let n_del = n_insertions;
 
         let mut values0 = HashMap::new();
         let mut values1 = HashMap::new();
@@ -1344,10 +1403,15 @@ mod tests {
                 assert!(*v == super::put::get_rc(&txn, *u) as usize
                         || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
             }
+            for (u, v) in value_pages.iter() {
+                debug!("page {:?}, actual rc = {:?}, from rc database {:?}", u, v, super::put::get_rc(&txn, *u));
+                assert!(*v == super::put::get_rc(&txn, *u) as usize
+                        || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
+            }
             
             debug!("check: {:?} {:?}", used_pages, value_pages);
 
-            if j >= n_del {
+            if j >= n_deletions {
                 break
             }
         }
@@ -1371,7 +1435,7 @@ mod tests {
                     || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
         }
         for (u, v) in value_pages.iter() {
-            debug!("page {:?}, actual rc = {:?}, from rc database {:?}", u, v, super::put::get_rc(&txn, *u));
+            debug!("value page {:?}, actual rc = {:?}, from rc database {:?}", u, v, super::put::get_rc(&txn, *u));
             assert!(*v == super::put::get_rc(&txn, *u) as usize
                     || (*v == 1 && super::put::get_rc(&txn, *u) == 0))
         }

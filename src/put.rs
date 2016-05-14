@@ -4,6 +4,7 @@ use std;
 use std::cmp::Ordering;
 use super::transaction;
 use rand::{Rng};
+use std::collections::hash_map::Entry;
 
 extern crate log;
 
@@ -135,9 +136,15 @@ pub fn free<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, off:u64) -> Result<(),Error
         }
     };
     if really_free {
-        if txn.protected_page == off {
-            debug!("deprotecting {:?}", off);
-            txn.free_protected = true
+        let mut index = 3;
+        if txn.protected_pages[0] == off {
+            index = 0
+        } else if txn.protected_pages[1] == off {
+            index = 1
+        }
+        if index < 3 {
+            debug!("not freeing protected {:?}", off);
+            txn.free_protected[index] = true
         } else {
             debug!("really freeing {:?}", off);
             unsafe { transaction::free(&mut txn.txn, off) }
@@ -178,10 +185,11 @@ pub fn alloc_value<T>(txn:&mut MutTxn<T>, value: &[u8]) -> Result<UnsafeValue,Er
 
 
 pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut len:u32)->Result<(),Error> {
-    debug!("freeing value {:?}", offset);
+    debug!(">>>>>>>>>>>>>>>>>>>>> freeing value {:?}", offset);
     let really_free =
         if let Some(mut rc) = txn.rc() {
             if let Some(count) = txn.get_u64(&mut rc, offset) {
+                debug!("count = {:?}", count);
                 if count>1 {
                     try!(txn.replace_u64(rng, &mut rc, offset, count-1));
                     txn.set_rc(rc);
@@ -198,6 +206,7 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut l
             true
         };
     if (!cfg!(feature="no_free")) && really_free {
+        debug!("really freeing value {:?}", offset);
         unsafe {
             loop {
                 if len <= PAGE_SIZE as u32 {
@@ -214,6 +223,7 @@ pub fn free_value<T,R:Rng>(rng:&mut R, txn:&mut MutTxn<T>, mut offset:u64, mut l
             }
         }
     }
+    debug!("<<<<<<<<<<<<<<<<<<<<< free_value");
     Ok(())
 }
 
@@ -244,6 +254,7 @@ pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[
         };
 
         let mut page = try!(txn.alloc_page());
+        debug!("copy_page: allocated {:?}", page.page_offset());
         page.init();
         let mut n = 0;
         let mut levels:[u16;N_LEVELS] = [FIRST_HEAD;N_LEVELS];
@@ -778,9 +789,12 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
     for (current, key_, value_, r) in PI::new(page,0) {
         debug!("split key_ = {:?} {:?}", current, std::str::from_utf8(key_));
         if current == forgetting {
-            if let UnsafeValue::O { offset, len } = value {
-                try!(free_value(rng, txn, offset, len));
-            }
+            // Only used in rebalance
+            /*if !page_will_be_dup {
+                if let UnsafeValue::O { offset, len } = value_ {
+                    try!(free_value(rng, txn, offset, len));
+                }
+            }*/
             continue
         }
         let r = if current == translate_index {
@@ -791,6 +805,11 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
             }
             r
         };
+        if page_will_be_dup {
+            if let UnsafeValue::O { offset, .. } = value_ {
+                try!(incr_rc(rng, txn, offset))
+            }
+        }
         let next_size = record_size(key_.len(),value_.len() as usize);
         if middle.is_none() { // Insert in left page.
             if left_bytes + next_size <= (PAGE_SIZE as u16) / 2 {

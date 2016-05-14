@@ -191,6 +191,8 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             // If both `left` and `new_left` stay alive after this
             // call, there is one more reference to left_left
             try!(incr_rc(rng, txn, left_left_child))
+        } else {
+            debug!("line {:?}: not incr {:?}", line!(), left_left_child)
         }
     }
 
@@ -202,6 +204,18 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     for (_, key, value, r) in PI::new(&left_child,0) {
 
         let next_size = record_size(key.len(),value.len() as usize);
+        if page_will_be_dup || left_rc > 1 {
+            if r > 0 {
+                try!(incr_rc(rng, txn, r))
+            } else {
+                debug!("line {:?}: not incr {:?}", line!(), r)
+            }
+            if let UnsafeValue::O { offset,.. } = value {
+                try!(incr_rc(rng, txn, offset))
+            }
+        } else {
+            debug!("line {:?}: not incr {:?}", line!(), r)
+        }
         if middle.is_none() {
             debug!("left_bytes = {:?} {:?} {:?}", left_bytes, size, next_size);
             // Should we insert next_size into the left page, or as the middle element?
@@ -214,15 +228,9 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
                 debug_assert!(off > 0);
                 debug_assert!(off + next_size <= PAGE_SIZE as u16);
                 debug!("key -> left: {:?} {:?}", std::str::from_utf8(key), r);
-                if (page_will_be_dup || left_rc > 1) && r > 0 {
-                    try!(incr_rc(rng, txn, r))
-                }
                 unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) }
                 left_bytes += next_size;
             } else {
-                if (page_will_be_dup || left_rc > 1) && r > 0 {
-                    try!(incr_rc(rng, txn, r))
-                }
                 middle = Some((key.as_ptr(),key.len(),value,r))
             }
         } else {
@@ -231,9 +239,6 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             debug_assert!(off > 0);
             debug_assert!(off + next_size <= PAGE_SIZE as u16);
             debug!("key -> right: {:?} {:?}", std::str::from_utf8(key), r);
-            if (page_will_be_dup || left_rc > 1) && r > 0 {
-                try!(incr_rc(rng, txn, r))
-            }
             unsafe { local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
         }
     }
@@ -246,8 +251,10 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         let (key,value) =
             if let Some(repl) = replacement {
                 debug!("replacement");
-                if let UnsafeValue::O { offset, len } = value {
-                    try!(free_value(rng, txn, offset, len))
+                if !page_will_be_dup {
+                    if let UnsafeValue::O { offset, len } = value {
+                        try!(free_value(rng, txn, offset, len))
+                    }
                 }
                 unsafe { (std::slice::from_raw_parts(repl.key_ptr, repl.key_len), repl.value) }
             } else {
@@ -259,13 +266,24 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         debug_assert!(off > 0);
         debug_assert!(off + next_size <= PAGE_SIZE as u16);
         debug!("key -> right (middle): {:?} {:?} {:?} {:?}", std::str::from_utf8(key), right_left_child, page_will_be_dup, child_must_dup);
-        let page_will_be_forgotten = unsafe {
-            u16::from_le(*(child_page.offset(FIRST_HEAD as isize) as *const u16)) == forgetting
-        };
-        if (page_will_be_dup || child_must_dup) && right_left_child > 0 && !page_will_be_forgotten {
-            // If the child is still alive after this call, increment
-            // the grandchild's RC
-            try!(incr_rc(rng, txn, right_left_child))
+        if page_will_be_dup || child_must_dup {
+            let page_will_be_forgotten = unsafe {
+                u16::from_le(*(child_page.offset(FIRST_HEAD as isize) as *const u16)) == forgetting
+            };
+            if right_left_child > 0 && !page_will_be_forgotten {
+                // If the child is still alive after this call, increment
+                // the grandchild's RC
+                try!(incr_rc(rng, txn, right_left_child))
+            } else {
+                debug!("line {:?}: not incr {:?}", line!(), right_left_child)
+            }
+        } else {
+            debug!("line {:?}: not incr {:?}", line!(), right_left_child)
+        }            
+        if page_will_be_dup {
+            if let UnsafeValue::O { offset, .. } = value {
+                try!(incr_rc(rng, txn, offset))
+            }
         }
         unsafe { local_insert_at(rng, &mut new_right, key, value, right_left_child, off, next_size, &mut right_levels) }
     }
@@ -283,15 +301,24 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             last_updated_ptr = new_right.offset(off as isize);
             debug!("key -> right: {:?} {:?}", std::str::from_utf8(key), r);
 
-            let page_will_be_forgotten = unsafe {
-                u16::from_le(*(child_page.offset(cur as isize) as *const u16)) == forgetting
-            };
-            if (page_will_be_dup || child_must_dup) && r > 0 && !page_will_be_forgotten {
-                try!(incr_rc(rng, txn, r))
+            if page_will_be_dup || child_must_dup {
+                let page_will_be_forgotten = unsafe {
+                    u16::from_le(*(child_page.offset(cur as isize) as *const u16)) == forgetting
+                };
+                if r > 0 && !page_will_be_forgotten {
+                    try!(incr_rc(rng, txn, r))
+                } else {
+                    debug!("line {:?}: not incr {:?}", line!(), r)
+                }
+                if let UnsafeValue::O { offset, .. } = value {
+                    try!(incr_rc(rng, txn, offset))
+                }
+            } else {
+                debug!("line {:?}: not incr {:?}", line!(), r)
             }
             unsafe {local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
         } else {
-            if do_free_value {
+            if !(child_must_dup || page_will_be_dup) && do_free_value {
                 if let UnsafeValue::O { offset, len } = value {
                     try!(free_value(rng, txn, offset, len))
                 }
@@ -421,16 +448,25 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             last_updated_ptr = new_left.offset(off as isize);
 
             debug!("key -> left: {:?} {:?}", std::str::from_utf8(key), r);
-            let page_will_be_forgotten = unsafe {
-                u16::from_le(*(child_page.offset(cur as isize) as *const u16)) == forgetting
-            };
-            if (page_will_be_dup || child_must_dup) && r > 0 && !page_will_be_forgotten {
-                try!(incr_rc(rng, txn, r))
-            }
+            if page_will_be_dup || child_must_dup {
+                let page_will_be_forgotten = unsafe {
+                    u16::from_le(*(child_page.offset(cur as isize) as *const u16)) == forgetting
+                };
+                if r > 0 && !page_will_be_forgotten {
+                    try!(incr_rc(rng, txn, r))
+                } else {
+                    debug!("line {:?}: not incr {:?}", line!(), r)
+                }
+                if let UnsafeValue::O { offset, .. } = value {
+                    try!(incr_rc(rng, txn, offset))
+                }
+            } else {
+                debug!("line {:?}: not incr {:?}", line!(), r)
+            }                
             unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
             left_bytes += next_size;
         } else {
-            if do_free_value {
+            if !(child_must_dup || page_will_be_dup) && do_free_value {
                 if let UnsafeValue::O { offset, len } = value {
                     try!(free_value(rng, txn, offset, len))
                 }
@@ -438,6 +474,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             unsafe { *((last_updated_ptr as *mut u64).offset(2)) = replace_page.to_le() }
         }
     }
+    let right_rc = get_rc(txn, right_child.page_offset());
     {
         let right_left_child = u64::from_le(unsafe { *((right_child.offset(0) as *const u64).offset(2)) });
         let (key,value) = unsafe { read_key_value(page.offset(next as isize)) };
@@ -446,17 +483,39 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
         debug_assert!(off > 0);
         debug_assert!(off + next_size <= PAGE_SIZE as u16);
         debug!("key -> left: {:?} {:?}", std::str::from_utf8(key), right_left_child);
-        if (page_will_be_dup || child_must_dup) && right_left_child > 0 {
-            debug!("incr right_left {:?}", right_left_child);
-            try!(incr_rc(rng, txn, right_left_child))
+        if page_will_be_dup || right_rc > 1 {
+            if right_left_child > 0 {
+                debug!("incr right_left {:?}", right_left_child);
+                try!(incr_rc(rng, txn, right_left_child))
+            } else {
+                debug!("line {:?}: not incr {:?}", line!(), right_left_child)
+            }
+        } else {
+            debug!("line {:?}: not incr {:?}", line!(), right_left_child)
+        }
+        if page_will_be_dup {
+            if let UnsafeValue::O { offset, .. } = value { 
+                try!(incr_rc(rng, txn, offset))
+            }
         }
         unsafe { local_insert_at(rng, &mut new_left, key, value, right_left_child, off, next_size, &mut left_levels) };
         left_bytes += next_size;
     }
-    let right_rc = get_rc(txn, right_child.page_offset());
     for (_, key, value, r) in PI::new(&right_child,0) {
 
         let next_size = record_size(key.len(),value.len() as usize);
+        if page_will_be_dup || right_rc > 1 {
+            if r > 0 {
+                try!(incr_rc(rng, txn, r))
+            } else {
+                debug!("line {:?}: not incr {:?}", line!(), r)
+            }
+            if let UnsafeValue::O { offset, .. } = value { 
+                try!(incr_rc(rng, txn, offset))
+            }
+        } else {
+            debug!("line {:?}: not incr {:?}", line!(), r)
+        }
         if middle.is_none() {
             debug!("left_bytes = {:?} {:?} {:?}", left_bytes, size, next_size);
             // Should we insert next_size into the left page, or as the middle element?
@@ -469,15 +528,9 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
                 debug_assert!(off > 0);
                 debug_assert!(off + next_size <= PAGE_SIZE as u16);
                 debug!("key -> right: {:?} {:?}", std::str::from_utf8(key), r);
-                if (page_will_be_dup || right_rc > 1) && r > 0 {
-                    try!(incr_rc(rng, txn, r))
-                }
                 unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
                 left_bytes += next_size;
             } else {
-                if (page_will_be_dup || right_rc > 1) && r > 0 {
-                    try!(incr_rc(rng, txn, r))
-                }
                 middle = Some((key.as_ptr(),key.len(),value,r))
             }
         } else {
@@ -485,9 +538,6 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             let off = new_right.can_alloc(next_size);
             debug_assert!(off > 0);
             debug_assert!(off + next_size <= PAGE_SIZE as u16);
-            if (page_will_be_dup || right_rc > 1) && r > 0 {
-                try!(incr_rc(rng, txn, r))
-            }
             unsafe { local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) };
         }
     }

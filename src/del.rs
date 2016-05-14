@@ -244,8 +244,13 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
     // First get the smallest binding, replace here.
     let smallest = get_smallest_binding(txn, child_page.page_offset());
     debug!("protecting {:?}", smallest.page);
-    txn.protected_page = smallest.page;
-    txn.free_protected = false;
+    let mut protected_index = 0;
+    if txn.protected_pages[0] != 0 {
+        protected_index = 1
+    }
+    txn.protected_pages[protected_index] = smallest.page;
+    txn.free_protected[protected_index] = false;
+
 
     {
         let key = unsafe { std::slice::from_raw_parts(smallest.key_ptr, smallest.key_len) };
@@ -270,7 +275,7 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                 let mut page =
                     if page_will_be_dup {
                         debug!("copying");
-                        try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, true, 0, true))
+                        try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, 0, true))
                     } else {
                         let off = page.can_alloc(size);
                         debug!("off = {:?}", off);
@@ -364,6 +369,13 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
             };
             if !page_will_be_dup && free_page > 0 {
                 try!(free(rng, txn, free_page));
+            } else {
+                // incrementing value: already done in split_page
+                /*
+                if let UnsafeValue::O { offset, .. } = value {
+                    try!(incr_rc(rng, txn, offset))
+                }
+                 */
             }
             result
         },
@@ -375,12 +387,13 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
             }
         }
     };
-    debug!("protected: {:?}", txn.free_protected);
-    if txn.free_protected {
+    debug!("protected: {:?}", txn.protected_pages);
+    if txn.free_protected[protected_index] {
         debug!("freeing previously protected {:?}", smallest.page);
-        unsafe { super::transaction::free(&mut txn.txn, txn.protected_page) }
+        unsafe { super::transaction::free(&mut txn.txn, smallest.page) }
     }
-    txn.protected_page = 0;
+    txn.protected_pages[protected_index] = 0;
+    txn.free_protected[protected_index] = false;
     result
 }
 
@@ -430,7 +443,15 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C,
             if will_be_underfull {
                 // If the parent is duplicated, or this page is referenced at least twice, don't free it.
                 // Else, free it after merging/rebalancing.
-                Ok(Res::Underfull { page:page, delete: levels, merged:0, free_value: true,
+                let free_value = if this_will_be_dup {
+                    false
+                } else {
+                    match comp {
+                        C::Smallest => false,
+                        _ => true
+                    }
+                };
+                Ok(Res::Underfull { page:page, delete: levels, merged:0, free_value: free_value,
                                     must_be_dup: page_rc > 1 })
             } else {
                 let mut new_levels = [0;N_LEVELS];
@@ -442,14 +463,18 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C,
                 }
 
                 let page =
-                    if parent_will_be_dup || page_rc > 1 {
+                    if this_will_be_dup {
                         // After this page is copied, if we're in case
                         // C::Smallest, there will be one more
                         // reference to the value.
-                        if let (C::Smallest, UnsafeValue::O { offset, .. }) = (comp, next_value) {
-                            try!(incr_rc(rng, txn, offset))
+                        match (comp,next_value) {
+                            (C::Smallest, UnsafeValue::O { offset, .. }) => {
+                                try!(incr_rc(rng, txn, offset));
+                            },
+                            _ => { }
                         }
-                        try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, true, 0, true))
+                        // Never free the value here.
+                        try!(copy_page(rng, txn, &page.as_page(), &levels, &mut new_levels, true, false, 0, true))
                     } else {
                         let free_value = match comp {
                             C::Smallest => false,
@@ -529,6 +554,11 @@ fn delete<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, comp:C,
             };
             if !this_will_be_dup && free_page > 0 {
                 try!(free(rng, txn, free_page));
+            } else {
+                // incrementing value: already done in split_page
+                /*if let UnsafeValue::O { offset, .. } = value_ {
+                    try!(incr_rc(rng, txn, offset))
+                }*/
             }
             Ok(result)
         },

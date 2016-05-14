@@ -9,7 +9,7 @@ use std::ptr::copy_nonoverlapping;
 use std::io::Write;
 use std::fmt;
 use std::cmp::Ordering;
-
+use std::collections::HashMap;
 use rustc_serialize::hex::ToHex;
 
 // Guarantee: there are at least 2 bindings per page.
@@ -48,9 +48,9 @@ pub struct MutTxn<'env,T> {
     #[doc(hidden)]
     pub txn: transaction::MutTxn<'env,T>,
     #[doc(hidden)]
-    pub protected_page: u64,
+    pub protected_pages: [u64;2],
     #[doc(hidden)]
-    pub free_protected: bool
+    pub free_protected: [bool;2]
 }
 
 impl<'env,T> Drop for MutTxn<'env,T> {
@@ -871,12 +871,12 @@ impl<'env> LoadPage for Txn<'env> {
 }
 
 #[cfg(debug_assertions)]
-fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
+fn debug<P: AsRef<Path>, T: LoadPage + super::Transaction>(t: &T, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
     let f = File::create(p.as_ref()).unwrap();
     let mut buf = BufWriter::new(f);
     writeln!(&mut buf, "digraph{{").unwrap();
     let mut h = HashSet::new();
-    fn print_page<T: LoadPage>(txn: &T,
+    fn print_page<T: LoadPage + super::Transaction>(txn: &T,
                                keys_hex:bool,values_hex:bool,
                                pages: &mut HashSet<u64>,
                                buf: &mut BufWriter<File>,
@@ -922,7 +922,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &[&Db], p: P, keys_hex:bool, va
         }
     }
 
-    fn print_tree<T: LoadPage>(txn: &T,
+    fn print_tree<T: LoadPage + super::Transaction>(txn: &T,
                                keys_hex:bool,values_hex:bool,
                                nodes: &mut HashSet<u16>,
                                buf: &mut BufWriter<File>,
@@ -948,7 +948,7 @@ fn debug<P: AsRef<Path>, T: LoadPage>(t: &T, db: &[&Db], p: P, keys_hex:bool, va
                         };
                     let value = {
                         if let UnsafeValue::O { ref offset, .. } = value {
-                            format!("{:?}", offset)
+                            format!("{:?}(rc = {:?})", offset, super::put::get_rc(txn, *offset))
                         } else {
                             let mut value_=Vec::new();
                             let mut value = Value::from_unsafe(&value, txn);

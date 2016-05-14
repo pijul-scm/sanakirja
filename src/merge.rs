@@ -36,14 +36,19 @@ fn merge_page<R:Rng,T>(
                 let page_will_be_forgotten = // If the next one is going to be forgotten, we'll replace its page.
                     u16::from_le(*(source.offset(current as isize) as *const u16)) == forgetting;
 
-                if increment_children && r > 0 && !page_will_be_forgotten {
-                    try!(incr_rc(rng, txn, r))
+                if increment_children {
+                    if r > 0 && !page_will_be_forgotten {
+                        try!(incr_rc(rng, txn, r))
+                    }
+                    if let UnsafeValue::O { offset, .. } = value {
+                        try!(incr_rc(rng, txn, offset))
+                    }
                 }
                 local_insert_at(rng, target, key, value, r, off, size, levels);
             } else {
                 debug!("forget, replace with {:?}", replace_page);
                 debug!("forget, freeing? {:?} {:?}", do_free_value, value);
-                if do_free_value {
+                if do_free_value && !increment_children {
                     if let UnsafeValue::O { offset, len } = value {
                         try!(free_value(rng, txn, offset, len))
                     }
@@ -174,6 +179,11 @@ pub fn merge_children_right<R:Rng, T>(
 
     if right_sibling_size + child_page.occupied() - deleted_size - 24 + next_record_size <= PAGE_SIZE as u16 {
         // Merge child_page into its right sibling.
+        if page_will_be_dup {
+            if let UnsafeValue::O { offset,.. } = next_value {
+                try!(incr_rc(rng, txn, offset))
+            }
+        }
 
         // Check the need for compaction of the right sibling.
         let needs_compaction = {
@@ -275,6 +285,11 @@ pub fn merge_children_left<R:Rng, T>(
     debug!("child_page_occupied {:?} {:?}", child_page.occupied(), deleted_size);
     // If there's enough space in the left sibling, merge. Else, return Res::Nothing { .. }.
     if left_sibling_size + child_page.occupied() - deleted_size - 24 + next_record_size <= PAGE_SIZE as u16 {
+        if page_will_be_dup {
+            if let UnsafeValue::O { offset,.. } = next_value {
+                try!(incr_rc(rng, txn, offset))
+            }
+        }
 
         // Check the need for compaction of the right sibling.
         let needs_compaction = {
@@ -389,6 +404,11 @@ pub fn merge_children_replace<R:Rng, T>(
     // If we can merge, do it. Else, return Res::Nothing { .. }.
     if left_sibling_size + child_page_size - 24 + next_record_size - deleted_size <= PAGE_SIZE as u16 {
 
+        if page_will_be_dup || child_will_be_dup {
+            if let UnsafeValue::O { offset, .. } = next_value {
+                try!(incr_rc(rng, txn, offset))
+            }
+        }
         // Check the need for compaction of the right sibling.
         let needs_compaction = {
             let extra_size =  child_page.occupied() - deleted_size - 24 + next_record_size;
