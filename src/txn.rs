@@ -258,7 +258,7 @@ pub unsafe fn read_key_value<'a>(p: *const u8) -> (&'a [u8], UnsafeValue) {
     let val_len = u32::from_le(*(p as *const u32).offset(3));
 
     if (val_len as usize) < VALUE_SIZE_THRESHOLD {
-        let padding = ((8 - (val_len & 7)) & 7);
+        let padding = (8 - (val_len & 7)) & 7;
         (std::slice::from_raw_parts((p as *const u8).offset((24 + val_len + padding) as isize), key_len as usize),
          UnsafeValue::S { p:(p as *const u8).offset(24), len:val_len })
     } else {
@@ -759,7 +759,7 @@ impl MutPage {
                     *((ptr as *mut u32).offset(3)) = len.to_le();
                     copy_nonoverlapping(p,(ptr as *mut u8).offset(24), len as usize);
 
-                    let padding = ((8 - (len & 7)) & 7);
+                    let padding = (8 - (len & 7)) & 7;
                     (ptr as *mut u8).offset((24 + len + padding) as isize)
                 },
                 UnsafeValue::O { offset,len } => {

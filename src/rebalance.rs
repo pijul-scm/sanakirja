@@ -321,7 +321,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     };
     debug!("result = {:?}", result);
     //
-    debug!("freeing left: {:?}", left_child.page_offset());
+    debug!("freeing left: {:?} {:?}", left_child.page_offset(), page_will_be_dup);
 
     if !page_will_be_dup {
         // Decrease the reference counter of the left child.
@@ -382,7 +382,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
         debug!("delete key: {:?}", std::str::from_utf8(key));
         record_size(key.len(), value.len() as usize)
     };
-    if left_size - deleted_size <= right_size {
+    if right_size <= left_size - deleted_size {
         return Ok(Res::Nothing { page:page })
     }
     let size = right_size + left_size + middle_size - deleted_size;
@@ -439,7 +439,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
         }
     }
     {
-        let right_left_child = u64::from_le(unsafe { *((child_page.offset(0) as *const u64).offset(2)) });
+        let right_left_child = u64::from_le(unsafe { *((right_child.offset(0) as *const u64).offset(2)) });
         let (key,value) = unsafe { read_key_value(page.offset(next as isize)) };
         let next_size = record_size(key.len(),value.len() as usize);
         let off = new_left.can_alloc(next_size);
@@ -511,7 +511,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     };
     debug!("result = {:?}", result);
     //
-    debug!("freeing right: {:?}", right_child.page_offset());
+    debug!("freeing right: {:?} {:?}", right_child.page_offset(), page_will_be_dup);
     if !page_will_be_dup {
         try!(free(rng, txn, right_child.page_offset()));
         debug!("freeing child: {:?}", child_page.page_offset());
