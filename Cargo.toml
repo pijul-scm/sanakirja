@@ -1,7 +1,7 @@
 [package]
 name = "sanakirja"
 description = "A key-value dictionary, using copy-on-write and B trees."
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Pierre-Étienne Meunier"]
 license = "MPL-2.0"
 documentation = "http://pijul.org/sanakirja/doc/sanakirja"
@@ -9,24 +9,12 @@ repository = "http://pijul.org/sanakirja"
 
 
 [dependencies]
-libc="0.2"
 log="0.3"
 env_logger="0.3"
 fs2="0.2"
 rand="0.3"
 memmap = "0.3"
-tempdir="0.3"
-
-rustc-serialize = "0.3"
-
-[build-dependencies]
-libc="0.2"
 
 [dev-dependencies]
 tempdir="0.3"
-
-
-[features]
-
-delete_always_realloc = []
-no_free = []
+rustc-serialize = "0.3"

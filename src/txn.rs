@@ -9,6 +9,7 @@ use std::ptr::copy_nonoverlapping;
 use std::io::Write;
 use std::fmt;
 use std::cmp::Ordering;
+#[cfg(tests)]
 use rustc_serialize::hex::ToHex;
 
 // Guarantee: there are at least 2 bindings per page.
@@ -87,7 +88,7 @@ impl<'env,T> MutTxn<'env,T> {
     }
 
 
-    #[cfg(debug_assertions)]
+    #[cfg(tests)]
     #[doc(hidden)]
     pub fn debug<P: AsRef<Path>>(&self, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
         debug(self, db, p, keys_hex, values_hex)
@@ -100,7 +101,7 @@ impl<'env,T> MutTxn<'env,T> {
 }
 
 impl<'env> Txn<'env> {
-    #[cfg(debug_assertions)]
+    #[cfg(tests)]
     #[doc(hidden)]
     pub fn debug<P: AsRef<Path>>(&self, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
         debug(self, db, p, keys_hex, values_hex)
@@ -869,7 +870,7 @@ impl<'env> LoadPage for Txn<'env> {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(tests)]
 fn debug<P: AsRef<Path>, T: LoadPage + super::Transaction>(t: &T, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
     let f = File::create(p.as_ref()).unwrap();
     let mut buf = BufWriter::new(f);

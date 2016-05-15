@@ -62,8 +62,8 @@
 //!
 
 
-extern crate libc;
 extern crate rand;
+#[cfg(tests)]
 extern crate rustc_serialize;
 
 #[macro_use]
