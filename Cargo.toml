@@ -6,7 +6,7 @@ authors = ["Pierre-Étienne Meunier"]
 license = "MPL-2.0"
 documentation = "http://pijul.org/sanakirja/doc/sanakirja"
 repository = "http://pijul.org/sanakirja"
-
+include = ["Cargo.toml","src/transaction.rs","src/txn.rs","src/lib.rs","src/put.rs","src/del.rs","src/merge.rs","src/rebalance.rs"]
 
 [dependencies]
 log="0.3"
