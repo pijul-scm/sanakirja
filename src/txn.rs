@@ -113,6 +113,40 @@ impl<'env> Txn<'env> {
     }
 }
 
+#[doc(hidden)]
+pub struct PI<'a,P:super::txn::P + 'a> {
+    pub page:&'a P,
+    pub level:usize,
+    pub current:u16
+}
+impl<'a,P:super::txn::P + 'a> PI<'a,P> {
+    #[doc(hidden)]
+    pub fn new(page:&'a P, level:usize) -> Self {
+        unsafe {
+            // Skip the first pointer (has no key/value)
+            let current = u16::from_le(*(page.offset(FIRST_HEAD as isize) as *const u16));
+            PI { page:page, level:level, current:current }
+        }
+    }
+}
+impl<'a,P:super::txn::P + 'a> Iterator for PI<'a,P> {
+    type Item = (u16, &'a [u8], UnsafeValue, u64);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == NIL {
+            None
+        } else {
+            unsafe {
+                let current = self.current;
+                let (key,value) = read_key_value(self.page.offset(self.current as isize));
+                let right_child = u64::from_le(*((self.page.offset(self.current as isize) as *const u64).offset(2)));
+                self.current = u16::from_le(*(self.page.offset(self.current as isize) as *const u16));
+                Some((current,key,value,right_child))
+            }
+        }
+    }
+}
+
+
 #[derive(Clone,Copy,Debug)]
 pub enum UnsafeValue {
     S { p:*const u8,
