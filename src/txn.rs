@@ -12,11 +12,11 @@ use std::cmp::Ordering;
 #[cfg(test)]
 use rustc_serialize::hex::ToHex;
 
-// Guarantee: there are at least 2 bindings per page.
+// Guarantee: there are at least 4 bindings per page.
 const BINDING_HEADER_SIZE: usize = 16; // each binding on B tree pages requires 16 bytes of header.
 
 pub const MAX_KEY_SIZE: usize = (PAGE_SIZE >> 3);
-pub const VALUE_SIZE_THRESHOLD: usize = (PAGE_SIZE >> 3) - BINDING_HEADER_SIZE;
+pub const VALUE_SIZE_THRESHOLD: usize = (PAGE_SIZE >> 3) - BINDING_HEADER_SIZE - 6; // 6 is the page header size (24) divided by 4.
 
 pub const NIL:u16 = 0xffff;
 pub const FIRST_HEAD:u16 = 0;
