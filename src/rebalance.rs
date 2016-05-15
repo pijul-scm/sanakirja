@@ -126,7 +126,7 @@ pub fn handle_failed_left_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, 
 pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
                                  replacement:Option<&Smallest>,
                                  child_page:&Cow, child_must_dup:bool,
-                                 forgetting:u16, replace_page:u64, do_free_value:bool,
+                                 forgetting:u16, replace_page:u64,
                                  page_will_be_dup:bool) -> Result<Res, Error> {
     debug!("rebalance_right {:?}, levels {:?}", page.page_offset(), &levels[..]);
 
@@ -251,14 +251,24 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         let (key,value) =
             if let Some(repl) = replacement {
                 debug!("replacement");
-                if !page_will_be_dup {
+                /*
+                if !(child_must_dup || page_will_be_dup) && do_free_value {
                     if let UnsafeValue::O { offset, len } = value {
                         try!(free_value(rng, txn, offset, len))
                     }
                 }
+                 */
                 unsafe { (std::slice::from_raw_parts(repl.key_ptr, repl.key_len), repl.value) }
             } else {
                 debug!("original");
+                // If this page (the one containing the value) is
+                // duplicated, there will be one more reference to
+                // this value.
+                if page_will_be_dup {
+                    if let UnsafeValue::O { ref offset, .. } = value {
+                        try!(incr_rc(rng, txn, *offset))
+                    }
+                }
                 (key, value)
             };
         let next_size = record_size(key.len(),value.len() as usize);
@@ -280,11 +290,6 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         } else {
             debug!("line {:?}: not incr {:?}", line!(), right_left_child)
         }            
-        if page_will_be_dup {
-            if let UnsafeValue::O { offset, .. } = value {
-                try!(incr_rc(rng, txn, offset))
-            }
-        }
         unsafe { local_insert_at(rng, &mut new_right, key, value, right_left_child, off, next_size, &mut right_levels) }
     }
 
@@ -318,11 +323,13 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             }
             unsafe {local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
         } else {
+            /*
             if !(child_must_dup || page_will_be_dup) && do_free_value {
                 if let UnsafeValue::O { offset, len } = value {
                     try!(free_value(rng, txn, offset, len))
                 }
             }
+             */
             debug!("replacing ptr, replace_page={:?}", replace_page);
             unsafe { *((last_updated_ptr as *mut u64).offset(2)) = replace_page.to_le(); }
         }
@@ -374,7 +381,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 /// Assumes `child_page` is the current element's right child.
 pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut levels:[u16;N_LEVELS],
                                 child_page:&Cow, child_must_dup:bool,
-                                forgetting:u16, replace_page:u64, do_free_value:bool,
+                                forgetting:u16, replace_page:u64,
                                 page_will_be_dup:bool) -> Result<Res, Error> {
     debug!("rebalance_left");
 
@@ -466,11 +473,14 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
             left_bytes += next_size;
         } else {
+            // freeing value: already done in the recursive calls before
+            /*
             if !(child_must_dup || page_will_be_dup) && do_free_value {
                 if let UnsafeValue::O { offset, len } = value {
                     try!(free_value(rng, txn, offset, len))
                 }
             }
+             */
             unsafe { *((last_updated_ptr as *mut u64).offset(2)) = replace_page.to_le() }
         }
     }

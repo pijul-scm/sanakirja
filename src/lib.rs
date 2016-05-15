@@ -73,7 +73,6 @@ extern crate memmap;
 
 use rand::Rng;
 use std::path::Path;
-use std::collections::HashMap;
 pub mod transaction;
 
 pub use transaction::{Statistics,Error};
@@ -958,7 +957,7 @@ mod tests {
                  || used_pages.contains_key(&p)
                  || value_pages.contains_key(&p)) {
                 leaking.push(p)
-                }
+            }
             p+=4096
         }
         println!("leaking: {:?}", leaking);
@@ -1313,7 +1312,7 @@ mod tests {
 
     #[test]
     fn fork_put_del_large_2000() {
-        let key_len = 200;
+        let key_len = 400;
         let value_len = 2000;
         let n_insertions = 2000;
         let n_del = n_insertions;

@@ -4,7 +4,6 @@ use std;
 use std::cmp::Ordering;
 use super::transaction;
 use rand::{Rng};
-use std::collections::hash_map::Entry;
 
 extern crate log;
 
@@ -15,7 +14,6 @@ pub enum Res {
         page: Cow, // The page where we want to delete something.
         delete: [u16;N_LEVELS], // The binding before the one we want to delete.
         merged: u64, // The updated left child of the deleted binding.
-        free_value: bool,
         must_be_dup: bool // This page is referenced at least twice (used when rebalancing fails)
     },
     Split {
@@ -720,6 +718,9 @@ pub unsafe fn local_insert_at<R:Rng>(rng:&mut R, page:&mut MutPage, key:&[u8], v
         let next = *((page.offset(levels[i] as isize) as *const u16).offset(i as isize));
         debug!("{:?} levels[{:?}]={:?}, next={:?}", page.page_offset(), i, levels[i], next);
         // debug_assert!(next != 0);
+        if let UnsafeValue::O { ref offset,.. } = value {
+            debug!("local_insert_at: UnsafeValue::O {:?}", offset);
+        }
         *((page.offset(off as isize) as *mut u16).offset(i as isize)) = next;
         *((page.offset(levels[i] as isize) as *mut u16).offset(i as isize)) = off.to_le();
         debug!("local_insert_at: link from {:?}.{:?} to {:?}, at level {:?}", page.page_offset(), levels[i], off, i);
@@ -789,7 +790,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
     for (current, key_, value_, r) in PI::new(page,0) {
         debug!("split key_ = {:?} {:?}", current, std::str::from_utf8(key_));
         if current == forgetting {
-            // Only used in rebalance
+            // Only used in rebalance, which already frees values.
             /*if !page_will_be_dup {
                 if let UnsafeValue::O { offset, len } = value_ {
                     try!(free_value(rng, txn, offset, len));

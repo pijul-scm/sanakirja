@@ -18,7 +18,7 @@ fn merge_page<R:Rng,T>(
     txn:&mut MutTxn<T>,
     source:&Cow, mut target:&mut MutPage,
     levels:&mut [u16],
-    forgetting:u16, replace_page:u64, do_free_value:bool, increment_children:bool) -> Result<(),Error> {
+    forgetting:u16, replace_page:u64, increment_children:bool) -> Result<(),Error> {
     unsafe {
         // A pointer to the last inserted value, so we can replace the
         // deleted's left child with `replace_page`
@@ -47,12 +47,12 @@ fn merge_page<R:Rng,T>(
                 local_insert_at(rng, target, key, value, r, off, size, levels);
             } else {
                 debug!("forget, replace with {:?}", replace_page);
-                debug!("forget, freeing? {:?} {:?}", do_free_value, value);
-                if do_free_value && !increment_children {
+                // debug!("forget, not freeing {:?} {:?}", do_free_value, value);
+                /*if do_free_value && !increment_children {
                     if let UnsafeValue::O { offset, len } = value {
                         try!(free_value(rng, txn, offset, len))
                     }
-                }
+            }*/
                 *((current_ptr as *mut u64).offset(2)) = replace_page.to_le()
             }
         }
@@ -67,7 +67,7 @@ fn merge_right<R:Rng,T>(
     rng:&mut R,
     txn:&mut MutTxn<T>,
     left:&Cow, right:&mut MutPage, forgetting:u16, replace_page:u64,
-    key:&[u8], value:UnsafeValue, do_free_value:bool, increment_children:bool) -> Result<(), Error> {
+    key:&[u8], value:UnsafeValue, increment_children:bool) -> Result<(), Error> {
     unsafe {
         debug!("merge right {:?} {:?} {:?}", left.page_offset(), right.page_offset(), std::str::from_utf8(key));
         // Merge the left page into the right page.
@@ -82,7 +82,7 @@ fn merge_right<R:Rng,T>(
         if increment_children && left_left_child > 0 && !page_will_be_forgotten {
             try!(incr_rc(rng, txn, left_left_child))
         }
-        try!(merge_page(rng, txn, left, right, &mut levels, forgetting, replace_page, do_free_value, increment_children));
+        try!(merge_page(rng, txn, left, right, &mut levels, forgetting, replace_page, increment_children));
 
         let size = record_size(key.len(), value.len() as usize);
         let off = right.can_alloc(size);
@@ -103,7 +103,7 @@ fn merge_left<R:Rng,T>(
     rng:&mut R,
     txn:&mut MutTxn<T>,
     right:&Cow, left:&mut MutPage, forgetting:u16, replace_page:u64,
-    key:&[u8], value:UnsafeValue, do_free_value:bool,
+    key:&[u8], value:UnsafeValue,
     increment_children:bool) -> Result<(), Error> {
     unsafe {
         debug!("merge left {:?} {:?} {:?}", right.page_offset(), left.page_offset(), std::str::from_utf8(key));
@@ -142,7 +142,7 @@ fn merge_left<R:Rng,T>(
             local_insert_at(rng, left, key, value, child, off, size, &mut levels);
         }
         // Finally, add all elements from `right` to `left`.
-        try!(merge_page(rng, txn, right, left, &mut levels, forgetting, replace_page, do_free_value, increment_children));
+        try!(merge_page(rng, txn, right, left, &mut levels, forgetting, replace_page, increment_children));
     }
     Ok(())
 }
@@ -154,8 +154,10 @@ pub fn merge_children_right<R:Rng, T>(
     rng:&mut R, txn:&mut MutTxn<T>, page:Cow,
     levels:[u16;N_LEVELS],
     child_page:&Cow, child_will_be_dup:bool,
-    delete:&[u16], merged:u64, do_free_value:bool,
+    delete:&[u16], merged:u64,
     page_will_be_dup:bool) -> Result<Res, Error> {
+
+    debug!("merge_children_right {:?}", page_will_be_dup);
 
     let next_offset = unsafe { u16::from_le(*(page.offset(levels[0] as isize) as *const u16)) };
     let next_ptr = page.offset(next_offset as isize);
@@ -211,7 +213,7 @@ pub fn merge_children_right<R:Rng, T>(
                                          &mut new_levels, false, false, 0))
                 };
             try!(merge_right(rng, txn, &child_page, &mut right_sibling, forgetting, merged, next_key,
-                             next_value, do_free_value, page_will_be_dup || child_will_be_dup));
+                             next_value, page_will_be_dup || child_will_be_dup));
             right_sibling
         };
 
@@ -227,7 +229,6 @@ pub fn merge_children_right<R:Rng, T>(
 
             // let page_rc = get_rc(txn, page.page_offset());
             Ok(Res::Underfull { page:page, delete:levels, merged:merged_right_sibling.page_offset(),
-                                free_value: false,
                                 must_be_dup: page_will_be_dup })
 
         } else {
@@ -255,7 +256,7 @@ pub fn merge_children_right<R:Rng, T>(
 pub fn merge_children_left<R:Rng, T>(
     rng:&mut R, txn:&mut MutTxn<T>, page:Cow, levels:[u16;N_LEVELS],
     child_page:&Cow, child_will_be_dup:bool,
-    delete:&[u16], merged:u64, do_free_value:bool,
+    delete:&[u16], merged:u64,
     page_will_be_dup:bool) -> Result<Res, Error> {
 
     debug!("merge_children_left {:?}", page_will_be_dup);
@@ -316,7 +317,6 @@ pub fn merge_children_left<R:Rng, T>(
                                          &mut new_levels, false, false, 0))
                 };
             try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value,
-                            do_free_value,
                             page_will_be_dup || child_will_be_dup));
             left_sibling
         };
@@ -332,7 +332,6 @@ pub fn merge_children_left<R:Rng, T>(
         if page.occupied() - next_record_size < (PAGE_SIZE as u16)/2 {
             //let page_rc = get_rc(txn, page.page_offset());
             Ok(Res::Underfull { page:page, delete:levels, merged:merged_left_sibling.page_offset(),
-                                free_value: false,
                                 must_be_dup: page_will_be_dup })
 
         } else {
@@ -404,11 +403,12 @@ pub fn merge_children_replace<R:Rng, T>(
     // If we can merge, do it. Else, return Res::Nothing { .. }.
     if left_sibling_size + child_page_size - 24 + next_record_size - deleted_size <= PAGE_SIZE as u16 {
 
-        if page_will_be_dup || child_will_be_dup {
+        // Already increased when we deleted it from the smallest descendant page.
+        /*if page_will_be_dup || child_will_be_dup {
             if let UnsafeValue::O { offset, .. } = next_value {
                 try!(incr_rc(rng, txn, offset))
             }
-        }
+        }*/
         // Check the need for compaction of the right sibling.
         let needs_compaction = {
             let extra_size =  child_page.occupied() - deleted_size - 24 + next_record_size;
@@ -434,7 +434,6 @@ pub fn merge_children_replace<R:Rng, T>(
                                          &levels, &mut new_levels, false, false, 0))
                 };
             try!(merge_left(rng, txn, &child_page, &mut left_sibling, forgetting, merged, next_key, next_value,
-                            false,
                             page_will_be_dup || child_will_be_dup));
             left_sibling
         };
@@ -444,7 +443,6 @@ pub fn merge_children_replace<R:Rng, T>(
             // let page_rc = get_rc(txn, page.page_offset());
             debug!("underfull");
             Ok(Res::Underfull { page:page, delete:levels, merged:merged_left_sibling.page_offset(),
-                                free_value: true,
                                 must_be_dup: page_will_be_dup })
         } else {
             // Else, just delete.
@@ -454,11 +452,11 @@ pub fn merge_children_replace<R:Rng, T>(
                 if page_will_be_dup {
                     try!(copy_page(rng, txn,
                                    &page.as_page(),
-                                   &levels, &mut new_levels, true, true,
+                                   &levels, &mut new_levels, true, false,
                                    merged_left_sibling.page_offset(), true))
                 } else {
                     try!(cow_pinpointing(rng, txn, page, &levels,
-                                         &mut new_levels, true, true,
+                                         &mut new_levels, true, false,
                                          merged_left_sibling.page_offset()))
                 };
             Ok(Res::Ok { page:page })

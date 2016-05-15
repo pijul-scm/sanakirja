@@ -9,7 +9,6 @@ use std::ptr::copy_nonoverlapping;
 use std::io::Write;
 use std::fmt;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use rustc_serialize::hex::ToHex;
 
 // Guarantee: there are at least 2 bindings per page.
@@ -324,7 +323,7 @@ pub trait LoadPage:Sized {
         let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
         let mut level = N_LEVELS-1;
-        let mut next_page = 0;
+        let next_page;
         let mut equal:Option<UnsafeValue> = None;
         loop {
             // advance in the list until there's nothing more to do.
@@ -391,7 +390,7 @@ pub trait LoadPage:Sized {
         let mut current_off = FIRST_HEAD;
         let mut current = page.offset(current_off as isize) as *const u16;
         let mut level = N_LEVELS-1;
-        let mut next_page = u64::from_le(*((current as *const u64).offset(2)));
+        let mut next_page; //  = u64::from_le(*((current as *const u64).offset(2)));
         // First mission: find first element.
         if state == Iterate::NotStarted {
             loop {
@@ -445,7 +444,7 @@ pub trait LoadPage:Sized {
                 break
             }
             current = page.offset(current_off as isize) as *const u16;
-            next_page = u64::from_le(*((current as *const u64).offset(2)));
+            // next_page = u64::from_le(*((current as *const u64).offset(2)));
             state = Iterate::Started;
             // On the first time, the "current" entry must not be included.
             let (key,value) = read_key_value(current as *const u8);
@@ -471,7 +470,7 @@ pub trait LoadPage:Sized {
         page_stack.clear();
         page_stack.push(initial_page.page_offset() | (FIRST_HEAD as u64));
         loop {
-            let mut next_page = 0;
+            let next_page;
             {
                 let last = page_stack.last_mut().unwrap();
                 let (page_offset, current_off):(u64,u16) = offsets(*last);
