@@ -502,6 +502,7 @@ pub fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:O
     let mut level = N_LEVELS-1;
     let mut current_off = FIRST_HEAD;
     let mut current = page.offset(FIRST_HEAD as isize) as *const u16;
+    let mut last_compared_offset = 0;
     loop {
         // advance in the list until there's nothing more to do.
         loop {
@@ -513,49 +514,57 @@ pub fn set_levels<T,P:super::txn::P>(txn:&MutTxn<T>, page:&P, key:&[u8], value:O
                 break
             } else {
                 debug_assert!(next!=0);
-                let next_ptr = page.offset(next as isize);
-                let (next_key,next_value) = unsafe { read_key_value(next_ptr) };
-                // debug!("compare: {:?} {:?}", std::str::from_utf8(key), std::str::from_utf8(next_key));
-                match key.cmp(next_key) {
-                    Ordering::Less => break,
-                    Ordering::Equal =>
-                        if let Some(value) = value {
-                            if cfg!(test) {
-                                unsafe {
-                                    if (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) != Ordering::Equal {
-                                        debug!("differ on value {:?}", next_value);
-                                        let mut s0 = Vec::new();
-                                        for i in Value::from_unsafe(&value, txn) {
-                                            s0.extend(i)
+                if next == last_compared_offset {
+                    // We're going to get the same result as last
+                    // time, and this wasn't Ordering::Greater. It it
+                    // was Ordering::Equal, we already set eq.
+                    break
+                } else {
+                    last_compared_offset = next;
+                    let next_ptr = page.offset(next as isize);
+                    let (next_key,next_value) = unsafe { read_key_value(next_ptr) };
+                    // debug!("compare: {:?} {:?}", std::str::from_utf8(key), std::str::from_utf8(next_key));
+                    match key.cmp(next_key) {
+                        Ordering::Less => break,
+                        Ordering::Equal =>
+                            if let Some(value) = value {
+                                /*if cfg!(test) {
+                                    unsafe {
+                                        if (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) != Ordering::Equal {
+                                            debug!("differ on value {:?}", next_value);
+                                            let mut s0 = Vec::new();
+                                            for i in Value::from_unsafe(&value, txn) {
+                                                s0.extend(i)
+                                            }
+                                            let mut s1 = Vec::new();
+                                            for i in Value::from_unsafe(&next_value, txn) {
+                                                s1.extend(i)
+                                            }
+                                            debug!("{:?}", std::str::from_utf8(&s0));
+                                            debug!("{:?}", std::str::from_utf8(&s1));
                                         }
-                                        let mut s1 = Vec::new();
-                                        for i in Value::from_unsafe(&next_value, txn) {
-                                            s1.extend(i)
-                                        }
-                                        debug!("{:?}", std::str::from_utf8(&s0));
-                                        debug!("{:?}", std::str::from_utf8(&s1));
+                                    }
+                                }*/
+                                match unsafe { (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) } {
+                                    Ordering::Less => break,
+                                    Ordering::Equal => {
+                                        *eq = true;
+                                        break
+                                    },
+                                    Ordering::Greater => {
+                                        current_off = next;
+                                        current = page.offset(current_off as isize) as *const u16;
                                     }
                                 }
-                            }
-                            match unsafe { (Value::from_unsafe(&value, txn)).cmp(Value::from_unsafe(&next_value, txn)) } {
-                                Ordering::Less => break,
-                                Ordering::Equal => {
-                                    *eq = true;
-                                    break
-                                },
-                                Ordering::Greater => {
-                                    current_off = next;
-                                    current = page.offset(current_off as isize) as *const u16;
-                                }
-                            }
-                        } else {
-                            // If no value was given, set at the smallest value, hence here.
-                            *eq = true;
-                            break
-                        },
-                    Ordering::Greater => {
-                        current_off = next;
-                        current = page.offset(current_off as isize) as *const u16;
+                            } else {
+                                // If no value was given, set at the smallest value, hence here.
+                                *eq = true;
+                                break
+                            },
+                        Ordering::Greater => {
+                            current_off = next;
+                            current = page.offset(current_off as isize) as *const u16;
+                        }
                     }
                 }
             }

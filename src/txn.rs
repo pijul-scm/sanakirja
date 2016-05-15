@@ -326,6 +326,9 @@ pub trait LoadPage:Sized {
         let mut level = N_LEVELS-1;
         let next_page;
         let mut equal:Option<UnsafeValue> = None;
+
+        let mut last_compared_offset = 0;
+
         loop {
             // advance in the list until there's nothing more to do.
             loop {
@@ -334,34 +337,43 @@ pub trait LoadPage:Sized {
                 if next == NIL {
                     break
                 } else {
-                    let next_ptr = page.offset(next as isize);
-                    let (next_key,next_value) = read_key_value(next_ptr);
-                    debug!("next_value={:?}", next_value);
-                    /*println!("cmp {:?} {:?}",
-                    std::str::from_utf8_unchecked(key),
-                    std::str::from_utf8_unchecked(next_key));*/
-                    match key.cmp(next_key) {
-                        Ordering::Less => break,
-                        Ordering::Equal =>
-                            if let Some(value) = value {
-                                match (Value::from_unsafe(&value, self)).cmp(Value::from_unsafe(&next_value, self)) {
-                                    Ordering::Less => break,
-                                    Ordering::Equal => {
-                                        equal = Some(next_value);
-                                        break
-                                    },
-                                    Ordering::Greater => {
-                                        current_off = next;
-                                        current = page.offset(current_off as isize) as *const u16;
+                    if next == last_compared_offset {
+                        // If we didn't move forward in the previous
+                        // list, and we're still comparing with the
+                        // same key/value, this key/value is <= to the
+                        // next one also in this list.
+                        break
+                    } else {
+                        last_compared_offset = next;
+                        let next_ptr = page.offset(next as isize);
+                        let (next_key,next_value) = read_key_value(next_ptr);
+                        debug!("next_value={:?}", next_value);
+                        /*println!("cmp {:?} {:?}",
+                        std::str::from_utf8_unchecked(key),
+                        std::str::from_utf8_unchecked(next_key));*/
+                        match key.cmp(next_key) {
+                            Ordering::Less => break,
+                            Ordering::Equal =>
+                                if let Some(value) = value {
+                                    match (Value::from_unsafe(&value, self)).cmp(Value::from_unsafe(&next_value, self)) {
+                                        Ordering::Less => break,
+                                        Ordering::Equal => {
+                                            equal = Some(next_value);
+                                            break
+                                        },
+                                        Ordering::Greater => {
+                                            current_off = next;
+                                            current = page.offset(current_off as isize) as *const u16;
+                                        }
                                     }
-                                }
-                            } else {
-                                equal = Some(next_value);
-                                break
-                            },
-                        Ordering::Greater => {
-                            current_off = next;
-                            current = page.offset(current_off as isize) as *const u16;
+                                } else {
+                                    equal = Some(next_value);
+                                    break
+                                },
+                            Ordering::Greater => {
+                                current_off = next;
+                                current = page.offset(current_off as isize) as *const u16;
+                            }
                         }
                     }
                 }
