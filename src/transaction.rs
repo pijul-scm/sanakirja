@@ -31,12 +31,15 @@ use std::fs::{File,OpenOptions};
 use std::path::Path;
 use memmap;
 
+pub const CURRENT_VERSION: u64 = 0;
+
+const OFF_MAP_LENGTH:isize = 1;
+const OFF_CURRENT_FREE:isize = 2;
 // We need a fixed page size for compatibility reasons. Most systems will have half of this, but some (SPARC) don't...
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SIZE_64: u64 = 4096;
 
-pub const ZERO_HEADER: isize = 16; // size of the header on page 0, in bytes.
-
+pub const ZERO_HEADER: isize = 24; // size of the header on page 0, in bytes.
 #[derive(Debug)]
 pub enum Error {
     IO(std::io::Error),
@@ -174,8 +177,11 @@ impl Env {
         let map = mmap.mut_ptr();
         if !db_exists {
             unsafe {
-                std::ptr::write_bytes(map, 0, PAGE_SIZE)
+                std::ptr::write_bytes(map, 0, PAGE_SIZE);
+                *(map as *mut u64) = CURRENT_VERSION.to_le();
             }
+        } else {
+            assert!(u64::from_le(*(map as *const u64)) == CURRENT_VERSION)
         }
         let env = Env {
             length: length,
@@ -201,8 +207,8 @@ impl Env {
     /// Start a mutable transaction. Mutable transactions that go out of scope are automatically aborted.
     pub fn mut_txn_begin<'env>(&'env self) -> Result<MutTxn<'env,()>, Error> {
         unsafe {
-            let last_page = u64::from_le(*(self.map as *const u64));
-            let current_list_page = u64::from_le(*((self.map as *const u64).offset(1)));
+            let last_page = u64::from_le(*((self.map as *const u64).offset(OFF_MAP_LENGTH)));
+            let current_list_page = u64::from_le(*((self.map as *const u64).offset(OFF_CURRENT_FREE)));
 
             debug!("map header = {:?}, {:?}", last_page ,current_list_page);
             let guard = try!(self.mutable.lock());
@@ -241,10 +247,10 @@ impl Env {
     /// Compute statistics about pages. This is a potentially costlty operation, as we need to go through all bookkeeping pages.
     pub fn statistics(&self) -> Statistics {
         unsafe {
-            let total_pages = u64::from_le(*(self.map as *const u64)) as usize;
+            let total_pages = u64::from_le(*((self.map as *const u64).offset(OFF_MAP_LENGTH))) as usize;
             let mut free_pages = HashSet::new();
             let mut bookkeeping_pages = Vec::new();
-            let mut cur = u64::from_le(*((self.map as *const u64).offset(1)));
+            let mut cur = u64::from_le(*((self.map as *const u64).offset(OFF_CURRENT_FREE)));
             while cur != 0 {
                 bookkeeping_pages.push(cur);
                 let p = self.map.offset(cur as isize) as *const u64;
@@ -581,8 +587,8 @@ impl<'env> Commit for MutTxn<'env,()> {
                 // last, instead of just the last one.
                 try!(self.env.mmap.flush_range(2*PAGE_SIZE, (self.env.length - 2*PAGE_SIZE_64) as usize));
 
-                *(self.env.map as *mut u64) = self.last_page.to_le();
-                *((self.env.map as *mut u64).offset(1)) = current_page.offset.to_le();
+                *((self.env.map as *mut u64).offset(OFF_MAP_LENGTH)) = self.last_page.to_le();
+                *((self.env.map as *mut u64).offset(OFF_CURRENT_FREE)) = current_page.offset.to_le();
                 try!(self.env.mmap.flush_range(0, 2*PAGE_SIZE));
                 self.env.lock_file.unlock().unwrap();
                 Ok(())

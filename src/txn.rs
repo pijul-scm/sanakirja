@@ -610,7 +610,7 @@ fn offsets(x:u64) -> (u64, u16) {
 impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a, T> {
     type Item = (&'a[u8], Value<'a,T>);
     fn next(&mut self) -> Option<Self::Item> {
-        if self.page_stack.len() == 0 {
+        if self.stack_pointer == 0 {
             None
         } else {
             unsafe {
