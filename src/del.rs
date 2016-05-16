@@ -1010,8 +1010,7 @@ fn test_delete_all(n:usize, keysize:usize, valuesize:usize, sorted:Sorted) {
         debug!("delete done, debugging");
         
         let db = Db { root_num: -1, root: page.page_offset() };
-        let mut ws = Vec::new();
-        for _ in txn.iter(&db, b"", None, &mut ws) {
+        for _ in txn.iter(&db, b"", None) {
             panic!("Database not empty")
         }
         //txn.debug(&[&db], format!("/tmp/after"), false, false);

@@ -267,12 +267,11 @@ pub trait Transaction:LoadPage {
     fn iter<'a, 'b>(&'a self,
                     db: &Db,
                     key: &[u8],
-                    value: Option<&[u8]>,
-                    workspace: &'b mut Vec<u64>)->Iter<'a,'b,Self> {
+                    value: Option<&[u8]>)->Iter<'a,Self> {
         unsafe {
             let page = self.load_page(db.root);
             let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
-            self.iter_(workspace, &page, key,value)
+            self.iter_(&page, key,value)
         }
     }
 
@@ -364,11 +363,10 @@ mod tests {
         let txn = env.txn_begin().unwrap();
         let root = txn.root(0).unwrap();
         txn.debug(&[&root], "/tmp/iter", false, false);
-        let mut ws = Vec::new();
 
         let mut i = 100;
         let (ref k0,ref v0) = random[i];
-        for (k,_) in txn.iter(&root, k0.as_bytes(), Some(v0.as_bytes()), &mut ws).take(100) {
+        for (k,_) in txn.iter(&root, k0.as_bytes(), Some(v0.as_bytes())).take(100) {
             let (ref kk,_) = random[i];
             println!("{:?} {:?}",
                      std::str::from_utf8(k).unwrap(),

@@ -513,18 +513,18 @@ pub trait LoadPage:Sized {
     // the least significant 12 bits encode the offset in the current
     // page, given by the other bits.
     unsafe fn iter_<'a,'b>(&'a self,
-                           page_stack: &'b mut Vec<u64>,
                            initial_page: &Page,
                            key:&[u8],
-                           value:Option<UnsafeValue>) -> Iter<'a, 'b, Self> {
+                           value:Option<UnsafeValue>) -> Iter<'a, Self> {
 
-        page_stack.clear();
-        page_stack.push(initial_page.page_offset() | (FIRST_HEAD as u64));
+        let mut iter = Iter { txn:self, page_stack:[0;52], stack_pointer: 0 };
+        // page_stack.clear();
+        iter.push(initial_page.page_offset() | (FIRST_HEAD as u64));
+        
         loop {
             let next_page;
             {
-                let last = page_stack.last_mut().unwrap();
-                let (page_offset, current_off):(u64,u16) = offsets(*last);
+                let (page_offset, current_off):(u64,u16) = offsets(iter.page_stack[iter.stack_pointer-1]);
 
                 let page:Page = self.load_page(page_offset);
                 let mut current:*const u16 = page.offset(current_off as isize) as *const u16;
@@ -549,7 +549,7 @@ pub trait LoadPage:Sized {
                                             Ordering::Less => break,
                                             Ordering::Equal => break,
                                             Ordering::Greater => {
-                                                *last = page_offset | (next as u64);
+                                                iter.page_stack[iter.stack_pointer-1] = page_offset | (next as u64);
                                                 current = page.offset(next as isize) as *const u16;
                                             }
                                         }
@@ -557,7 +557,7 @@ pub trait LoadPage:Sized {
                                         break
                                     },
                                 Ordering::Greater => {
-                                    *last = page_offset | (next as u64);
+                                    iter.page_stack[iter.stack_pointer-1] = page_offset | (next as u64);
                                     current = page.offset(next as isize) as *const u16;
                                 }
                             }
@@ -565,7 +565,7 @@ pub trait LoadPage:Sized {
                     }
                     if level == 0 {
                         let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
-                        *last = page_offset | (next as u64);
+                        iter.page_stack[iter.stack_pointer-1] = page_offset | (next as u64);
                         next_page = u64::from_le(*((current as *const u64).offset(2)));
                         break
                     } else {
@@ -576,17 +576,30 @@ pub trait LoadPage:Sized {
             if next_page == 0 {
                 break
             } else {
-                page_stack.push(next_page | (FIRST_HEAD as u64));
+                iter.push(next_page | (FIRST_HEAD as u64));
             }
         }
-        Iter { txn:self,page_stack:page_stack }
+        iter
     }
     
     fn rc(&self) -> Option<Db>;
 }
 
-pub struct Iter<'a, 'b, T:'a> {
-    txn:&'a T, page_stack:&'b mut Vec<u64>
+pub struct Iter<'a, T:'a> {
+    txn:&'a T,
+    page_stack:[u64;52],
+    stack_pointer:usize
+}
+
+impl<'a,T:'a> Iter<'a,T> {
+    fn push(&mut self, x:u64) {
+        self.page_stack[self.stack_pointer] = x;
+        self.stack_pointer += 1
+    }
+    fn pop(&mut self) -> u64 {
+        self.stack_pointer -= 1;
+        self.page_stack[self.stack_pointer]
+    }
 }
 
 fn offsets(x:u64) -> (u64, u16) {
@@ -594,22 +607,19 @@ fn offsets(x:u64) -> (u64, u16) {
     (x & !mask, (x&mask) as u16)
 }
 
-impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a,'b,T> {
+impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a, T> {
     type Item = (&'a[u8], Value<'a,T>);
     fn next(&mut self) -> Option<Self::Item> {
         if self.page_stack.len() == 0 {
             None
         } else {
             unsafe {
-                let (page_off, current_off):(u64,u16) = {
-                    let last = self.page_stack.last_mut().unwrap();
-                    offsets(*last)
-                };
+                let (page_off, current_off):(u64,u16) = offsets(self.page_stack[self.stack_pointer-1]);
                 // println!("page_off = {:?} {:?}", page_off, current_off);
                 // the binding at current_off is the next one to be sent.
                 if current_off >= 4095 {
                     // println!("pop");
-                    self.page_stack.pop();
+                    self.pop();
                     self.next()
                 } else {
                     let page = self.txn.load_page(page_off);
@@ -621,14 +631,13 @@ impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a,'b,T> {
                     {
                         let next = u16::from_le(*(current as *const u16));
                         let next = std::cmp::min(next, 4095); // Avoid overflow.
-                        let last = self.page_stack.last_mut().unwrap();
-                        *last = page_off | (next as u64);
+                        self.page_stack[self.stack_pointer-1] = page_off | (next as u64);
                     }
                     // If there's a page below, push it: the next element is there.
                     let next_page = u64::from_le(*((current as *const u64).offset(2)));
                     if next_page != 0 {
                         // println!("push");
-                        self.page_stack.push(next_page | (FIRST_HEAD as u64));
+                        self.push(next_page | (FIRST_HEAD as u64));
                     }
 
                     // Now, return the current element. If we're inside the page, there's an element to return.
