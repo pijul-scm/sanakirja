@@ -236,7 +236,7 @@ pub fn copy_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, p:&Page, old_levels:&[
             };
         *((page.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = right_page.to_le();
 
-        for (current, key, value, right) in PI::new(p, 0) {
+        for (current, key, value, right) in PageIterator::new(p, 0) {
 
             let right = if current == old_levels[0] && translate_right > 0 {
                 translate_right
@@ -763,7 +763,7 @@ pub unsafe fn split_page<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>,page:&Cow,
 
     let mut extra_on_lhs = false;
     
-    for (current, key_, value_, r) in PI::new(page,0) {
+    for (current, key_, value_, r) in PageIterator::new(page,0) {
         debug!("split key_ = {:?} {:?}", current, std::str::from_utf8(key_));
         if current == forgetting {
             // Only used in rebalance, which already frees values.

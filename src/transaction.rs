@@ -239,7 +239,6 @@ impl Env {
     }
 
     /// Compute statistics about pages. This is a potentially costlty operation, as we need to go through all bookkeeping pages.
-    #[cfg(debug_assertions)]
     pub fn statistics(&self) -> Statistics {
         unsafe {
             let total_pages = u64::from_le(*(self.map as *const u64)) as usize;

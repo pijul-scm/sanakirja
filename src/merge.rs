@@ -24,7 +24,7 @@ fn merge_page<R:Rng,T>(
         // deleted's left child with `replace_page`
         let mut current_ptr = target.offset(levels[0] as isize);
         // Let's go.
-        for (current, key,value,r) in PI::new(source, 0) {
+        for (current, key,value,r) in PageIterator::new(source, 0) {
             debug!("merge_page: {:?} {:?} {:?} {:?}", current, std::str::from_utf8(key), r, increment_children);
             if current != forgetting {
                 let size = record_size(key.len(), value.len() as usize);

@@ -201,7 +201,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
     let mut left_levels = [0;N_LEVELS];
     let mut right_levels = [0;N_LEVELS];
 
-    for (_, key, value, r) in PI::new(&left_child,0) {
+    for (_, key, value, r) in PageIterator::new(&left_child,0) {
 
         let next_size = record_size(key.len(),value.len() as usize);
         if page_will_be_dup || left_rc > 1 {
@@ -295,7 +295,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 
     let mut last_updated_ptr = new_right.offset(right_levels[0] as isize);
     debug!("forgetting:{:?}", forgetting);
-    for (cur, key, value, r) in PI::new(child_page,0) {
+    for (cur, key, value, r) in PageIterator::new(child_page,0) {
         debug!("cur:{:?}, r:{:?}", cur, r);
         if cur != forgetting {
             let next_size = record_size(key.len(),value.len() as usize);
@@ -445,7 +445,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     let mut right_levels = [0;N_LEVELS];
 
     let mut last_updated_ptr = new_left.offset(0);
-    for (cur, key, value, r) in PI::new(child_page,0) {
+    for (cur, key, value, r) in PageIterator::new(child_page,0) {
         if cur != forgetting {
             let next_size = record_size(key.len(),value.len() as usize);
             // insert in right page.
@@ -511,7 +511,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
         unsafe { local_insert_at(rng, &mut new_left, key, value, right_left_child, off, next_size, &mut left_levels) };
         left_bytes += next_size;
     }
-    for (_, key, value, r) in PI::new(&right_child,0) {
+    for (_, key, value, r) in PageIterator::new(&right_child,0) {
 
         let next_size = record_size(key.len(),value.len() as usize);
         if page_will_be_dup || right_rc > 1 {

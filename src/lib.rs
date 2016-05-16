@@ -93,7 +93,7 @@ pub struct Env {
 
 
 impl Env {
-    /// Creates an environment. Size is a number of blocks.
+    /// Creates an environment. Size is a number of blocks. Not all platforms/filesystems accept all sizes, in particular for huge sizes. Some, like Linux/ext4, allocate the file lazily.
     pub fn new<P: AsRef<Path>>(file: P, size:u64) -> Result<Env, Error> {
         transaction::Env::new(file, size*(1<<12)).and_then(|env| Ok(Env { env: env }))
     }
@@ -106,7 +106,6 @@ impl Env {
     }
 
     /// Start a mutable transaction.
-
     pub fn mut_txn_begin<'env>(&'env self) -> Result<MutTxn<'env,()>,Error> {
         let txn = try!(self.env.mut_txn_begin());
         Ok(MutTxn {
@@ -115,7 +114,7 @@ impl Env {
             free_protected: [false;2]
         })
     }
-    /// Returns statistics about pages.
+    /// Returns statistics about pages. Useful for debugging or performance analysis.
     pub fn statistics(&self) -> Result<Statistics,Error> {
         let mut stats = self.env.statistics();
         let txn = try!(self.txn_begin());
@@ -135,20 +134,20 @@ impl Env {
 }
 
 impl<'env,T> MutTxn<'env,T> {
-    /// Creates a new database.
+    /// Creates a new database, complexity O(1).
     pub fn create_db(&mut self) -> Result<Db,Error> {
         let mut db = try!(self.alloc_page());
         db.init();
         Ok(Db { root_num:-1, root: db.page_offset() })
     }
 
-    /// Produce an independent fork of a database. This method copies at most one block, and uses reference-counting on child blocks. The two databases share their bindings at the time of the fork, and can safely be considered separate databases after the fork.
+    /// Produce an independent fork of a database. The two databases share their bindings at the time of the fork, and can safely be considered separate databases after the fork. Complexity: linear in the number of blocks referenced at least twice (smaller than the total number of allocated blocks).
     pub fn fork_db<R:Rng>(&mut self, rng:&mut R, db:&Db) -> Result<Db,Error> {
         try!(put::fork_db(rng, self, db.root));
         Ok(Db { root_num:-1, root: db.root })
     }
 
-    /// Specialized version of ```put``` to register the name of a database. Argument ```db``` can be the root database (as in LMDB) or any other database.
+    /// Specialized version of ```put``` to register the name of a database. Argument ```db``` can be the root database (as in LMDB) or any other database. Complexity O(log |```db```|).
     pub fn put_db<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: &[u8], value: Db)->Result<(),Error> {
         let mut val: [u8; 8] = [0; 8];
         unsafe {
@@ -159,33 +158,33 @@ impl<'env,T> MutTxn<'env,T> {
         Ok(())
     }
 
-    /// Drops a database.
+    /// Drops a database. Complexity O(|```db```|).
     pub fn drop<R:Rng>(&mut self, rng:&mut R, db: Db)->Result<(),Error> {
         del::drop(rng, self, db)
     }
 
-    /// Empties a database, without dropping it.
+    /// Empties a database, without dropping it. Complexity O(|```db```|).
     pub fn clear<R:Rng>(&mut self, rng:&mut R, db: &mut Db)->Result<(),Error> {
         del::clear(rng, self, db)
     }
 
 
-    /// Add a binding to a B tree.
+    /// Add a binding to a B tree. Complexity O(log |```db```|).
     pub fn put<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8])->Result<bool,Error> {
         put::put(r, self, db, key, value)
     }
 
-    /// Replace the binding for a key. This is actually no more than `del` and `put` in a row: if there are more than one binding for that key, replace the smallest one, in lexicographical order.
+    /// Replace the binding for a key. At the moment, this is actually no more than `del` and `put` in a row: if there are more than one binding for that key, replace the smallest one, in lexicographical order. Complexity O(log |```db```|).
     pub fn replace<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: &[u8])->Result<(),Error> {
         del::replace(r, self, db, key, value)
     }
 
-    /// Delete the smallest binding (in lexicographical order) from the map matching the key and value. When the `value` argument is `None`, delete the smallest binding for that key.
+    /// Delete the smallest binding (in lexicographical order) from the map matching the key and value. When the `value` argument is `None`, delete the smallest binding for that key. Complexity O(log |```db```|).
     pub fn del<R:Rng>(&mut self, r:&mut R, db: &mut Db, key: &[u8], value: Option<&[u8]>)->Result<bool,Error> {
         del::del(r, self, db, key, value)
     }
 
-    /// Specialized version of ```put`` for the case where both the key and value are 64-bits integers.
+    /// Specialized version of ```put`` for the case where both the key and value are 64-bits integers. Complexity O(log |```db```|).
     pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64)->Result<bool,Error> {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
@@ -195,7 +194,7 @@ impl<'env,T> MutTxn<'env,T> {
         }
         self.put(rng, db, &k, &v)
     }
-    /// Specialized version of ```del`` for the case where the key is a 64-bits integer, and the value is None.
+    /// Specialized version of ```del`` for the case where the key is a 64-bits integer, and the value is None. Complexity O(log |```db```|).
     pub fn del_u64<R:Rng>(&mut self, rng:&mut R, db:&mut Db, key:u64)->Result<bool,Error> {
         let mut k: [u8; 8] = [0; 8];
         unsafe {
@@ -204,7 +203,7 @@ impl<'env,T> MutTxn<'env,T> {
         self.del(rng, db, &k, None)
     }
 
-    /// Specialized version of ```replace`` for the case where the key is a 64-bits integer.
+    /// Specialized version of ```replace`` for the case where the key is a 64-bits integer. Complexity  O(log |```db```|).
     pub fn replace_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64)->Result<(),Error> {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
@@ -220,7 +219,7 @@ impl<'env,T> MutTxn<'env,T> {
         self.txn.set_root((num+1) as isize, db.root)
     }
 
-    /// Create a child transaction, which can be either committed to its parent (but not to the file), or aborted independently from its parent.
+    /// Create a child transaction, which can be either committed to its parent (but not to the file), or aborted independently from its parent. Complexity O(1).
     pub fn mut_txn_begin<'txn>(&'txn mut self) -> Result<MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>>,Error> {
         let txn = try!(self.txn.mut_txn_begin());
         Ok(MutTxn { txn: txn, protected_pages: [0;2], free_protected:[false;2] })
@@ -235,7 +234,7 @@ pub trait Transaction:LoadPage {
     fn root(&self, num:usize) -> Option<Db> {
         self.root_db_((num+1) as isize)
     }
-    /// get the smallest value corresponding to a key (or to a key and a value). The return type is an iterator outputting byte slices.
+    /// get the smallest value corresponding to a key (or to a key and a value). The return type is an iterator outputting byte slices. Complexity  O(log |```db```|).
     fn get<'a>(&'a self, db: &Db, key: &[u8], value:Option<&[u8]>) -> Option<Value<'a,Self>> {
         unsafe {
             let page = self.load_page(db.root);
@@ -250,7 +249,7 @@ pub trait Transaction:LoadPage {
         self.open_db_(root_db, key)
     }
 
-    /// Iterate a function, starting from the `key` and `value` arguments, until the function returns `false`.
+    /// Iterate a function, starting from the `key` and `value` arguments, until the function returns `false`. Complexity O(log |```db```| + n), where n is the number of iterations before ```f``` returns ```false```.
     fn iterate<'a, F: FnMut(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
                                                                db: &Db,
                                                                key: &[u8],
@@ -264,7 +263,7 @@ pub trait Transaction:LoadPage {
     }
 
 
-    /// Return an iterator on a database, starting with the given key and value.
+    /// Return an iterator on a database, starting with the given key and value. ```workspace``` is a vector of pointers to blocks and positions inside blocks. It is cleared by this function, and potentially resized if the B tree depth is larger than its current size. This function does not perform any other heap allocation. The Rust typesystem guarantees that ```workspace``` is not touched by any other function while the iterator returned by this function is alive. Complexity O(log |```db```|).
     fn iter<'a, 'b>(&'a self,
                     db: &Db,
                     key: &[u8],
@@ -286,14 +285,14 @@ impl<'env,T> Transaction for MutTxn<'env,T> {}
 
 
 impl<'env> MutTxn<'env,()> {
-    /// Commit the transaction to the file (consuming it).
+    /// Commit the transaction to the file (consuming it). Complexity linear in the number of pages freed by this transaction.
     pub fn commit(mut self) -> Result<(), transaction::Error> {
         self.txn.commit()
     }
 }
 
 impl<'env,'txn,T> MutTxn<'env,&'txn mut transaction::MutTxn<'env,T>> {
-    /// Commit the child transaction to its parent (consuming it).
+    /// Commit the child transaction to its parent (consuming it). Complexity linear in the number of pages freed by this transaction.
     pub fn commit(mut self) -> Result<(), transaction::Error> {
         self.txn.commit()
     }
@@ -849,8 +848,7 @@ mod tests {
     #[cfg(test)]
     fn check_rc<T:Transaction>(txn:&T, dbs:&[&Db]) -> (HashMap<u64,usize>, HashMap<u64,usize>) {
         use std::collections::{HashMap};
-        use super::txn::{Page,LoadPage,P, UnsafeValue};
-        use super::put::PI;
+        use super::txn::{Page,LoadPage,P, UnsafeValue, PageIterator};
         // let txn = env.txn_begin();
         // let db = txn.root(0).unwrap();
         fn count_pages<T:Transaction>(txn:&T, page:&Page, pages:&mut HashMap<u64,usize>, value_pages:&mut HashMap<u64,usize>) {
@@ -872,7 +870,7 @@ mod tests {
                         count_pages(txn, &child, pages, value_pages);
                     }
                 }
-                for (_,_,value,child) in PI::new(page, 0) {
+                for (_,_,value,child) in PageIterator::new(page, 0) {
                     if child > 0 {
                         let child = txn.load_page(child);
                         count_pages(txn, &child, pages, value_pages);

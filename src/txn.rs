@@ -113,23 +113,27 @@ impl<'env> Txn<'env> {
     }
 }
 
+
+/// The following structure is meant to iterate through the skip list
+/// in a page. More specifically, it goes through all bindings at the
+/// specified level.
 #[doc(hidden)]
-pub struct PI<'a,P:super::txn::P + 'a> {
+pub struct PageIterator<'a,P:super::txn::P + 'a> {
     pub page:&'a P,
     pub level:usize,
     pub current:u16
 }
-impl<'a,P:super::txn::P + 'a> PI<'a,P> {
+impl<'a,P:super::txn::P + 'a> PageIterator<'a,P> {
     #[doc(hidden)]
     pub fn new(page:&'a P, level:usize) -> Self {
         unsafe {
             // Skip the first pointer (has no key/value)
             let current = u16::from_le(*(page.offset(FIRST_HEAD as isize) as *const u16));
-            PI { page:page, level:level, current:current }
+            PageIterator { page:page, level:level, current:current }
         }
     }
 }
-impl<'a,P:super::txn::P + 'a> Iterator for PI<'a,P> {
+impl<'a,P:super::txn::P + 'a> Iterator for PageIterator<'a,P> {
     type Item = (u16, &'a [u8], UnsafeValue, u64);
     fn next(&mut self) -> Option<Self::Item> {
         if self.current == NIL {

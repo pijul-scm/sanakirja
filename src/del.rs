@@ -664,7 +664,7 @@ fn drop_page<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, page:u64)->Result<(),Erro
         }
     } else {
         let page = txn.load_page(page);
-        for (_ , _, value, r) in PI::new(&page,0) {
+        for (_ , _, value, r) in PageIterator::new(&page,0) {
             if let UnsafeValue::O { offset, len } = value {
                 try!(free_value(rng, txn, offset, len))
             }
@@ -687,7 +687,7 @@ pub fn clear<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db)->Result<(),E
         decr_rc(rng, txn, db.root)
     } else {
         let page = txn.load_cow_page(db.root);
-        for (_ , _, value, r) in PI::new(&page,0) {
+        for (_ , _, value, r) in PageIterator::new(&page,0) {
             if let UnsafeValue::O { offset, len } = value {
                 try!(free_value(rng, txn, offset, len))
             }
