@@ -311,12 +311,6 @@ pub unsafe fn read_key_value<'a>(p: *const u8) -> (&'a [u8], UnsafeValue) {
     }
 }
 
-#[derive(PartialEq,Debug)]
-pub enum Iterate {
-    NotStarted,
-    Started,
-    Finished
-}
 pub trait LoadPage:Sized {
     fn length(&self) -> u64;
 
@@ -430,82 +424,6 @@ pub trait LoadPage:Sized {
         } else {
             equal
         }
-    }
-
-    unsafe fn iterate_<'a, F: FnMut(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
-                                                                    mut state: Iterate,
-                                                                    page: Page,
-                                                                    key: &[u8],
-                                                                    value: Option<UnsafeValue>,
-                                                                    f: &mut F) -> Iterate {
-        let mut current_off = FIRST_HEAD;
-        let mut current = page.offset(current_off as isize) as *const u16;
-        let mut level = N_LEVELS-1;
-        let mut next_page; //  = u64::from_le(*((current as *const u64).offset(2)));
-        // First mission: find first element.
-        if state == Iterate::NotStarted {
-            loop {
-                // advance in the list until there's nothing more to do.
-                loop {
-                    let next = u16::from_le(*(current.offset(level as isize))); // next in the list at the current level.
-                    if next == NIL {
-                        break
-                    } else {
-                        let next_ptr = page.offset(next as isize);
-                        let (next_key,next_value) = read_key_value(next_ptr);
-                        match key.cmp(next_key) {
-                            Ordering::Less => break,
-                            Ordering::Equal =>
-                                if let Some(value) = value {
-                                    match (Value::from_unsafe(&value,self)).cmp(Value::from_unsafe(&next_value, self)) {
-                                        Ordering::Less => break,
-                                        Ordering::Equal => break,
-                                        Ordering::Greater => {
-                                            current_off = next;
-                                            current = page.offset(current_off as isize) as *const u16;
-                                        }
-                                    }
-                                } else {
-                                    break
-                                },
-                            Ordering::Greater => {
-                                current_off = next;
-                                current = page.offset(current_off as isize) as *const u16;
-                            }
-                        }
-                    }
-                }
-                if level == 0 {
-                    break
-                } else {
-                    level -= 1
-                }
-            }
-        }
-        // Here, we know that "key" is smaller than or equal to the next element.
-        loop {
-            debug!("page {:?}, current: {:?} state: {:?}", page.page_offset(), current_off, state);
-            next_page = u64::from_le(*((current as *const u64).offset(2)));
-            if next_page>0 {
-                let next_page = self.load_page(next_page);
-                state = self.iterate_(state, next_page, key, value, f);
-            }
-            current_off = u16::from_le(*current);
-            if current_off == NIL {
-                break
-            }
-            current = page.offset(current_off as isize) as *const u16;
-            // next_page = u64::from_le(*((current as *const u64).offset(2)));
-            state = Iterate::Started;
-            // On the first time, the "current" entry must not be included.
-            let (key,value) = read_key_value(current as *const u8);
-            let continue_ = f(key,Value::from_unsafe(&value, self));
-            if ! continue_ {
-                state = Iterate::Finished;
-                break
-            }
-        }
-        state
     }
 
     // In iterators, the page stack stores a list of pages from the

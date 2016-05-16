@@ -119,14 +119,13 @@ impl Env {
         let mut stats = self.env.statistics();
         let txn = try!(self.txn_begin());
         if let Some(db) = txn.rc() {
-            txn.iterate(&db, &[], None, |key,mut value| {
+            for (key,mut value) in txn.iter(&db, &[], None) {
                 unsafe {
                     let key = u64::from_le(*(key.as_ptr() as *const u64));
                     let value = u64::from_le(*(value.next().unwrap().as_ptr() as *const u64));
                     stats.reference_counts.insert(key,value);
                 }
-                true
-            })
+            }
         }
         Ok(stats)
     }
@@ -247,19 +246,6 @@ pub trait Transaction:LoadPage {
     /// Open an existing database from the root database.
     fn open_db<'a>(&'a self, root_db:&Db, key: &[u8]) -> Option<Db> {
         self.open_db_(root_db, key)
-    }
-
-    /// Iterate a function, starting from the `key` and `value` arguments, until the function returns `false`. Complexity O(log |```db```| + n), where n is the number of iterations before ```f``` returns ```false```.
-    fn iterate<'a, F: FnMut(&'a [u8], Value<'a,Self>) -> bool>(&'a self,
-                                                               db: &Db,
-                                                               key: &[u8],
-                                                               value: Option<&[u8]>,
-                                                               mut f: F) {
-        unsafe {
-            let page = self.load_page(db.root);
-            let value = value.map(|x| txn::UnsafeValue::S { p:x.as_ptr(), len:x.len() as u32 });
-            self.iterate_(txn::Iterate::NotStarted,page,key,value,&mut f);
-        }
     }
 
 

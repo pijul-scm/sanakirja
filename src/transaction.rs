@@ -181,7 +181,7 @@ impl Env {
                 *(map as *mut u64) = CURRENT_VERSION.to_le();
             }
         } else {
-            assert!(u64::from_le(*(map as *const u64)) == CURRENT_VERSION)
+            assert!(unsafe { u64::from_le(*(map as *const u64)) == CURRENT_VERSION })
         }
         let env = Env {
             length: length,
