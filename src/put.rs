@@ -557,9 +557,7 @@ pub fn insert<R:Rng,T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, key:&[u8], valu
     if eq {
         Ok(Res::Nothing{page:page})
     } else {
-        let child_page = unsafe {
-            u64::from_le(*((page.offset(levels[0] as isize) as *const u64).offset(2)))
-        };
+        let child_page = page.right_child(levels[0]);
         let page_rc = get_rc(txn, page.page_offset());
         let page_will_be_dup = parent_will_be_dup || (page_rc > 1);
         debug!("page_rc = {:?} {:?}", parent_will_be_dup, page_rc);
@@ -684,21 +682,23 @@ pub unsafe fn full_local_insert<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:C
 /// If the "levels" (pointers to the current elements of each of the
 /// lists) are known, allocate an element of size size at offset off,
 /// updates the lists on the page, and update the levels accordingly.
-pub unsafe fn local_insert_at<R:Rng>(rng:&mut R, page:&mut MutPage, key:&[u8], value:UnsafeValue, right_page:u64, off:u16, size:u16, levels:&mut [u16]) {
+pub fn local_insert_at<R:Rng>(rng:&mut R, page:&mut MutPage, key:&[u8], value:UnsafeValue, right_page:u64, off:u16, size:u16, levels:&mut [u16]) {
     debug!("entering local_insert_at");
     debug_assert!(off + size <= PAGE_SIZE as u16);
     page.reset_pointers(off);
     page.alloc_key_value(off, size, key.as_ptr(), key.len(), value);
-    *((page.offset(off as isize) as *mut u64).offset(2)) = right_page.to_le();
+    page.set_right_child(off, right_page);
     for i in 0..N_LEVELS {
-        let next = *((page.offset(levels[i] as isize) as *const u16).offset(i as isize));
+        let next = page.level(levels[i], i);
         debug!("{:?} levels[{:?}]={:?}, next={:?}", page.page_offset(), i, levels[i], next);
         // debug_assert!(next != 0);
-        if let UnsafeValue::O { ref offset,.. } = value {
-            debug!("local_insert_at: UnsafeValue::O {:?}", offset);
-        }
-        *((page.offset(off as isize) as *mut u16).offset(i as isize)) = next;
-        *((page.offset(levels[i] as isize) as *mut u16).offset(i as isize)) = off.to_le();
+        /*if let UnsafeValue::O { ref offset,.. } = value {
+        debug!("local_insert_at: UnsafeValue::O {:?}", offset);
+    }*/
+        page.set_level(off, i, next);
+        // *((page.offset(off as isize) as *mut u16).offset(i as isize)) = next;
+        page.set_level(levels[i], i, off);
+        // *((page.offset(levels[i] as isize) as *mut u16).offset(i as isize)) = off.to_le();
         debug!("local_insert_at: link from {:?}.{:?} to {:?}, at level {:?}", page.page_offset(), levels[i], off, i);
         levels[i] = off;
         if rng.gen() {
@@ -878,17 +878,15 @@ pub fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Res) -> Result<Mut
     if let Res::Split { left,right,key_ptr,key_len,value,free_page } = x {
         let mut page = try!(txn.alloc_page());
         page.init();
-        unsafe {
-            *((page.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left.page_offset().to_le();
-            let mut levels = [0;N_LEVELS];
-            let size = record_size(key_len, value.len() as usize);
-            let off = page.can_alloc(size);
-            let key = std::slice::from_raw_parts(key_ptr, key_len);
-            local_insert_at(rng, &mut page, key, value, right.page_offset(), off, size, &mut levels);
-            debug!("root split, freeing {:?}", free_page);
-            try!(free(rng, txn, free_page));
-            Ok(page)
-        }
+        page.set_right_child(FIRST_HEAD, left.page_offset());
+        let mut levels = [0;N_LEVELS];
+        let size = record_size(key_len, value.len() as usize);
+        let off = page.can_alloc(size);
+        let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+        local_insert_at(rng, &mut page, key, value, right.page_offset(), off, size, &mut levels);
+        debug!("root split, freeing {:?}", free_page);
+        try!(free(rng, txn, free_page));
+        Ok(page)
     } else {
         unreachable!()
     }
@@ -897,21 +895,19 @@ pub fn root_split<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, x:Res) -> Result<Mut
 
 pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], value: &[u8])->Result<bool,Error> {
     assert!(key.len() < MAX_KEY_SIZE);
-    unsafe {
-        let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
-        let value = if value.len() > VALUE_SIZE_THRESHOLD {
-            try!(alloc_value(txn,value))
-        } else {
-            UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
-        };
-        debug!("value = {:?}", Value::from_unsafe(&value, txn));
-        match try!(insert(rng, txn, root_page, key, value, 0, false)) {
-            Res::Nothing { .. } => Ok(false),
-            Res::Ok { page,.. } => { db.root = page.page_offset(); Ok(true) }
-            x => {
-                db.root = try!(root_split(rng,txn,x)).page_offset();
-                Ok(true)
-            }
+    let root_page = Cow { cow: txn.txn.load_cow_page(db.root) };
+    let value = if value.len() > VALUE_SIZE_THRESHOLD {
+        try!(alloc_value(txn,value))
+    } else {
+        UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
+    };
+    unsafe { debug!("value = {:?}", Value::from_unsafe(&value, txn)) }
+    match try!(insert(rng, txn, root_page, key, value, 0, false)) {
+        Res::Nothing { .. } => Ok(false),
+        Res::Ok { page,.. } => { db.root = page.page_offset(); Ok(true) }
+        x => {
+            db.root = try!(root_split(rng,txn,x)).page_offset();
+            Ok(true)
         }
     }
 }

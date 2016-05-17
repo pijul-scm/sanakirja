@@ -1,7 +1,7 @@
 use super::transaction;
 use std;
 use std::path::Path;
-use super::transaction::{PAGE_SIZE,PAGE_SIZE_64};
+use super::transaction::{PAGE_SIZE,PAGE_SIZE_16, PAGE_SIZE_64};
 use std::fs::File;
 use std::io::BufWriter;
 use std::collections::HashSet;
@@ -557,7 +557,7 @@ impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a, T> {
                         // println!("push");
                         self.push(next_page | (FIRST_HEAD as u64));
                     }
-
+                    
                     // Now, return the current element. If we're inside the page, there's an element to return.
                     if current_off > FIRST_HEAD {
                         let (key,value) = read_key_value(current as *const u8);
@@ -576,16 +576,6 @@ impl<'a,'b,T:LoadPage+'a> Iterator for Iter<'a, T> {
 }
 
 
-// Page layout: Starts with a header of 32 bytes.
-// - 64 bits: RC
-// - 5*16 bits: pointers to all the skip lists.
-// - 16 bits: offset of the first free spot, from the byte before
-// - 16 bits: how much space is occupied in this page? (controls compaction)
-// - 16 bits: padding
-// - 64 bits: smaller child
-// - beginning of coding space (different encodings in B-nodes and B-leaves)
-
-
 pub trait P:std::fmt::Debug {
     /// offset of the page in the file.
     fn page_offset(&self) -> u64;
@@ -602,12 +592,6 @@ pub trait P:std::fmt::Debug {
             0
         }
     }
-
-    // Value of the page's reference counter.
-    fn rc(&self) -> u64 {
-        unsafe { u64::from_le(*(self.data())) }
-    }
-
     // First free spot in this page (head of the linked list, number of |u32| from the last glue.
     fn first_free(&self) -> u16 {
         unsafe {
@@ -642,6 +626,18 @@ pub trait P:std::fmt::Debug {
         unsafe {
             let p = self.data() as *mut u8;
             p.offset(off)
+        }
+    }
+    fn right_child(&self, off:u16) -> u64 {
+        assert!(off < PAGE_SIZE_16);
+        unsafe {
+            u64::from_le(*((self.offset(off as isize) as *const u64).offset(2)))
+        }
+    }
+    fn level(&mut self, off:u16, level:usize) -> u16 {
+        assert!(off <= PAGE_SIZE_16);
+        unsafe {
+            u16::from_le(*((self.offset(off as isize) as *mut u16).offset(level as isize)))
         }
     }
 }
@@ -749,16 +745,30 @@ impl MutPage {
             copy_nonoverlapping(key_ptr, target_key_ptr, key_len);
         }
     }
-    pub unsafe fn reset_pointers(&mut self, off_ptr:u16) {
+    pub fn reset_pointers(&mut self, off_ptr:u16) {
         assert!(off_ptr + 24 < PAGE_SIZE as u16);
         // println!("resetting pointers for {:?} at {:?}", self.page_offset(), off_ptr);
-        let ptr = self.offset(off_ptr as isize) as *mut u8;
-        *(ptr as *mut u16) = NIL;
-        *((ptr as *mut u16).offset(1)) = NIL;
-        *((ptr as *mut u16).offset(2)) = NIL;
-        *((ptr as *mut u16).offset(3)) = NIL;
-        *((ptr as *mut u16).offset(4)) = NIL;
-        *((ptr as *mut u64).offset(2)) = 0;
+        unsafe {
+            let ptr = self.offset(off_ptr as isize) as *mut u8;
+            *(ptr as *mut u16) = NIL;
+            *((ptr as *mut u16).offset(1)) = NIL;
+            *((ptr as *mut u16).offset(2)) = NIL;
+            *((ptr as *mut u16).offset(3)) = NIL;
+            *((ptr as *mut u16).offset(4)) = NIL;
+            *((ptr as *mut u64).offset(2)) = 0;
+        }
+    }
+    pub fn set_right_child(&self, off:u16, right_child:u64) {
+        assert!(off < PAGE_SIZE_16);
+        unsafe {
+            *((self.offset(off as isize) as *mut u64).offset(2)) = right_child.to_le();
+        }
+    }
+    pub fn set_level(&mut self, off:u16, level:usize, next:u16) {
+        assert!(off <= PAGE_SIZE_16 - 16);
+        unsafe {
+            *((self.offset(off as isize) as *mut u16).offset(level as isize)) = next.to_le();
+        }
     }
 }
 

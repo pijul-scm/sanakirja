@@ -281,9 +281,7 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                 let off = page.can_alloc(size);
                 debug!("off = {:?}, size={:?}", off, size);
                 debug_assert!(off + size <= PAGE_SIZE as u16);
-                unsafe {
-                    local_insert_at(rng, &mut page, smallest_key, smallest.value, child_page.page_offset(), off, size, &mut new_levels)
-                }
+                local_insert_at(rng, &mut page, smallest_key, smallest.value, child_page.page_offset(), off, size, &mut new_levels);
                 Res::Ok { page:page }
 
             } else {
@@ -356,15 +354,11 @@ fn delete_at_internal_node<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, l
                 // Reinsert the left page with the smallest key.
                 let middle_off = page.can_alloc(middle_size);
                 debug_assert!(middle_off + middle_size <= PAGE_SIZE as u16);
-                unsafe {
-                    local_insert_at(rng, &mut page, middle_key, value, right.page_offset(), middle_off, middle_size, &mut new_levels);
-                }
+                local_insert_at(rng, &mut page, middle_key, value, right.page_offset(), middle_off, middle_size, &mut new_levels);
 
                 let smallest_off = page.can_alloc(smallest_size);
                 debug_assert!(smallest_off + smallest_size <= PAGE_SIZE as u16);
-                unsafe {
-                    local_insert_at(rng, &mut page, smallest_key, smallest.value, left.page_offset(), smallest_off, smallest_size, &mut new_levels);
-                }
+                local_insert_at(rng, &mut page, smallest_key, smallest.value, left.page_offset(), smallest_off, smallest_size, &mut new_levels);
 
                 Ok(Res::Ok { page:page })
             } else {

@@ -37,6 +37,7 @@ const OFF_MAP_LENGTH:isize = 1;
 const OFF_CURRENT_FREE:isize = 2;
 // We need a fixed page size for compatibility reasons. Most systems will have half of this, but some (SPARC) don't...
 pub const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE_16: u16 = 4096;
 pub const PAGE_SIZE_64: u64 = 4096;
 
 pub const ZERO_HEADER: isize = 24; // size of the header on page 0, in bytes.

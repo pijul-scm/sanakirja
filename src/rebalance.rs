@@ -51,9 +51,7 @@ pub fn handle_failed_right_rebalancing<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>,
         let key = unsafe { std::slice::from_raw_parts(repl.key_ptr, repl.key_len) };
         let size = record_size(key.len(), repl.value.len() as usize);
         let off = page.can_alloc(size);
-        unsafe {
-            local_insert_at(rng, &mut page, key, repl.value, new_child_page.page_offset(), off, size, &mut new_levels)
-        }
+        local_insert_at(rng, &mut page, key, repl.value, new_child_page.page_offset(), off, size, &mut new_levels);
         Ok(Res::Ok { page:page })
     } else {
         let mut new_levels = [0;N_LEVELS];
@@ -144,7 +142,8 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 
     // Find the right child of the next element.
     let left_child = {
-        let left_child = u64::from_le(unsafe { *((page.offset(levels[0] as isize) as *const u64).offset(2)) });
+        let left_child = page.right_child(levels[0]);
+        // u64::from_le(unsafe { *((page.offset(levels[0] as isize) as *const u64).offset(2)) });
         txn.load_cow_page(left_child)
     };
     // Find the right child of the current element.
@@ -184,16 +183,16 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
 
     let left_rc = get_rc(txn, left_child.page_offset());
 
-    unsafe {
-        let left_left_child = u64::from_le(*((left_child.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
-        *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left_left_child.to_le();
-        if (page_will_be_dup || left_rc > 1) && left_left_child > 0 {
-            // If both `left` and `new_left` stay alive after this
-            // call, there is one more reference to left_left
-            try!(incr_rc(rng, txn, left_left_child))
-        } else {
-            debug!("line {:?}: not incr {:?}", line!(), left_left_child)
-        }
+    let left_left_child = left_child.right_child(FIRST_HEAD);
+    new_left.set_right_child(FIRST_HEAD, left_left_child);
+    // u64::from_le(*((left_child.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
+    // *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left_left_child.to_le();
+    if (page_will_be_dup || left_rc > 1) && left_left_child > 0 {
+        // If both `left` and `new_left` stay alive after this
+        // call, there is one more reference to left_left
+        try!(incr_rc(rng, txn, left_left_child))
+    } else {
+        debug!("line {:?}: not incr {:?}", line!(), left_left_child)
     }
 
 
@@ -228,7 +227,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
                 debug_assert!(off > 0);
                 debug_assert!(off + next_size <= PAGE_SIZE as u16);
                 debug!("key -> left: {:?} {:?}", std::str::from_utf8(key), r);
-                unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) }
+                local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels);
                 left_bytes += next_size;
             } else {
                 middle = Some((key.as_ptr(),key.len(),value,r))
@@ -239,13 +238,14 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             debug_assert!(off > 0);
             debug_assert!(off + next_size <= PAGE_SIZE as u16);
             debug!("key -> right: {:?} {:?}", std::str::from_utf8(key), r);
-            unsafe { local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
+            local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels);
         }
     }
 
     debug_assert!(middle.is_some());
     {
-        let right_left_child = u64::from_le(unsafe { *((child_page.offset(0) as *const u64).offset(2)) });
+        let right_left_child = child_page.right_child(FIRST_HEAD);
+        // u64::from_le(unsafe { *((child_page.offset(0) as *const u64).offset(2)) });
         debug!("right_left_child = {:?}", right_left_child);
         let (key,value) = unsafe { read_key_value(page.offset(next as isize)) };
         let (key,value) =
@@ -290,7 +290,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
         } else {
             debug!("line {:?}: not incr {:?}", line!(), right_left_child)
         }            
-        unsafe { local_insert_at(rng, &mut new_right, key, value, right_left_child, off, next_size, &mut right_levels) }
+        local_insert_at(rng, &mut new_right, key, value, right_left_child, off, next_size, &mut right_levels)
     }
 
     let mut last_updated_ptr = new_right.offset(right_levels[0] as isize);
@@ -321,7 +321,7 @@ pub fn rebalance_right<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut l
             } else {
                 debug!("line {:?}: not incr {:?}", line!(), r)
             }
-            unsafe {local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) }
+            local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels)
         } else {
             /*
             if !(child_must_dup || page_will_be_dup) && do_free_value {
@@ -399,7 +399,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
 
     // Find the right child of the next element.
     let right_child = {
-        let right_child = u64::from_le(unsafe { *((page.offset(next as isize) as *const u64).offset(2)) });
+        let right_child = page.right_child(next); // u64::from_le(unsafe { *((page.offset(next as isize) as *const u64).offset(2)) });
         txn.load_cow_page(right_child)
     };
 
@@ -428,10 +428,13 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     new_right.init();
     let mut middle = None;
     debug!("allocated {:?} and {:?}", new_left.page_offset(), new_right.page_offset());
-    unsafe {
-        let left_left_child = u64::from_le(*((child_page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
-        *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left_left_child.to_le();
 
+    let left_left_child = child_page.right_child(FIRST_HEAD);
+    // u64::from_le(*((child_page.offset(FIRST_HEAD as isize) as *const u64).offset(2)));
+    new_left.set_right_child(FIRST_HEAD, left_left_child);
+    // *((new_left.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = left_left_child.to_le();
+
+    unsafe {
         let page_will_be_forgotten = u16::from_le(*(child_page.offset(FIRST_HEAD as isize) as *const u16)) == forgetting;
 
         if (page_will_be_dup || child_must_dup) && left_left_child > 0 && !page_will_be_forgotten {
@@ -470,7 +473,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             } else {
                 debug!("line {:?}: not incr {:?}", line!(), r)
             }                
-            unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
+            local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels);
             left_bytes += next_size;
         } else {
             // freeing value: already done in the recursive calls before
@@ -486,7 +489,8 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
     }
     let right_rc = get_rc(txn, right_child.page_offset());
     {
-        let right_left_child = u64::from_le(unsafe { *((right_child.offset(0) as *const u64).offset(2)) });
+        let right_left_child = right_child.right_child(FIRST_HEAD);
+        // u64::from_le(unsafe { *((right_child.offset(0) as *const u64).offset(2)) });
         let (key,value) = unsafe { read_key_value(page.offset(next as isize)) };
         let next_size = record_size(key.len(),value.len() as usize);
         let off = new_left.can_alloc(next_size);
@@ -508,7 +512,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
                 try!(incr_rc(rng, txn, offset))
             }
         }
-        unsafe { local_insert_at(rng, &mut new_left, key, value, right_left_child, off, next_size, &mut left_levels) };
+        local_insert_at(rng, &mut new_left, key, value, right_left_child, off, next_size, &mut left_levels);
         left_bytes += next_size;
     }
     for (_, key, value, r) in PageIterator::new(&right_child,0) {
@@ -538,7 +542,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
                 debug_assert!(off > 0);
                 debug_assert!(off + next_size <= PAGE_SIZE as u16);
                 debug!("key -> right: {:?} {:?}", std::str::from_utf8(key), r);
-                unsafe { local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels) };
+                local_insert_at(rng, &mut new_left, key, value, r, off, next_size, &mut left_levels);
                 left_bytes += next_size;
             } else {
                 middle = Some((key.as_ptr(),key.len(),value,r))
@@ -548,7 +552,7 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
             let off = new_right.can_alloc(next_size);
             debug_assert!(off > 0);
             debug_assert!(off + next_size <= PAGE_SIZE as u16);
-            unsafe { local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels) };
+            local_insert_at(rng, &mut new_right, key, value, r, off, next_size, &mut right_levels);
         }
     }
 
@@ -556,7 +560,8 @@ pub fn rebalance_left<R:Rng, T>(rng:&mut R, txn:&mut MutTxn<T>, page:Cow, mut le
         // Delete the current entry, insert the new one instead.
         if let Some((key_ptr,key_len,value,r)) = middle {
 
-            unsafe { *((new_right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = r.to_le(); }
+            new_right.set_right_child(FIRST_HEAD, r);
+            // unsafe { *((new_right.offset(FIRST_HEAD as isize) as *mut u64).offset(2)) = r.to_le(); }
             let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
             debug!("middle = {:?}", std::str::from_utf8(key));
             // The following call might split.
