@@ -183,7 +183,7 @@ impl<'env,T> MutTxn<'env,T> {
         del::del(r, self, db, key, value)
     }
 
-    /// Specialized version of ```put`` for the case where both the key and value are 64-bits integers. Complexity O(log |```db```|).
+    /// Specialized version of ```put``` for the case where both the key and value are 64-bits integers. Complexity O(log |```db```|).
     pub fn put_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64)->Result<bool,Error> {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
@@ -193,7 +193,7 @@ impl<'env,T> MutTxn<'env,T> {
         }
         self.put(rng, db, &k, &v)
     }
-    /// Specialized version of ```del`` for the case where the key is a 64-bits integer, and the value is None. Complexity O(log |```db```|).
+    /// Specialized version of ```del``` for the case where the key is a 64-bits integer, and the value is None. Complexity O(log |```db```|).
     pub fn del_u64<R:Rng>(&mut self, rng:&mut R, db:&mut Db, key:u64)->Result<bool,Error> {
         let mut k: [u8; 8] = [0; 8];
         unsafe {
@@ -202,7 +202,7 @@ impl<'env,T> MutTxn<'env,T> {
         self.del(rng, db, &k, None)
     }
 
-    /// Specialized version of ```replace`` for the case where the key is a 64-bits integer. Complexity  O(log |```db```|).
+    /// Specialized version of ```replace``` for the case where the key is a 64-bits integer. Complexity  O(log |```db```|).
     pub fn replace_u64<R:Rng>(&mut self, rng:&mut R, db: &mut Db, key: u64, value: u64)->Result<(),Error> {
         let mut k: [u8; 8] = [0; 8];
         let mut v: [u8; 8] = [0; 8];
@@ -249,7 +249,7 @@ pub trait Transaction:LoadPage {
     }
 
 
-    /// Return an iterator on a database, starting with the given key and value. ```workspace``` is a vector of pointers to blocks and positions inside blocks. It is cleared by this function, and potentially resized if the B tree depth is larger than its current size. This function does not perform any other heap allocation. The Rust typesystem guarantees that ```workspace``` is not touched by any other function while the iterator returned by this function is alive. Complexity O(log |```db```|).
+    /// Return an iterator on a database, starting with the given key and value. Complexity O(log |```db```|).
     fn iter<'a, 'b>(&'a self,
                     db: &Db,
                     key: &[u8],
