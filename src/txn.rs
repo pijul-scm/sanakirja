@@ -9,7 +9,7 @@ use std::ptr::copy_nonoverlapping;
 use std::io::Write;
 use std::fmt;
 use std::cmp::Ordering;
-#[cfg(test)]
+#[cfg(debug_assertions)]
 use rustc_serialize::hex::ToHex;
 
 // Guarantee: there are at least 4 bindings per page.
@@ -88,7 +88,7 @@ impl<'env,T> MutTxn<'env,T> {
     }
 
 
-    #[cfg(test)]
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn debug<P: AsRef<Path>>(&self, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
         debug(self, db, p, keys_hex, values_hex)
@@ -159,7 +159,7 @@ pub enum UnsafeValue {
         len: u32 }
 }
 
-/// Iterator over parts of a value. On values of size at most 1024 bytes, the iterator will run exactly once. On larger values, it returns all parts of the value, in order.
+/// Iterator over parts of a value. On values of size at most 4096 bytes, the iterator will run exactly once. On larger values, it returns all parts of the value, in order.
 #[derive(Clone)]
 pub enum Value<'a,T:'a> {
     S { p:*const u8,
@@ -173,13 +173,13 @@ impl <'a,T:LoadPage>fmt::Debug for Value<'a,T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // let it = Value { txn:self.txn, value:self.value.clone() };
         let it:Value<_> = self.clone();
-        try!(write!(f,"Value {{ value: ["));
+        try!(write!(f,"Value ({:?}) {{ value: [", self.len()));
         let mut first = true;
         for x in it {
             if !first {
-                try!(write!(f, ", {:?}", std::str::from_utf8(x).unwrap_or("")))
+                try!(write!(f, ", {:?}", std::str::from_utf8(x)))
             } else {
-                try!(write!(f, "{:?}", std::str::from_utf8(x).unwrap_or("")));
+                try!(write!(f, "{:?}", std::str::from_utf8(x)));
                 first = false;
             }
         }
@@ -857,7 +857,7 @@ impl<'env> LoadPage for Txn<'env> {
     }
 }
 
-#[cfg(test)]
+#[cfg(debug_assertions)]
 fn debug<P: AsRef<Path>, T: LoadPage + super::Transaction>(t: &T, db: &[&Db], p: P, keys_hex:bool, values_hex:bool) {
     let f = File::create(p.as_ref()).unwrap();
     let mut buf = BufWriter::new(f);

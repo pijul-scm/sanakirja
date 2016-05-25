@@ -63,7 +63,7 @@
 
 
 extern crate rand;
-#[cfg(test)]
+#[cfg(debug_assertions)]
 extern crate rustc_serialize;
 
 #[macro_use]

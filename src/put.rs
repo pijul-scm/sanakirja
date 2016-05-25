@@ -901,6 +901,7 @@ pub fn put<R:Rng,T>(rng:&mut R, txn: &mut MutTxn<T>, db: &mut Db, key: &[u8], va
     } else {
         UnsafeValue::S { p:value.as_ptr(), len:value.len() as u32 }
     };
+    debug!("key = {:?}", std::str::from_utf8(key));
     unsafe { debug!("value = {:?}", Value::from_unsafe(&value, txn)) }
     match try!(insert(rng, txn, root_page, key, value, 0, false)) {
         Res::Nothing { .. } => Ok(false),

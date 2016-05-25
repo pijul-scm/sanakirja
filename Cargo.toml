@@ -14,7 +14,7 @@ env_logger="0.3"
 fs2="0.2"
 rand="0.3"
 memmap = "0.3"
+rustc-serialize = "0.3"
 
 [dev-dependencies]
 tempdir="0.3"
-rustc-serialize = "0.3"
