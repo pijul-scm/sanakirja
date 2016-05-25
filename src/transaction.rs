@@ -348,7 +348,7 @@ impl<'env,T> MutTxn<'env,T> {
                 current_list_page: Page { data:self.current_list_page.data,
                                           offset: self.current_list_page.offset },
                 current_list_length: self.current_list_length,
-                current_list_position: self.current_list_length,
+                current_list_position: self.current_list_position,
                 occupied_clean_pages: HashSet::new(),
                 free_clean_pages: Vec::new(),
                 free_pages: Vec::new(),
@@ -494,7 +494,7 @@ impl<'a,'env,T> Commit for MutTxn<'env,&'a mut MutTxn<'env,T>> {
         self.parent.current_list_page = Page { offset:self.current_list_page.offset,
                                                data:self.current_list_page.data };
         self.parent.current_list_length = self.current_list_length;
-        self.parent.current_list_position = self.current_list_length;
+        self.parent.current_list_position = self.current_list_position;
         self.parent.occupied_clean_pages.extend(self.occupied_clean_pages.iter());
         self.parent.free_clean_pages.extend(self.free_clean_pages.iter());
         self.parent.free_pages.extend(self.free_pages.iter());
